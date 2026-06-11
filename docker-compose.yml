@@ -1,0 +1,16 @@
+services:
+  feishu-agent:
+    build: .
+    container_name: feishu-agent
+    restart: unless-stopped
+    ports:
+      - "8800:8800"                       # 管理后台；飞书是长连接出站，无需对外暴露端口
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro # 飞书凭证 + 初始管理员密码（也可改用下面的环境变量）
+      - ./data:/app/data                  # 记忆/设置/用量(SQLite)，持久化
+    # 不想挂 config.yaml 就改用环境变量（优先级更高）：
+    # environment:
+    #   FEISHU_APP_ID: cli_xxx
+    #   FEISHU_APP_SECRET: xxx
+    #   ADMIN_PASSWORD: 改个强密码
+    #   WEB_SESSION_SECRET: 固定一串随机值，重启不掉登录态

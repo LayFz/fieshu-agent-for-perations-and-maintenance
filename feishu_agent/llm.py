@@ -1,36 +1,61 @@
-"""大模型编排：对话历史 + 长期记忆 + 工具循环。任意 OpenAI 兼容模型。"""
+"""大模型编排：对话历史 + 长期记忆 + 工具循环 + token 计量。
+配置（base_url/model/api_key/提示词/历史轮数）实时取自 DB——管理后台一改即生效。"""
 import json
 
 from openai import OpenAI
 
-from . import memory
-from .config import cfg
+from . import store
 from .tools import TOOLS, execute
 
-_client = OpenAI(base_url=cfg.llm["base_url"], api_key=cfg.llm["api_key"])
 _MAX_TOOL_LOOPS = 6
 
 
-def _system():
-    sys = cfg.agent.get("system_prompt", "你是飞书助手。")
-    notes = memory.load_notes("global")
+def _settings():
+    s = store.all_settings()
+    return {
+        "base_url": s.get("llm_base_url") or "https://api.openai.com/v1",
+        "model": s.get("llm_model") or "gpt-4o-mini",
+        "api_key": s.get("llm_api_key") or "",
+        "system_prompt": s.get("system_prompt") or "你是飞书助手。",
+        "history_turns": int(s.get("history_turns") or 12),
+    }
+
+
+def _system(prompt):
+    notes = store.load_notes("global")
     if notes:
-        sys += "\n\n【长期记忆】\n" + "\n".join("- " + n for n in notes)
-    return sys
+        prompt += "\n\n【长期记忆】\n" + "\n".join("- " + n for n in notes)
+    return prompt
+
+
+def _record(chat_id, model, resp):
+    u = getattr(resp, "usage", None)
+    if not u:
+        return
+    store.record_usage(chat_id, model,
+                       getattr(u, "prompt_tokens", 0) or 0,
+                       getattr(u, "completion_tokens", 0) or 0,
+                       getattr(u, "total_tokens", 0) or 0)
 
 
 def run(chat_id: str, user_text: str) -> str:
-    msgs = [{"role": "system", "content": _system()}]
-    msgs += memory.load_history(chat_id, cfg.agent.get("history_turns", 12))
+    st = _settings()
+    if not st["api_key"]:
+        return "（还没配置大模型 API Key —— 请先到管理后台「大模型配置」里填好再用我。）"
+    client = OpenAI(base_url=st["base_url"], api_key=st["api_key"])
+
+    msgs = [{"role": "system", "content": _system(st["system_prompt"])}]
+    msgs += store.load_history(chat_id, st["history_turns"])
     msgs.append({"role": "user", "content": user_text})
-    memory.save(chat_id, "user", user_text)
+    store.save(chat_id, "user", user_text)
 
     for _ in range(_MAX_TOOL_LOOPS):
-        resp = _client.chat.completions.create(model=cfg.llm["model"], messages=msgs, tools=TOOLS)
+        resp = client.chat.completions.create(model=st["model"], messages=msgs, tools=TOOLS)
+        _record(chat_id, st["model"], resp)
         m = resp.choices[0].message
         if not m.tool_calls:
             answer = (m.content or "").strip() or "(无输出)"
-            memory.save(chat_id, "assistant", answer)
+            store.save(chat_id, "assistant", answer)
             return answer
         # 把带 tool_calls 的 assistant 轮接回去
         msgs.append({
@@ -51,5 +76,5 @@ def run(chat_id: str, user_text: str) -> str:
                          "content": json.dumps(result, ensure_ascii=False)})
 
     answer = "（工具调用过多，已中止；请把任务拆细一点再试）"
-    memory.save(chat_id, "assistant", answer)
+    store.save(chat_id, "assistant", answer)
     return answer

@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>feishu-agent 管理后台</title>
+<style>
+  :root{ --bg:#f4f5f7; --card:#fff; --line:#e6e8eb; --ink:#1f2329; --sub:#646a73;
+         --pri:#3370ff; --pri-d:#1f5eff; --ok:#3bb346; --warn:#ff8800; --err:#f5222d; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+        color:var(--ink); background:var(--bg); }
+  a{ color:var(--pri); text-decoration:none; }
+  button{ font:inherit; cursor:pointer; }
+  .btn{ background:var(--pri); color:#fff; border:0; border-radius:6px; padding:8px 16px; }
+  .btn:hover{ background:var(--pri-d); }
+  .btn.ghost{ background:#fff; color:var(--ink); border:1px solid var(--line); }
+  .btn.danger{ background:#fff; color:var(--err); border:1px solid #ffd6d6; padding:4px 10px; font-size:13px; }
+  input,textarea,select{ font:inherit; width:100%; padding:8px 10px; border:1px solid var(--line);
+        border-radius:6px; background:#fff; color:var(--ink); }
+  textarea{ resize:vertical; min-height:120px; font-family:inherit; }
+  label{ display:block; font-size:13px; color:var(--sub); margin:14px 0 6px; }
+
+  /* 登录 */
+  #login{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:var(--bg); z-index:50; }
+  #login .box{ width:340px; background:#fff; border:1px solid var(--line); border-radius:12px; padding:28px; box-shadow:0 8px 30px rgba(0,0,0,.06); }
+  #login h1{ font-size:18px; margin:0 0 4px; } #login p{ color:var(--sub); margin:0 0 18px; font-size:13px; }
+  #login .err{ color:var(--err); font-size:13px; min-height:18px; margin-top:10px; }
+
+  /* 框架 */
+  #app{ display:none; }
+  header{ height:54px; background:#fff; border-bottom:1px solid var(--line); display:flex; align-items:center;
+          padding:0 20px; position:sticky; top:0; z-index:10; }
+  header .logo{ font-weight:600; } header .logo b{ color:var(--pri); }
+  header .right{ margin-left:auto; color:var(--sub); display:flex; align-items:center; gap:14px; }
+  .layout{ display:flex; min-height:calc(100vh - 54px); }
+  nav{ width:180px; background:#fff; border-right:1px solid var(--line); padding:12px 0; flex:0 0 auto; }
+  nav a{ display:block; padding:10px 20px; color:var(--ink); font-size:14px; border-left:3px solid transparent; }
+  nav a:hover{ background:#f7f8fa; } nav a.on{ color:var(--pri); border-left-color:var(--pri); background:#f0f5ff; font-weight:500; }
+  main{ flex:1; padding:24px 28px; max-width:1000px; }
+  h2{ font-size:18px; margin:0 0 4px; } .desc{ color:var(--sub); margin:0 0 20px; font-size:13px; }
+
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:16px; }
+  .grid{ display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); }
+  .stat{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .stat .k{ color:var(--sub); font-size:13px; } .stat .v{ font-size:26px; font-weight:600; margin-top:4px; }
+  .chips{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:18px; }
+  .chip{ padding:5px 12px; border-radius:20px; font-size:13px; border:1px solid var(--line); background:#fff; }
+  .chip .dot{ display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .dot.g{ background:var(--ok); } .dot.r{ background:var(--err); } .dot.y{ background:var(--warn); }
+
+  table{ width:100%; border-collapse:collapse; font-size:13px; }
+  th,td{ text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); }
+  th{ color:var(--sub); font-weight:500; background:#fafbfc; }
+  td.num,th.num{ text-align:right; font-variant-numeric:tabular-nums; }
+  .muted{ color:var(--sub); } .mono{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  .tabs{ display:flex; gap:6px; margin-bottom:14px; }
+  .tabs button{ background:#fff; border:1px solid var(--line); border-radius:6px; padding:6px 14px; color:var(--ink); }
+  .tabs button.on{ background:var(--pri); color:#fff; border-color:var(--pri); }
+  .row{ display:flex; gap:14px; } .row>div{ flex:1; }
+  .save-bar{ margin-top:18px; display:flex; align-items:center; gap:12px; }
+  .hint{ color:var(--sub); font-size:12px; margin-top:4px; }
+  .empty{ color:var(--sub); padding:30px; text-align:center; }
+  .bubble{ padding:8px 12px; border-radius:8px; margin:6px 0; max-width:80%; white-space:pre-wrap; word-break:break-word; }
+  .bubble.user{ background:#e8f0ff; } .bubble.assistant{ background:#f2f3f5; }
+  .bubble .who{ font-size:11px; color:var(--sub); margin-bottom:2px; }
+  #toast{ position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#1f2329; color:#fff;
+          padding:10px 18px; border-radius:8px; font-size:13px; opacity:0; transition:.25s; pointer-events:none; z-index:60; }
+  #toast.show{ opacity:1; }
+</style>
+</head>
+<body>
+
+<!-- 登录 -->
+<div id="login">
+  <div class="box">
+    <h1>feishu-agent 管理后台</h1>
+    <p>内部服务 · 请登录</p>
+    <label>用户名</label><input id="lg-u" autocomplete="username">
+    <label>密码</label><input id="lg-p" type="password" autocomplete="current-password">
+    <div style="margin-top:18px"><button class="btn" style="width:100%" onclick="doLogin()">登录</button></div>
+    <div class="err" id="lg-err"></div>
+  </div>
+</div>
+
+<!-- 主体 -->
+<div id="app">
+  <header>
+    <div class="logo">飞书 <b>Agent</b> 控制台</div>
+    <div class="right">
+      <span id="who"></span>
+      <button class="btn ghost" onclick="doLogout()">退出</button>
+    </div>
+  </header>
+  <div class="layout">
+    <nav>
+      <a data-page="overview" class="on">概览</a>
+      <a data-page="settings">大模型配置</a>
+      <a data-page="memory">记忆系统</a>
+      <a data-page="tools">工具</a>
+      <a data-page="usage">Token 用量</a>
+      <a data-page="account">账号</a>
+    </nav>
+    <main id="content"></main>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = (s,r=document)=>r.querySelector(s);
+const fmt = n => (n==null?0:Number(n)).toLocaleString('en-US');
+const dt  = ts => ts ? new Date(ts*1000).toLocaleString('zh-CN',{hour12:false}) : '';
+const esc = s => (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
+
+async function api(method, path, body){
+  const opt={ method, headers:{} };
+  if(body!==undefined){ opt.headers['Content-Type']='application/json'; opt.body=JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  if(r.status===401){ showLogin(); throw new Error('未登录'); }
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(data.detail || ('HTTP '+r.status));
+  return data;
+}
+
+/* ---------- 登录 ---------- */
+function showLogin(){ $('#app').style.display='none'; $('#login').style.display='flex'; }
+async function doLogin(){
+  $('#lg-err').textContent='';
+  try{
+    const u=$('#lg-u').value, p=$('#lg-p').value;
+    const r=await api('POST','/api/login',{username:u,password:p});
+    enterApp(r.username);
+  }catch(e){ $('#lg-err').textContent=e.message; }
+}
+async function doLogout(){ try{ await api('POST','/api/logout'); }catch(e){} showLogin(); }
+function enterApp(username){
+  $('#login').style.display='none'; $('#app').style.display='block';
+  $('#who').textContent='👤 '+username;
+  go('overview');
+}
+$('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
+
+/* ---------- 路由 ---------- */
+const PAGES = { overview, settings, memory, tools, usage, account };
+function go(page){
+  document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on', a.dataset.page===page));
+  PAGES[page]();
+}
+document.querySelectorAll('nav a').forEach(a=> a.onclick=()=>go(a.dataset.page));
+
+/* ---------- 概览 ---------- */
+async function overview(){
+  const c=$('#content'); c.innerHTML='<h2>概览</h2><p class="desc">加载中…</p>';
+  const o=await api('GET','/api/overview');
+  const chip=(ok,t,yellow)=>`<span class="chip"><span class="dot ${ok?'g':(yellow?'y':'r')}"></span>${t}</span>`;
+  c.innerHTML=`
+    <h2>概览</h2><p class="desc">系统状态与累计用量一览。</p>
+    <div class="chips">
+      ${chip(o.bot_running,'机器人 '+(o.bot_running?'在线':'离线'))}
+      ${chip(o.feishu_configured,'飞书凭证 '+(o.feishu_configured?'已配置':'未配置'))}
+      ${chip(o.llm_configured,'大模型 '+(o.llm_configured?('已配置 · '+esc(o.model||'')):'未配置'), !o.llm_configured)}
+    </div>
+    <div class="grid">
+      <div class="stat"><div class="k">累计消息</div><div class="v">${fmt(o.counts.messages)}</div></div>
+      <div class="stat"><div class="k">长期记忆</div><div class="v">${fmt(o.counts.notes)}</div></div>
+      <div class="stat"><div class="k">会话数</div><div class="v">${fmt(o.counts.chats)}</div></div>
+      <div class="stat"><div class="k">累计 Token</div><div class="v">${fmt(o.usage_total.total)}</div></div>
+      <div class="stat"><div class="k">今日 Token</div><div class="v">${fmt(o.usage_today.total)}</div></div>
+      <div class="stat"><div class="k">累计调用</div><div class="v">${fmt(o.usage_total.calls)}</div></div>
+    </div>
+    ${o.llm_configured?'':'<div class="card" style="border-color:#ffe2b8;background:#fff8ee">⚠ 还没配置大模型，去「大模型配置」填好 API Key 后机器人才能回话。</div>'}`;
+}
+
+/* ---------- 大模型配置 ---------- */
+async function settings(){
+  const c=$('#content'); c.innerHTML='<h2>大模型配置</h2><p class="desc">加载中…</p>';
+  const s=await api('GET','/api/settings');
+  c.innerHTML=`
+    <h2>大模型配置</h2><p class="desc">任意 OpenAI 兼容接口——改完保存即对机器人生效（无需重启）。</p>
+    <div class="card">
+      <div class="row">
+        <div><label>接口地址 base_url</label><input id="s-url" value="${esc(s.base_url)}" placeholder="https://api.deepseek.com/v1"></div>
+        <div><label>模型 model</label><input id="s-model" value="${esc(s.model)}" placeholder="deepseek-chat"></div>
+      </div>
+      <label>API Key ${s.api_key_set?`<span class="muted">（已设置：${esc(s.api_key_masked)}，留空＝不修改）</span>`:'<span class="muted">（尚未设置）</span>'}</label>
+      <input id="s-key" type="password" placeholder="${s.api_key_set?'留空则保持不变':'粘贴 API Key'}">
+      <label>历史轮数 history_turns</label>
+      <input id="s-turns" type="number" min="0" style="width:140px" value="${s.history_turns}">
+      <label>系统提示词 system_prompt</label>
+      <textarea id="s-prompt">${esc(s.system_prompt)}</textarea>
+      <div class="save-bar"><button class="btn" onclick="saveSettings()">保存</button>
+        <span class="hint">常见：DeepSeek <code>https://api.deepseek.com/v1</code> · 通义 <code>https://dashscope.aliyun.com/compatible-mode/v1</code> · OpenAI <code>https://api.openai.com/v1</code></span></div>
+    </div>`;
+}
+async function saveSettings(){
+  const body={ base_url:$('#s-url').value, model:$('#s-model').value,
+    system_prompt:$('#s-prompt').value, history_turns:Number($('#s-turns').value)||0 };
+  const key=$('#s-key').value.trim(); if(key) body.api_key=key;
+  await api('POST','/api/settings',body); toast('已保存'); settings();
+}
+
+/* ---------- 记忆系统 ---------- */
+let memTab='notes';
+async function memory(){
+  const c=$('#content');
+  c.innerHTML=`<h2>记忆系统</h2><p class="desc">长期记忆（remember 工具写入）与各会话的对话历史。</p>
+    <div class="tabs">
+      <button id="mt-n" class="${memTab==='notes'?'on':''}" onclick="memTab='notes';memory()">长期记忆</button>
+      <button id="mt-c" class="${memTab==='chats'?'on':''}" onclick="memTab='chats';memory()">对话历史</button>
+    </div><div id="mem-body" class="card">加载中…</div>`;
+  if(memTab==='notes') renderNotes(); else renderChats();
+}
+async function renderNotes(){
+  const {notes}=await api('GET','/api/memory/notes'); const b=$('#mem-body');
+  if(!notes.length){ b.innerHTML='<div class="empty">还没有长期记忆。机器人调用 remember 工具后会出现在这里。</div>'; return; }
+  b.innerHTML=`<table><thead><tr><th style="width:60px">#</th><th>内容</th><th style="width:160px">时间</th><th style="width:70px"></th></tr></thead><tbody>
+    ${notes.map(n=>`<tr><td class="muted">${n.id}</td><td>${esc(n.content)}</td><td class="muted">${dt(n.ts)}</td>
+      <td><button class="btn danger" onclick="delNote(${n.id})">删除</button></td></tr>`).join('')}</tbody></table>`;
+}
+async function delNote(id){ if(!confirm('删除这条记忆？')) return; await api('DELETE','/api/memory/notes/'+id); toast('已删除'); renderNotes(); }
+async function renderChats(){
+  const {chats}=await api('GET','/api/memory/chats'); const b=$('#mem-body');
+  if(!chats.length){ b.innerHTML='<div class="empty">还没有任何对话。</div>'; return; }
+  b.innerHTML=`<table><thead><tr><th>会话 chat_id</th><th class="num">消息数</th><th style="width:160px">最近</th><th style="width:80px"></th></tr></thead><tbody>
+    ${chats.map(ch=>`<tr><td class="mono">${esc(ch.chat_id)}</td><td class="num">${ch.count}</td>
+      <td class="muted">${dt(ch.last_ts)}</td><td><button class="btn ghost" style="padding:4px 10px;font-size:13px"
+      onclick='viewChat(${JSON.stringify(ch.chat_id)})'>查看</button></td></tr>`).join('')}</tbody></table>`;
+}
+async function viewChat(chatId){
+  const {messages}=await api('GET','/api/memory/chats/'+encodeURIComponent(chatId));
+  const b=$('#mem-body');
+  b.innerHTML=`<div style="margin-bottom:10px"><button class="btn ghost" style="padding:4px 12px" onclick="renderChats()">← 返回</button>
+    <span class="mono muted" style="margin-left:10px">${esc(chatId)}</span></div>
+    ${messages.map(m=>`<div class="bubble ${m.role}"><div class="who">${m.role} · ${dt(m.ts)}</div>${esc(m.content)}</div>`).join('') || '<div class="empty">空</div>'}`;
+}
+
+/* ---------- 工具 ---------- */
+async function tools(){
+  const c=$('#content'); c.innerHTML='<h2>工具</h2><p class="desc">加载中…</p>';
+  const {tools}=await api('GET','/api/tools');
+  c.innerHTML=`<h2>工具</h2><p class="desc">机器人当前可调用的能力（function calling），共 ${tools.length} 个。</p>
+    <div class="card"><table><thead><tr><th style="width:220px">名称</th><th>说明</th></tr></thead><tbody>
+    ${tools.map(t=>`<tr><td class="mono">${esc(t.name)}</td><td>${esc(t.description)}</td></tr>`).join('')}
+    </tbody></table></div>`;
+}
+
+/* ---------- Token 用量 ---------- */
+async function usage(){
+  const c=$('#content'); c.innerHTML='<h2>Token 用量</h2><p class="desc">加载中…</p>';
+  const u=await api('GET','/api/usage');
+  c.innerHTML=`<h2>Token 用量</h2><p class="desc">每次大模型调用的 token 消耗（含工具循环的多次调用）。</p>
+    <div class="grid">
+      <div class="stat"><div class="k">输入 prompt</div><div class="v">${fmt(u.total.prompt)}</div></div>
+      <div class="stat"><div class="k">输出 completion</div><div class="v">${fmt(u.total.completion)}</div></div>
+      <div class="stat"><div class="k">合计 total</div><div class="v">${fmt(u.total.total)}</div></div>
+      <div class="stat"><div class="k">调用次数</div><div class="v">${fmt(u.total.calls)}</div></div>
+    </div>
+    <div class="row" style="align-items:flex-start">
+      <div class="card"><h3 style="margin:0 0 10px;font-size:15px">按天</h3>
+        <table><thead><tr><th>日期</th><th class="num">Token</th><th class="num">调用</th></tr></thead><tbody>
+        ${u.by_day.map(d=>`<tr><td>${esc(d.day)}</td><td class="num">${fmt(d.total)}</td><td class="num">${fmt(d.calls)}</td></tr>`).join('')||'<tr><td colspan=3 class="muted">暂无</td></tr>'}
+        </tbody></table></div>
+      <div class="card"><h3 style="margin:0 0 10px;font-size:15px">按模型</h3>
+        <table><thead><tr><th>模型</th><th class="num">Token</th><th class="num">调用</th></tr></thead><tbody>
+        ${u.by_model.map(m=>`<tr><td class="mono">${esc(m.model)}</td><td class="num">${fmt(m.total)}</td><td class="num">${fmt(m.calls)}</td></tr>`).join('')||'<tr><td colspan=3 class="muted">暂无</td></tr>'}
+        </tbody></table></div>
+    </div>
+    <div class="card"><h3 style="margin:0 0 10px;font-size:15px">最近调用</h3>
+      <table><thead><tr><th style="width:160px">时间</th><th>模型</th><th class="num">输入</th><th class="num">输出</th><th class="num">合计</th></tr></thead><tbody>
+      ${u.recent.map(r=>`<tr><td class="muted">${dt(r.ts)}</td><td class="mono">${esc(r.model)}</td>
+        <td class="num">${fmt(r.prompt_tokens)}</td><td class="num">${fmt(r.completion_tokens)}</td><td class="num">${fmt(r.total_tokens)}</td></tr>`).join('')||'<tr><td colspan=5 class="muted">暂无</td></tr>'}
+      </tbody></table></div>`;
+}
+
+/* ---------- 账号 ---------- */
+async function account(){
+  const c=$('#content');
+  c.innerHTML=`<h2>账号</h2><p class="desc">修改管理员登录密码。</p>
+    <div class="card" style="max-width:420px">
+      <label>原密码</label><input id="a-old" type="password">
+      <label>新密码（至少 6 位）</label><input id="a-new" type="password">
+      <label>确认新密码</label><input id="a-new2" type="password">
+      <div class="save-bar"><button class="btn" onclick="changePw()">修改密码</button></div>
+    </div>`;
+}
+async function changePw(){
+  const o=$('#a-old').value, n=$('#a-new').value, n2=$('#a-new2').value;
+  if(n!==n2){ toast('两次新密码不一致'); return; }
+  try{ await api('POST','/api/password',{old:o,new:n}); toast('密码已修改'); account(); }
+  catch(e){ toast(e.message); }
+}
+
+/* ---------- 启动 ---------- */
+(async function(){
+  try{ const me=await api('GET','/api/me'); enterApp(me.username); }
+  catch(e){ showLogin(); }
+})();
+</script>
+</body>
+</html>

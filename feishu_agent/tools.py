@@ -1,5 +1,5 @@
 """工具定义（给大模型 function-calling）+ 执行器（真正干活）。"""
-from . import feishu_docs, memory
+from . import feishu_docs, store
 
 # OpenAI 兼容的 tools schema
 TOOLS = [
@@ -51,6 +51,11 @@ TOOLS = [
 ]
 
 
+def tool_list():
+    """给管理后台看的工具清单（名称 + 说明）。"""
+    return [{"name": t["function"]["name"], "description": t["function"]["description"]} for t in TOOLS]
+
+
 def execute(name, args):
     try:
         if name == "list_knowledge_bases":
@@ -65,7 +70,7 @@ def execute(name, args):
             return feishu_docs.create_node(args["space_id"], args["title"], args["markdown"],
                                            args.get("parent_node_token"))
         if name == "remember":
-            memory.add_note("global", args["note"])
+            store.add_note("global", args["note"])
             return {"ok": True}
         return {"error": f"unknown tool {name}"}
     except Exception as e:

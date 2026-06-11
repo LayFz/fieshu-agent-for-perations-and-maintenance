@@ -1,44 +1,80 @@
 # feishu-agent
 
-内网可跑的**飞书 AI 助手**:群里 @机器人下任务 → 大模型理解 → 调工具**读写飞书云文档/知识库** → 回群。带对话记忆。
+公司内部的飞书智能助手。**飞书群里 @机器人说话 → 大模型 + 工具读写飞书文档/知识库 → 回群**，
+带**对话记忆**、**长期记忆**，并提供一个**管理后台**（登录后配置模型、看记忆、看工具、看 token 用量）。
 
-- **收/回消息**:飞书官方 SDK 长连接(WebSocket),**只需出站联网,不用公网 IP/域名/回调**。
-- **大模型**:OpenAI 兼容接口,改 `config.yaml` 三行即可换任意模型(DeepSeek / 通义 / Kimi / OpenAI…)。
-- **文档能力**:`tools` 里定义,大模型用 function-calling 调用,执行体走飞书 docx/wiki REST(Markdown→飞书块,支持原生表格)。
-- **鉴权**:用**应用身份 `tenant_access_token`**(app_id+secret 自动续,**永不过期、不绑个人**)。
-- **记忆**:SQLite 存每个群的对话历史 + 长期笔记。
+- **只对内、不用公网**：飞书用**长连接**（机器人主动拨出），服务只出站、不开放入站端口；管理后台端口只在内网开。
+- **可换任意模型**：任何 OpenAI 兼容接口（DeepSeek / 通义 / OpenAI / 自建网关…），后台改 3 项即生效，不动代码。
+- **密钥不入库**：`config.yaml`（gitignore）或环境变量；运行时设置存 `data/agent.db`。
+- **一条命令 Docker 起**。
 
 ## 架构
 
 ```
-群里 @机器人 ──长连接──▶ main.on_message
-    └─▶ llm.run(对话历史 + 记忆 + 工具清单 → 大模型)
-            └─▶ 大模型决定调工具 → tools.execute → feishu_docs(读/写/建节点)
-            └─▶ 大模型给最终话术 ──▶ 回群
+飞书群 ──长连接(出站)──▶  bot(后台线程)  ──▶  llm 编排(对话历史+长期记忆+工具循环)
+                                                   │  每次调用记 token 用量
+                                                   ▼
+                                         tools ──▶ 飞书 docx/wiki REST（读/写/建文档）
+管理员浏览器 ──:8800──▶  admin(FastAPI, 主线程)  ──▶  同一个 SQLite(data/agent.db)
+                          登录 / 配模型 / 看记忆 / 看工具 / 看用量
 ```
 
-## 跑起来
+bot 与 admin **同进程**：后台改了模型配置，bot 下一条消息就用新配置（都读同一个 DB）。
+
+## 目录
+
+```
+feishu_agent/
+  main.py        入口：播种(设置+管理员) → 起 bot 线程 + uvicorn(admin)
+  bot.py         飞书长连接：收群消息 → llm → 回群
+  llm.py         大模型编排：历史 + 记忆 + 工具循环 + token 计量（配置实时取自 DB）
+  tools.py       工具定义(function calling) + 执行器
+  feishu_docs.py 飞书 docx/wiki 高层操作
+  md2feishu.py   Markdown → 飞书块（含原生表格）
+  auth.py        应用身份 tenant_access_token（自动续，永不过期、不绑个人）
+  store.py       数据层：设置 / 管理员 / 记忆 / 笔记 / token 用量（单个 SQLite）
+  config.py      引导配置：config.yaml < 环境变量
+  admin.py       管理后台 FastAPI（登录 + 配置 + 记忆 + 工具 + 用量）
+  web/index.html 管理后台前端（单文件，无需构建）
+config.example.yaml / Dockerfile / docker-compose.yml
+data/            运行后生成：agent.db（gitignore）
+```
+
+## 本地跑
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp config.example.yaml config.yaml      # 填 app_secret + 模型 base_url/model/api_key
-python -m feishu_agent.main             # 常驻;之后群里 @机器人 试
+cp config.example.yaml config.yaml      # 填飞书凭证；模型可留空，登录后台再配
+python -m feishu_agent.main
 ```
-密钥也可走环境变量:`FEISHU_APP_SECRET`、`LLM_API_KEY`(覆盖 config.yaml)。
+首启会打印初始管理员账号（默认 `admin / admin12345`），浏览器开 **http://localhost:8800** 登录。
 
-## 前提(飞书侧,已发布版本后)
+## Docker 跑
 
-1. 应用开启「机器人」能力,**把机器人拉进目标群**。
-2. 订阅事件 `im.message.receive_v1`,选「**使用长连接接收事件**」。
-3. 申请权限:`im:message`、`im:message.group_at_msg:readonly`、`im:message:send_as_bot`,以及文档权限 `wiki:wiki`、`docx:document`、`docs:document.media:upload`。
-4. 让应用能写知识库:把「**含机器人的群**」加为知识库成员/管理员(`member_type=openchat`),或用 API 直接加应用。
-5. 创建版本并**发布**(敏感权限需管理员审批)。
+```bash
+docker compose up -d --build
+docker compose logs -f                  # 看首启打印的管理员账号
+```
+访问 **http://<内网IP>:8800**。数据持久化在 `./data`（删容器不丢记忆/配置）。
+生产建议：在 compose 里用环境变量设强 `ADMIN_PASSWORD`，并固定 `WEB_SESSION_SECRET`（重启不掉登录态）。
 
-## 现状(v1)
+## 管理后台能干嘛
 
-- ✅ 收群消息(text)→ 大模型 → 工具读写文档 → 回群;对话历史 + 长期笔记。
-- 🔜 待加:定时任务、配置后台网页、更多消息类型(富文本/卡片)、更细的记忆(向量检索)。
-- ⚠️ `@机器人` 占位剔除做了简化(按 mentions 精确剔除可后续优化)。
+| 页面 | 作用 |
+|---|---|
+| 概览 | 机器人在线/飞书/模型状态；累计消息、记忆、会话、token |
+| 大模型配置 | 改 base_url / model / API Key / 提示词 / 历史轮数，**保存即生效** |
+| 记忆系统 | 看长期记忆（可删）、按会话看对话历史 |
+| 工具 | 当前机器人可调用的工具清单 |
+| Token 用量 | 总量、按天、按模型、最近调用明细 |
+| 账号 | 改管理员密码 |
 
-详见各模块注释。
+## 飞书侧前提（一次性）
+
+1. 自建应用启用**机器人**，把机器人**加进目标群**。
+2. 事件订阅选**长连接**方式，订阅 `im.message.receive_v1`。
+3. 开通权限：`im:message`、`im:message:send_as_bot`、`wiki:wiki`、`docx:document`（要写文档再加 `drive:drive`）。
+4. 把**群**作为成员加进目标知识库（文档权限收敛到群，群里有机器人即可操作）。
+5. 改完权限/事件要**重新发版**才生效。
+
+> ⚠️ 关键：事件订阅必须走**长连接**（不是 webhook），这是内网免公网方案成立的根。

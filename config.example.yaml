@@ -1,20 +1,29 @@
 # 复制为 config.yaml 填真实值（config.yaml 已 gitignore，不入库）。
-# 密钥也可用环境变量覆盖：FEISHU_APP_SECRET / LLM_API_KEY。
+# 任何一项都可用环境变量覆盖（容器部署推荐）：
+#   FEISHU_APP_ID / FEISHU_APP_SECRET / LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+#   ADMIN_USERNAME / ADMIN_PASSWORD / WEB_SESSION_SECRET / WEB_PORT
 
 feishu:
   app_id: cli_aa9f8123c47a9cd8
   app_secret: ""              # 或环境变量 FEISHU_APP_SECRET
 
+# llm / agent 仅作"首启初始值"——启动后请在【管理后台 → 大模型配置】里改，
+# 改动持久化到 data/agent.db，运行时以 DB 为准（这里改了不会覆盖已存的）。
 llm:
-  # OpenAI 兼容接口——换任意模型只改这三项
-  base_url: https://api.deepseek.com/v1   # 通义: https://dashscope.aliyun.com/compatible-mode/v1 ; OpenAI: https://api.openai.com/v1
+  base_url: https://api.deepseek.com/v1
   model: deepseek-chat
-  api_key: ""                 # 或环境变量 LLM_API_KEY
-
+  api_key: ""                 # 留空也行，登录后台再填
 agent:
-  history_turns: 12           # 每个会话带多少轮历史给模型
+  history_turns: 12
   system_prompt: |
     你是公司内部的飞书助手，能读写飞书云文档与知识库。
     收到任务时：先想清楚要操作哪个知识库/哪篇文档（不确定就先用工具列出来看看），
     再调用工具完成，最后用一两句话回复结果（带上链接或文档名）。
     需要长期记住的偏好/结论，用 remember 工具记下来。
+
+admin:
+  username: admin
+  password: admin12345        # 初始管理员密码（仅首启建号时用）；登录后到「账号」里改掉
+web:
+  port: 8800
+  session_secret: ""          # 留空＝自动生成并持久化；多实例/想固定登录态时再填
