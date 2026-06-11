@@ -12,6 +12,8 @@ def _bootstrap():
     store.seed_setting("llm_api_key", cfg.llm.get("api_key"))
     store.seed_setting("system_prompt", cfg.agent.get("system_prompt"))
     store.seed_setting("history_turns", str(cfg.agent.get("history_turns", 12)))
+    store.seed_setting("feishu_app_id", cfg.feishu.get("app_id"))
+    store.seed_setting("feishu_app_secret", cfg.feishu.get("app_secret"))
     if cfg.web.get("session_secret"):
         store.set_setting("server_secret", cfg.web["session_secret"])
 
@@ -25,7 +27,7 @@ def _bootstrap():
 def main():
     _bootstrap()
     from feishu import bot
-    if cfg.has_feishu():
+    if store.has_feishu():
         bot.start_in_background()
     else:
         print("⚠ 未配置飞书 app_id/secret，bot 未启动（管理后台仍可用，可先配模型）")

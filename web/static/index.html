@@ -96,6 +96,7 @@
     <nav>
       <a data-page="overview" class="on">概览</a>
       <a data-page="settings">大模型配置</a>
+      <a data-page="feishu">飞书配置</a>
       <a data-page="memory">记忆系统</a>
       <a data-page="tools">工具</a>
       <a data-page="usage">Token 用量</a>
@@ -144,7 +145,7 @@ function enterApp(username){
 $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
-const PAGES = { overview, settings, memory, tools, usage, account };
+const PAGES = { overview, settings, feishu, memory, tools, usage, account };
 function go(page){
   document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on', a.dataset.page===page));
   PAGES[page]();
@@ -291,6 +292,42 @@ async function changePw(){
   if(n!==n2){ toast('两次新密码不一致'); return; }
   try{ await api('POST','/api/password',{old:o,new:n}); toast('密码已修改'); account(); }
   catch(e){ toast(e.message); }
+}
+
+/* ---------- 飞书配置 ---------- */
+async function feishu(){
+  const c=$('#content'); c.innerHTML='<h2>飞书配置</h2><p class="desc">加载中…</p>';
+  const f=await api('GET','/api/feishu');
+  c.innerHTML=`
+    <h2>飞书配置</h2><p class="desc">机器人身份（自建应用）的 App ID / App Secret，后台可改，密钥掩码显示。</p>
+    <div class="card">
+      <div class="chips" style="margin-bottom:6px">
+        <span class="chip"><span class="dot ${f.bot_running?'g':'r'}"></span>长连接 ${f.bot_running?'在线':'离线'}</span>
+      </div>
+      <label>App ID</label><input id="f-id" value="${esc(f.app_id)}" placeholder="cli_xxx">
+      <label>App Secret ${f.app_secret_set?`<span class="muted">（已设置：${esc(f.app_secret_masked)}，留空＝不修改）</span>`:'<span class="muted">（未设置）</span>'}</label>
+      <input id="f-secret" type="password" placeholder="${f.app_secret_set?'留空则保持不变':'粘贴 App Secret'}">
+      <div class="save-bar"><button class="btn" onclick="saveFeishu()">保存</button>
+        <span class="hint">仅保存：读写文档的取数立即用新凭证；群消息长连接要点下面「重启」才用新凭证重连。</span></div>
+    </div>
+    <div class="card" style="border-color:#ffe2b8;background:#fff8ee">
+      <b>重启服务</b>：长连接在进程启动时建立，换了 App ID / Secret 后点这里重启（约 5 秒回来，本页自动重连）。
+      <div style="margin-top:10px"><button class="btn" onclick="restartBot()">重启服务并重连</button></div>
+    </div>`;
+}
+async function saveFeishu(){
+  const body={ app_id:$('#f-id').value };
+  const s=$('#f-secret').value.trim(); if(s) body.app_secret=s;
+  await api('POST','/api/feishu',body); toast('已保存'); feishu();
+}
+async function restartBot(){
+  if(!confirm('重启服务以让飞书长连接用新凭证重连？管理后台会断开几秒。')) return;
+  try{ await api('POST','/api/feishu/restart'); }catch(e){}
+  toast('服务重启中，约 5 秒后自动重连…'); setTimeout(waitReconnect, 4000);
+}
+async function waitReconnect(){
+  try{ await fetch('/api/me'); location.reload(); }
+  catch(e){ setTimeout(waitReconnect, 2000); }
 }
 
 /* ---------- 启动 ---------- */

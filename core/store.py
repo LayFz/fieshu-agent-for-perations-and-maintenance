@@ -55,6 +55,15 @@ def server_secret():
     return s
 
 
+# ---------- 飞书凭证（后台可改，运行时以 DB 为准） ----------
+def feishu_creds():
+    return (get_setting("feishu_app_id", "") or "", get_setting("feishu_app_secret", "") or "")
+
+def has_feishu():
+    a, s = feishu_creds()
+    return bool(a and s)
+
+
 # ---------- 管理员 ----------
 def _hash_pw(pw, salt=None):
     salt = salt or os.urandom(16)

@@ -4,6 +4,9 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -12,7 +15,7 @@ from fastapi.responses import HTMLResponse
 
 from core import store
 from core.config import cfg
-from feishu import bot
+from feishu import auth, bot
 from llm.tools import tool_list
 
 app = FastAPI(title="feishu-agent 管理后台", docs_url=None, redoc_url=None)
@@ -96,7 +99,7 @@ def overview(request: Request):
     _auth(request)
     return {
         "bot_running": bot.RUNNING,
-        "feishu_configured": cfg.has_feishu(),
+        "feishu_configured": store.has_feishu(),
         "llm_configured": bool(store.get_setting("llm_api_key")),
         "model": store.get_setting("llm_model"),
         "counts": store.counts(),
@@ -131,6 +134,35 @@ async def save_settings(request: Request):
             store.set_setting("history_turns", str(max(0, int(b["history_turns"]))))
         except (TypeError, ValueError):
             pass
+    return {"ok": True}
+
+
+# ---------- 飞书配置 ----------
+@app.get("/api/feishu")
+def feishu_get(request: Request):
+    _auth(request)
+    sec = store.get_setting("feishu_app_secret", "")
+    return {"app_id": store.get_setting("feishu_app_id", ""),
+            "app_secret_masked": _mask(sec), "app_secret_set": bool(sec),
+            "bot_running": bot.RUNNING}
+
+@app.post("/api/feishu")
+async def feishu_set(request: Request):
+    _auth(request)
+    b = await request.json()
+    if "app_id" in b:       store.set_setting("feishu_app_id", (b["app_id"] or "").strip())
+    if b.get("app_secret"): store.set_setting("feishu_app_secret", b["app_secret"].strip())  # 仅非空才更新
+    auth.reset()  # 取数(读写文档)立即用新凭证；长连接需「重启」重连
+    return {"ok": True}
+
+@app.post("/api/feishu/restart")
+def feishu_restart(request: Request):
+    _auth(request)
+    # 进程自重执行：长连接是启动时建立的，换凭证后整进程重启才会用新凭证重连（本地/Docker 都管用）
+    def _go():
+        time.sleep(1.0)
+        os.execv(sys.executable, [sys.executable, "-m", "app.main"])
+    threading.Thread(target=_go, daemon=True).start()
     return {"ok": True}
 
 

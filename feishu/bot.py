@@ -6,7 +6,7 @@ import threading
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
-from core.config import cfg
+from core import store
 from llm.engine import run as llm_run
 
 RUNNING = False          # 给管理后台看连接状态
@@ -16,7 +16,8 @@ _client = None
 def _api():
     global _client
     if _client is None:
-        _client = lark.Client.builder().app_id(cfg.feishu["app_id"]).app_secret(cfg.feishu["app_secret"]).build()
+        app_id, app_secret = store.feishu_creds()
+        _client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
     return _client
 
 
@@ -60,12 +61,13 @@ def on_message(data):
 def _serve():
     global RUNNING
     asyncio.set_event_loop(asyncio.new_event_loop())  # 子线程需要自己的事件循环
+    app_id, app_secret = store.feishu_creds()
     handler = (lark.EventDispatcherHandler.builder("", "")
                .register_p2_im_message_receive_v1(on_message).build())
     RUNNING = True
     print("feishu-agent bot：长连接监听中")
     try:
-        lark.ws.Client(cfg.feishu["app_id"], cfg.feishu["app_secret"],
+        lark.ws.Client(app_id, app_secret,
                        event_handler=handler, log_level=lark.LogLevel.INFO).start()
     finally:
         RUNNING = False
