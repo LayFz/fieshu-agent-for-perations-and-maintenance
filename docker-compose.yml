@@ -6,8 +6,8 @@ services:
     ports:
       - "8800:8800"                       # 管理后台；飞书是长连接出站，无需对外暴露端口
     volumes:
-      - ./config.yaml:/app/config.yaml:ro # 飞书凭证 + 初始管理员密码（也可改用下面的环境变量）
-      - ./data:/app/data                  # 记忆/设置/用量(SQLite)，持久化
+      - ./config.yaml:/code/config.yaml:ro # 飞书凭证 + 初始管理员密码（也可改用下面的环境变量）
+      - ./data:/code/data                  # 记忆/设置/用量(SQLite)，持久化
     # 不想挂 config.yaml 就改用环境变量（优先级更高）：
     # environment:
     #   FEISHU_APP_ID: cli_xxx

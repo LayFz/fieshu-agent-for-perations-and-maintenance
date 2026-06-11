@@ -6,8 +6,8 @@ import threading
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
-from .config import cfg
-from .llm import run as llm_run
+from core.config import cfg
+from llm.engine import run as llm_run
 
 RUNNING = False          # 给管理后台看连接状态
 _client = None

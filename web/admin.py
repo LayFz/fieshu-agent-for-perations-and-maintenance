@@ -1,5 +1,5 @@
 """管理后台：FastAPI（登录 + 大模型配置 + 记忆浏览 + 工具清单 + token 用量）。
-前端是同源单文件 web/index.html（无需构建）。"""
+前端是同源单文件 web/static/index.html（无需构建）。"""
 import base64
 import hashlib
 import hmac
@@ -10,12 +10,13 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 
-from . import bot, store
-from .config import cfg
-from .tools import tool_list
+from core import store
+from core.config import cfg
+from feishu import bot
+from llm.tools import tool_list
 
 app = FastAPI(title="feishu-agent 管理后台", docs_url=None, redoc_url=None)
-_WEB = Path(__file__).resolve().parent / "web"
+_WEB = Path(__file__).resolve().parent / "static"
 _COOKIE = "fa_sid"
 _TTL = 7 * 24 * 3600
 

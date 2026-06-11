@@ -1,5 +1,6 @@
 """工具定义（给大模型 function-calling）+ 执行器（真正干活）。"""
-from . import feishu_docs, store
+from core import store
+from feishu import docs as feishu_docs
 
 # OpenAI 兼容的 tools schema
 TOOLS = [

@@ -4,7 +4,7 @@ import time
 
 import requests
 
-from .config import cfg
+from core.config import cfg
 
 _lock = threading.Lock()
 _cache = {"token": None, "exp": 0.0}

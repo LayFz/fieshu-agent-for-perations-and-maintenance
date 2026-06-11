@@ -1,8 +1,8 @@
 """入口：首启播种(设置 + 管理员) → 启动飞书 bot(后台线程) + 管理后台(uvicorn 主线程)。"""
 import uvicorn
 
-from . import store
-from .config import cfg
+from core import store
+from core.config import cfg
 
 
 def _bootstrap():
@@ -24,13 +24,13 @@ def _bootstrap():
 
 def main():
     _bootstrap()
-    from . import bot
+    from feishu import bot
     if cfg.has_feishu():
         bot.start_in_background()
     else:
         print("⚠ 未配置飞书 app_id/secret，bot 未启动（管理后台仍可用，可先配模型）")
 
-    from . import admin
+    from web import admin
     port = int(cfg.web.get("port", 8800))
     print(f"★ 管理后台：http://localhost:{port}")
     uvicorn.run(admin.app, host="0.0.0.0", port=port, log_level="info")

@@ -4,7 +4,7 @@ import json
 
 from openai import OpenAI
 
-from . import store
+from core import store
 from .tools import TOOLS, execute
 
 _MAX_TOOL_LOOPS = 6
