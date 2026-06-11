@@ -11,6 +11,8 @@ from llm.engine import run as llm_run
 
 RUNNING = False          # 给管理后台看连接状态
 _client = None
+_seen = set()            # 已处理的 message_id：飞书事件可能重投，去重避免重复回答
+_seen_lock = threading.Lock()
 
 
 def _api():
@@ -46,16 +48,39 @@ def _strip_mentions(text, mentions):
     return text.strip()
 
 
+def _handle(chat_id, text):
+    # 真正干活：调模型 + 工具，再回群。放后台线程，避免阻塞事件 ACK
+    try:
+        ans = llm_run(chat_id, text)
+        print(f"[已回复] {ans[:80]!r}", flush=True)
+        _reply(chat_id, ans)
+    except Exception as e:
+        import traceback
+        print("处理消息出错:", e, flush=True)
+        traceback.print_exc()
+
+
 def on_message(data):
+    # 必须尽快返回让 SDK 及时 ACK；否则飞书超时会重投 → 重复回答
     try:
         msg = data.event.message
+        msg_id = getattr(msg, "message_id", None)
         chat_id = msg.chat_id
         text = _strip_mentions(_extract_text(msg), getattr(msg, "mentions", None))
+        print(f"[收到消息] id={msg_id} chat={chat_id} -> {text!r}", flush=True)
         if not text:
             return
-        _reply(chat_id, llm_run(chat_id, text))
+        with _seen_lock:                      # 去重：同一条消息(飞书重投)只处理一次
+            if msg_id in _seen:
+                print(f"[跳过重复] id={msg_id}", flush=True)
+                return
+            _seen.add(msg_id)
+            if len(_seen) > 2000:             # 防集合无限增长
+                _seen.clear()
+                _seen.add(msg_id)
+        threading.Thread(target=_handle, args=(chat_id, text), daemon=True).start()
     except Exception as e:
-        print("处理消息出错:", e)
+        print("处理消息出错:", e, flush=True)
 
 
 def _serve():
