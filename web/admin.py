@@ -54,10 +54,14 @@ def _mask(s):
     return (s[:3] + "***" + s[-2:]) if len(s) > 6 else "***"
 
 
-# ---------- 静态首页 ----------
+# ---------- 静态首页 / 健康检查 ----------
 @app.get("/", response_class=HTMLResponse)
 def index():
     return (_WEB / "index.html").read_text(encoding="utf-8")
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 
 # ---------- 鉴权 ----------

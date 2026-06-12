@@ -1,6 +1,7 @@
 """飞书长连接：收群消息 → 大模型+工具 → 回群。在后台线程里常驻，只出站、不开端口。"""
 import asyncio
 import json
+import re
 import threading
 
 import lark_oapi as lark
@@ -23,10 +24,19 @@ def _api():
     return _client
 
 
+def _md_card(text):
+    # 飞书纯文本不渲染 Markdown；用交互卡片的 markdown 组件渲染 **粗体**/列表/链接/代码。
+    # 标题(# ~ ######)降级成粗体行，避免飞书 markdown 不吃 ATX 标题时露出原始 # 号。
+    md = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", r"**\1**", text, flags=re.M)
+    return {"config": {"wide_screen_mode": True},
+            "elements": [{"tag": "markdown", "content": md}]}
+
+
 def _reply(chat_id, text):
     req = (CreateMessageRequest.builder().receive_id_type("chat_id")
            .request_body(CreateMessageRequestBody.builder().receive_id(chat_id)
-                         .msg_type("text").content(json.dumps({"text": text})).build()).build())
+                         .msg_type("interactive")
+                         .content(json.dumps(_md_card(text))).build()).build())
     resp = _api().im.v1.message.create(req)
     if not resp.success():
         print("回消息失败:", resp.code, resp.msg)
