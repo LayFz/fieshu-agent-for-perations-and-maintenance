@@ -1,4 +1,9 @@
-"""应用身份 token（tenant_access_token）：app_id+secret 自动换取并缓存，永不过期、不绑个人。"""
+"""应用身份 token（tenant_access_token）：按应用的 app_id+secret 换取并缓存。
+
+多应用：当前线程用哪个应用的凭证，由 contextvar 决定（engine 跑工具前用 use_app 设定）。
+缓存按 app_id 分桶，不同应用互不串。
+"""
+import contextvars
 import threading
 import time
 
@@ -7,23 +12,43 @@ import requests
 from core import store
 
 _lock = threading.Lock()
-_cache = {"token": None, "exp": 0.0, "key": None}
+_cache = {}                                  # app_id -> {"token": str, "exp": float}
+_current = contextvars.ContextVar("feishu_creds", default=None)   # (app_id, app_secret)
 
 
-def reset():
-    """飞书凭证变更后清缓存，下次取数用新 token。"""
+def use_app(app_id, app_secret):
+    """设定当前上下文使用的飞书应用凭证；返回 token 供 reset_ctx 还原。"""
+    return _current.set((app_id, app_secret))
+
+def reset_ctx(token):
+    try:
+        _current.reset(token)
+    except Exception:
+        pass
+
+def reset(app_id=None):
+    """凭证变更后清缓存：不传清全部，传 app_id 只清那一个。"""
     with _lock:
-        _cache["token"] = None
+        if app_id is None:
+            _cache.clear()
+        else:
+            _cache.pop(app_id, None)
 
 
 def tenant_token() -> str:
-    app_id, app_secret = store.feishu_creds()  # 实时取自 DB（后台可改）
+    cur = _current.get()
+    if cur and cur[0]:
+        app_id, app_secret = cur
+    else:
+        app_id, app_secret = store.legacy_feishu_creds()   # 兜底：迁移前的全局凭证
     now = time.time()
-    if _cache["token"] and _cache["key"] == app_id and now < _cache["exp"] - 120:
-        return _cache["token"]
+    c = _cache.get(app_id)
+    if c and now < c["exp"] - 120:
+        return c["token"]
     with _lock:
-        if _cache["token"] and _cache["key"] == app_id and now < _cache["exp"] - 120:
-            return _cache["token"]
+        c = _cache.get(app_id)
+        if c and now < c["exp"] - 120:
+            return c["token"]
         r = requests.post(
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
             json={"app_id": app_id, "app_secret": app_secret},
@@ -31,7 +56,5 @@ def tenant_token() -> str:
         ).json()
         if r.get("code") != 0:
             raise RuntimeError(f"获取 tenant_access_token 失败: {r}")
-        _cache["token"] = r["tenant_access_token"]
-        _cache["exp"] = time.time() + r.get("expire", 7200)
-        _cache["key"] = app_id
-        return _cache["token"]
+        _cache[app_id] = {"token": r["tenant_access_token"], "exp": time.time() + r.get("expire", 7200)}
+        return _cache[app_id]["token"]

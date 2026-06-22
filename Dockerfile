@@ -10,6 +10,8 @@ COPY app ./app
 COPY core ./core
 COPY feishu ./feishu
 COPY llm ./llm
+COPY obs ./obs
+COPY sched ./sched
 COPY web ./web
 
 EXPOSE 8800

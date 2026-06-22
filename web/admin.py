@@ -1,4 +1,4 @@
-"""管理后台：FastAPI（登录 + 大模型配置 + 记忆浏览 + 工具清单 + token 用量）。
+"""管理后台：FastAPI（登录 + AI供应商 + 应用 + 记忆 + 工具池 + 用量 + 全局可观测配置）。
 前端是同源单文件 web/static/index.html（无需构建）。"""
 import base64
 import hashlib
@@ -14,11 +14,10 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 
 from core import store
-from core.config import cfg
 from feishu import auth, bot
-from llm.tools import tool_list
+from llm.tools import all_tools, tool_list_for
 
-app = FastAPI(title="feishu-agent 管理后台", docs_url=None, redoc_url=None)
+app = FastAPI(title="数字员工平台 管理后台", docs_url=None, redoc_url=None)
 _WEB = Path(__file__).resolve().parent / "static"
 _COOKIE = "fa_sid"
 _TTL = 7 * 24 * 3600
@@ -53,6 +52,12 @@ def _mask(s):
         return ""
     return (s[:3] + "***" + s[-2:]) if len(s) > 6 else "***"
 
+async def _body(request):
+    try:
+        return await request.json()
+    except Exception:
+        return {}
+
 
 # ---------- 静态首页 / 健康检查 ----------
 @app.get("/", response_class=HTMLResponse)
@@ -67,9 +72,9 @@ def healthz():
 # ---------- 鉴权 ----------
 @app.post("/api/login")
 async def login(request: Request, response: Response):
-    body = await request.json()
-    username = (body.get("username") or "").strip()
-    password = body.get("password") or ""
+    b = await _body(request)
+    username = (b.get("username") or "").strip()
+    password = b.get("password") or ""
     if not store.verify_admin(username, password):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     response.set_cookie(_COOKIE, _make_session(username), max_age=_TTL, httponly=True, samesite="lax")
@@ -87,10 +92,10 @@ def me(request: Request):
 @app.post("/api/password")
 async def change_password(request: Request):
     _auth(request)
-    body = await request.json()
-    if not store.verify_admin(store.admin_username(), body.get("old") or ""):
+    b = await _body(request)
+    if not store.verify_admin(store.admin_username(), b.get("old") or ""):
         raise HTTPException(status_code=400, detail="原密码错误")
-    new = body.get("new") or ""
+    new = b.get("new") or ""
     if len(new) < 6:
         raise HTTPException(status_code=400, detail="新密码至少 6 位")
     store.set_password(new)
@@ -101,68 +106,264 @@ async def change_password(request: Request):
 @app.get("/api/overview")
 def overview(request: Request):
     _auth(request)
+    provs = {p["id"]: p for p in store.list_providers()}
+    apps = []
+    for a in store.list_apps():
+        prov = provs.get(a.get("ai_provider_id"))
+        apps.append({
+            "id": a["id"], "name": a["name"], "enabled": a["enabled"],
+            "running": bot.is_running(a["id"]),
+            "feishu_set": bool(a.get("feishu_app_id") and a.get("feishu_app_secret")),
+            "provider": prov["name"] if prov else None,
+            "provider_ready": bool(prov and prov.get("api_key")),
+            "tools_count": len(a.get("tools") or []),
+            "skills_count": len(a.get("skills") or []),
+        })
     return {
-        "bot_running": bot.RUNNING,
-        "feishu_configured": store.has_feishu(),
-        "llm_configured": bool(store.get_setting("llm_api_key")),
-        "model": store.get_setting("llm_model"),
+        "apps": apps,
+        "providers_count": store.providers_count(),
+        "any_running": bot.any_running(),
+        "obs_configured": bool(store.get_setting("oo_base_url") and store.get_setting("oo_user")),
         "counts": store.counts(),
         "usage_total": store.usage_total(),
         "usage_today": store.usage_since(24 * 3600),
     }
 
 
-# ---------- 大模型配置 ----------
-@app.get("/api/settings")
-def get_settings(request: Request):
+# ---------- AI 供应商（多个模型） ----------
+@app.get("/api/providers")
+def providers(request: Request):
     _auth(request)
+    return {"providers": [{
+        "id": p["id"], "name": p["name"], "base_url": p["base_url"], "model": p["model"],
+        "api_key_masked": _mask(p["api_key"]), "api_key_set": bool(p["api_key"]),
+    } for p in store.list_providers()]}
+
+@app.post("/api/providers")
+async def create_provider(request: Request):
+    _auth(request)
+    b = await _body(request)
+    name = (b.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请填供应商名称")
+    pid = store.create_provider(name, (b.get("base_url") or "").strip(),
+                                (b.get("model") or "").strip(), (b.get("api_key") or "").strip())
+    return {"ok": True, "id": pid}
+
+@app.put("/api/providers/{pid}")
+async def edit_provider(pid: int, request: Request):
+    _auth(request)
+    b = await _body(request)
+    store.update_provider(pid, name=b.get("name"), base_url=b.get("base_url"),
+                          model=b.get("model"), api_key=(b.get("api_key") or "").strip())
+    return {"ok": True}
+
+@app.delete("/api/providers/{pid}")
+def remove_provider(pid: int, request: Request):
+    _auth(request)
+    store.delete_provider(pid)
+    return {"ok": True}
+
+
+# ---------- 工具池 ----------
+@app.get("/api/tools/pool")
+def tools_pool(request: Request):
+    _auth(request)
+    return {"tools": all_tools()}
+
+
+# ---------- 技能（知识/工作方法包） ----------
+@app.get("/api/skills")
+def skills(request: Request):
+    _auth(request)
+    return {"skills": store.list_skills()}
+
+@app.post("/api/skills")
+async def create_skill(request: Request):
+    _auth(request)
+    b = await _body(request)
+    name = (b.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请填技能名称")
+    try:
+        sid = store.create_skill(name, b.get("description") or "", b.get("content") or "")
+    except Exception:
+        raise HTTPException(status_code=400, detail="技能名称已存在")
+    return {"ok": True, "id": sid}
+
+@app.put("/api/skills/{sid}")
+async def edit_skill(sid: int, request: Request):
+    _auth(request)
+    b = await _body(request)
+    store.update_skill(sid, name=b.get("name"), description=b.get("description"), content=b.get("content"))
+    return {"ok": True}
+
+@app.delete("/api/skills/{sid}")
+def remove_skill(sid: int, request: Request):
+    _auth(request)
+    store.delete_skill(sid)
+    return {"ok": True}
+
+
+# ---------- 定时任务 ----------
+@app.get("/api/schedules")
+def schedules(request: Request):
+    _auth(request)
+    names = {a["id"]: a["name"] for a in store.list_apps()}
+    out = []
+    for sc in store.list_schedules(_app_id(request)):
+        d = dict(sc)
+        d["app_name"] = names.get(sc["app_id"])
+        out.append(d)
+    return {"schedules": out}
+
+@app.post("/api/schedules")
+async def create_schedule(request: Request):
+    _auth(request)
+    b = await _body(request)
+    if not b.get("app_id") or not b.get("chat_id"):
+        raise HTTPException(status_code=400, detail="需指定 app_id 与 chat_id（发哪个群）")
+    if b.get("kind") not in ("daily", "weekly", "interval"):
+        raise HTTPException(status_code=400, detail="kind 必须是 daily/weekly/interval")
+    sid, nxt = store.create_schedule(int(b["app_id"]), b["chat_id"], b.get("title") or "",
+                                     b.get("instruction") or "", b["kind"], b.get("spec") or "",
+                                     1 if b.get("enabled", True) else 0)
+    return {"ok": True, "id": sid, "next_run_ts": nxt}
+
+@app.put("/api/schedules/{sid}")
+async def edit_schedule(sid: int, request: Request):
+    _auth(request)
+    b = await _body(request)
+    fields = {k: b[k] for k in ("title", "instruction", "kind", "spec", "chat_id", "enabled") if k in b}
+    store.update_schedule(sid, **fields)
+    return {"ok": True}
+
+@app.delete("/api/schedules/{sid}")
+def remove_schedule(sid: int, request: Request):
+    _auth(request)
+    store.delete_schedule(sid)
+    return {"ok": True}
+
+@app.post("/api/schedules/{sid}/run")
+def run_schedule(sid: int, request: Request):
+    _auth(request)
+    from sched import runner
+    ok = runner.run_now(sid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"ok": True}
+
+
+# ---------- 应用（数字员工/席位） ----------
+def _app_view(a):
     return {
-        "base_url": store.get_setting("llm_base_url", ""),
-        "model": store.get_setting("llm_model", ""),
-        "api_key_masked": _mask(store.get_setting("llm_api_key", "")),
-        "api_key_set": bool(store.get_setting("llm_api_key")),
-        "system_prompt": store.get_setting("system_prompt", ""),
-        "history_turns": int(store.get_setting("history_turns", "12") or 12),
+        "id": a["id"], "name": a["name"],
+        "feishu_app_id": a.get("feishu_app_id") or "",
+        "feishu_secret_masked": _mask(a.get("feishu_app_secret")),
+        "feishu_secret_set": bool(a.get("feishu_app_secret")),
+        "ai_provider_id": a.get("ai_provider_id"),
+        "system_prompt": a.get("system_prompt") or "",
+        "history_turns": int(a.get("history_turns") or 12),
+        "tools": a.get("tools") or [],
+        "skills": a.get("skills") or [],
+        "enabled": a["enabled"],
+        "running": bot.is_running(a["id"]),
     }
 
-@app.post("/api/settings")
-async def save_settings(request: Request):
+@app.get("/api/apps")
+def apps(request: Request):
     _auth(request)
-    b = await request.json()
-    if "base_url" in b:       store.set_setting("llm_base_url", (b["base_url"] or "").strip())
-    if "model" in b:          store.set_setting("llm_model", (b["model"] or "").strip())
-    if b.get("api_key"):      store.set_setting("llm_api_key", b["api_key"].strip())  # 仅非空才更新，避免掩码覆盖真值
-    if "system_prompt" in b:  store.set_setting("system_prompt", b["system_prompt"] or "")
-    if "history_turns" in b:
-        try:
-            store.set_setting("history_turns", str(max(0, int(b["history_turns"]))))
-        except (TypeError, ValueError):
-            pass
+    return {"apps": [_app_view(a) for a in store.list_apps()]}
+
+@app.get("/api/apps/{aid}")
+def app_detail(aid: int, request: Request):
+    _auth(request)
+    a = store.get_app(aid)
+    if not a:
+        raise HTTPException(status_code=404, detail="应用不存在")
+    v = _app_view(a)
+    v["tool_list"] = tool_list_for(a.get("tools"))
+    v["skill_list"] = [{"id": s["id"], "name": s["name"], "description": s.get("description")}
+                       for s in store.skills_for(a.get("skills"))]
+    return v
+
+@app.post("/api/apps")
+async def create_app(request: Request):
+    _auth(request)
+    b = await _body(request)
+    name = (b.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请填应用名称")
+    aid = store.create_app(
+        name, (b.get("feishu_app_id") or "").strip(), (b.get("feishu_app_secret") or "").strip(),
+        b.get("ai_provider_id"), b.get("system_prompt") or "",
+        int(b.get("history_turns") or 12), b.get("tools") or [],
+        1 if b.get("enabled", True) else 0, skills=b.get("skills") or [])
+    return {"ok": True, "id": aid, "note": "新应用的飞书长连接需重启服务后建立"}
+
+@app.put("/api/apps/{aid}")
+async def edit_app(aid: int, request: Request):
+    _auth(request)
+    b = await _body(request)
+    fields = {k: b[k] for k in ("name", "feishu_app_id", "ai_provider_id",
+                                "system_prompt", "history_turns", "tools", "skills", "enabled") if k in b}
+    if "enabled" in fields:
+        fields["enabled"] = 1 if fields["enabled"] else 0
+    if b.get("feishu_app_secret"):
+        fields["feishu_app_secret"] = b["feishu_app_secret"].strip()
+    store.update_app(aid, **fields)
+    auth.reset(aid)   # 该应用飞书凭证若变更，取数立即用新值；长连接仍需重启
+    return {"ok": True, "note": "人设/工具/AI 即时生效；飞书凭证或启用状态变更需重启服务重连"}
+
+@app.delete("/api/apps/{aid}")
+def remove_app(aid: int, request: Request):
+    _auth(request)
+    store.delete_app(aid)
     return {"ok": True}
 
 
-# ---------- 飞书配置 ----------
-@app.get("/api/feishu")
-def feishu_get(request: Request):
+# ---------- 全局可观测配置（OpenObserve，供 query_logs 工具用） ----------
+@app.get("/api/obs")
+def obs_get(request: Request):
     _auth(request)
-    sec = store.get_setting("feishu_app_secret", "")
-    return {"app_id": store.get_setting("feishu_app_id", ""),
-            "app_secret_masked": _mask(sec), "app_secret_set": bool(sec),
-            "bot_running": bot.RUNNING}
+    oo_pw = store.get_setting("oo_pass", "")
+    bz_pw = store.get_setting("bz_pass", "")
+    uk_k = store.get_setting("uk_api_key", "")
+    return {
+        # OpenObserve（日志）
+        "base_url": store.get_setting("oo_base_url", ""),
+        "org": store.get_setting("oo_org", "default"),
+        "user": store.get_setting("oo_user", ""),
+        "pass_masked": _mask(oo_pw), "pass_set": bool(oo_pw),
+        # Beszel（服务器负载）
+        "bz_url": store.get_setting("bz_url", ""),
+        "bz_user": store.get_setting("bz_user", ""),
+        "bz_pass_masked": _mask(bz_pw), "bz_pass_set": bool(bz_pw),
+        # Uptime Kuma（服务在线状态）
+        "uk_url": store.get_setting("uk_url", ""),
+        "uk_key_masked": _mask(uk_k), "uk_key_set": bool(uk_k),
+    }
 
-@app.post("/api/feishu")
-async def feishu_set(request: Request):
+@app.post("/api/obs")
+async def obs_set(request: Request):
     _auth(request)
-    b = await request.json()
-    if "app_id" in b:       store.set_setting("feishu_app_id", (b["app_id"] or "").strip())
-    if b.get("app_secret"): store.set_setting("feishu_app_secret", b["app_secret"].strip())  # 仅非空才更新
-    auth.reset()  # 取数(读写文档)立即用新凭证；长连接需「重启」重连
+    b = await _body(request)
+    if "base_url" in b: store.set_setting("oo_base_url", (b["base_url"] or "").strip())
+    if "org" in b:      store.set_setting("oo_org", (b["org"] or "default").strip())
+    if "user" in b:     store.set_setting("oo_user", (b["user"] or "").strip())
+    if b.get("pass"):   store.set_setting("oo_pass", b["pass"].strip())
+    if "bz_url" in b:   store.set_setting("bz_url", (b["bz_url"] or "").strip())
+    if "bz_user" in b:  store.set_setting("bz_user", (b["bz_user"] or "").strip())
+    if b.get("bz_pass"): store.set_setting("bz_pass", b["bz_pass"].strip())
+    if "uk_url" in b:   store.set_setting("uk_url", (b["uk_url"] or "").strip())
+    if b.get("uk_key"): store.set_setting("uk_api_key", b["uk_key"].strip())
     return {"ok": True}
 
-@app.post("/api/feishu/restart")
-def feishu_restart(request: Request):
+
+# ---------- 服务重启（建立新应用的长连接） ----------
+@app.post("/api/restart")
+def restart(request: Request):
     _auth(request)
-    # 进程自重执行：长连接是启动时建立的，换凭证后整进程重启才会用新凭证重连（本地/Docker 都管用）
     def _go():
         time.sleep(1.0)
         os.execv(sys.executable, [sys.executable, "-m", "app.main"])
@@ -170,18 +371,15 @@ def feishu_restart(request: Request):
     return {"ok": True}
 
 
-# ---------- 工具清单 ----------
-@app.get("/api/tools")
-def tools(request: Request):
-    _auth(request)
-    return {"tools": tool_list()}
+# ---------- 记忆（按应用过滤） ----------
+def _app_id(request):
+    v = request.query_params.get("app_id")
+    return int(v) if v not in (None, "", "all") else None
 
-
-# ---------- 记忆 ----------
 @app.get("/api/memory/notes")
 def notes(request: Request):
     _auth(request)
-    return {"notes": store.list_notes()}
+    return {"notes": store.list_notes(_app_id(request))}
 
 @app.delete("/api/memory/notes/{note_id}")
 def del_note(note_id: int, request: Request):
@@ -192,21 +390,26 @@ def del_note(note_id: int, request: Request):
 @app.get("/api/memory/chats")
 def chats(request: Request):
     _auth(request)
-    return {"chats": store.list_chats()}
+    return {"chats": store.list_chats(_app_id(request))}
 
-@app.get("/api/memory/chats/{chat_id}")
-def chat_detail(chat_id: str, request: Request):
+@app.get("/api/memory/chat")
+def chat_detail(request: Request):
     _auth(request)
-    return {"messages": store.chat_messages(chat_id)}
+    aid = request.query_params.get("app_id")
+    chat_id = request.query_params.get("chat_id", "")
+    if aid in (None, "", "all"):
+        raise HTTPException(status_code=400, detail="缺少 app_id")
+    return {"messages": store.chat_messages(int(aid), chat_id)}
 
 
-# ---------- token 用量 ----------
+# ---------- token 用量（按应用过滤） ----------
 @app.get("/api/usage")
 def usage(request: Request):
     _auth(request)
+    aid = _app_id(request)
     return {
-        "total": store.usage_total(),
-        "by_day": store.usage_by_day(),
-        "by_model": store.usage_by_model(),
-        "recent": store.usage_recent(50),
+        "total": store.usage_total(aid),
+        "by_day": store.usage_by_day(app_id=aid),
+        "by_model": store.usage_by_model(aid),
+        "recent": store.usage_recent(50, aid),
     }
