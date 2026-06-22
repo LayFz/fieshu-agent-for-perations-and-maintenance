@@ -14,6 +14,24 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from core import store
 from llm.engine import run as llm_run
 
+# lark 的 ws 客户端用了一个【模块级全局事件循环】，所有 Client.start() 共用它，
+# 同进程跑多个长连接时第二个会撞 "This event loop is already running"。
+# 用线程本地代理替换该全局 loop：每个应用线程各拿一个独立事件循环，互不干扰。
+import lark_oapi.ws.client as _wsc
+
+_loop_local = threading.local()
+
+class _ThreadLoopProxy:
+    def __getattr__(self, name):
+        loop = getattr(_loop_local, "loop", None)
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            _loop_local.loop = loop
+        return getattr(loop, name)
+
+_wsc.loop = _ThreadLoopProxy()
+
 _send_clients = {}          # app_id -> lark.Client（回消息用）
 _running = {}               # app_id -> bool（连接状态，给后台看）
 _started = set()            # 已启动过 _serve 的 app_id，避免重复起线程
@@ -104,7 +122,7 @@ def _on_message(app_id, data):
 
 def _serve(app):
     app_id = app["id"]
-    asyncio.set_event_loop(asyncio.new_event_loop())   # 子线程需要自己的事件循环
+    # 事件循环由上面的 _ThreadLoopProxy 按线程惰性创建（lark start() 首次访问 loop 时）
     handler = (lark.EventDispatcherHandler.builder("", "")
                .register_p2_im_message_receive_v1(lambda data, _id=app_id: _on_message(_id, data))
                .build())
