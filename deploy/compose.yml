@@ -1,6 +1,6 @@
-# feishu-agent 内网部署（.51 = ubantu2，overlay 10.10.0.3 / LAN 192.168.110.51）。
+# feishu-agent 内网部署（.51 = ubantu2，overlay <deploy-host-wg> / LAN <deploy-host>）。
 # 单容器：飞书机器人长连接(只出站) + 管理后台(:8800)。SQLite 数据持久化在 ./data。
-# 镜像来自自建 Harbor(10.10.0.1)；真实密钥走挂载的 config.yaml（不入库、不进镜像）。
+# 镜像来自自建 Harbor(<harbor-host>)；真实密钥走挂载的 config.yaml（不入库、不进镜像）。
 name: feishu-agent
 
 services:
@@ -17,7 +17,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     ports:
-      # 全网卡：公司 LAN 直接 http://192.168.110.51:8800 进后台；
+      # 全网卡：公司 LAN 直接 http://<deploy-host>:8800 进后台；
       # 飞书是出站长连接，无需任何入站端口
       - "8800:8800"
     # 健康检查继承自镜像 HEALTHCHECK(/healthz)；deploy.sh 据此判健康门

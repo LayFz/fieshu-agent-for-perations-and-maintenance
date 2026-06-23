@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # feishu-agent 内网(.51)部署/回滚脚本。在 .51 的部署目录执行（CI 远程调用，或手动）。
 #
-#   部署：REGISTRY=10.10.0.1 PROJECT=feishu-agent TAG=<sha> HARBOR_USER=.. HARBOR_PASSWORD=.. bash deploy.sh
+#   部署：REGISTRY=<harbor-host> PROJECT=feishu-agent TAG=<sha> HARBOR_USER=.. HARBOR_PASSWORD=.. bash deploy.sh
 #   回滚：bash deploy.sh rollback        # 切回上一个成功部署的 tag
 #
 # 前置（.51 一次性准备好，不入库）：
 #   - config.yaml（飞书 app_id/app_secret + 初始管理员密码）
 #   - data/（SQLite 持久化目录，首次自动建）
-#   - /etc/docker/daemon.json 已把 10.10.0.1 加入 insecure-registries（.51 已就绪）
+#   - /etc/docker/daemon.json 已把 <harbor-host> 加入 insecure-registries（.51 已就绪）
 set -euo pipefail
 cd "$(dirname "$0")"
 ACTION="${1:-deploy}"
 HEALTH_CONTAINER="${HEALTH_CONTAINER:-feishu-agent}"
 
-: "${REGISTRY:?需要 REGISTRY，如 10.10.0.1}"
+: "${REGISTRY:?需要 REGISTRY，如 <harbor-host>}"
 : "${PROJECT:?需要 PROJECT，如 feishu-agent}"
 
 if [ "$ACTION" = "rollback" ]; then
@@ -52,4 +52,4 @@ if [ "$ok" != "1" ]; then
   echo "✗ $HEALTH_CONTAINER 未达健康，请查日志：docker logs $HEALTH_CONTAINER"
   exit 1
 fi
-echo "✓ 部署完成 tag=$TAG（健康门：$HEALTH_CONTAINER 已就绪），后台 http://192.168.110.51:8800"
+echo "✓ 部署完成 tag=$TAG（健康门：$HEALTH_CONTAINER 已就绪），后台 http://<deploy-host>:8800"

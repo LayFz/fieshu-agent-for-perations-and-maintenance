@@ -506,7 +506,7 @@ async function obs(){
     <div class="card">
       <h3 style="margin:0 0 4px;font-size:15px">① OpenObserve（日志）<span class="muted" style="font-weight:400"> · 工具 query_logs / list_log_streams</span></h3>
       <div class="row">
-        <div><label>base_url</label><input id="o-url" value="${esc(o.base_url)}" placeholder="http://192.168.110.18:5080"></div>
+        <div><label>base_url</label><input id="o-url" value="${esc(o.base_url)}" placeholder="http://<monitor-host>:5080"></div>
         <div style="flex:0 0 180px"><label>组织 org</label><input id="o-org" value="${esc(o.org)}" placeholder="default"></div>
       </div>
       <div class="row">
@@ -518,7 +518,7 @@ async function obs(){
 
     <div class="card">
       <h3 style="margin:0 0 4px;font-size:15px">② Beszel（服务器负载）<span class="muted" style="font-weight:400"> · 工具 server_stats</span></h3>
-      <label>URL</label><input id="b-url" value="${esc(o.bz_url)}" placeholder="http://192.168.110.18:8090">
+      <label>URL</label><input id="b-url" value="${esc(o.bz_url)}" placeholder="http://<monitor-host>:8090">
       <div class="row">
         <div><label>账号(邮箱)</label><input id="b-user" value="${esc(o.bz_user)}" placeholder="feishu@xxx"></div>
         <div><label>密码 ${o.bz_pass_set?`<span class="muted">（已设，留空=不改）</span>`:''}</label>
@@ -529,7 +529,7 @@ async function obs(){
 
     <div class="card">
       <h3 style="margin:0 0 4px;font-size:15px">③ Uptime Kuma（服务在线状态）<span class="muted" style="font-weight:400"> · 工具 service_status</span></h3>
-      <label>URL</label><input id="u-url" value="${esc(o.uk_url)}" placeholder="http://192.168.110.18:3001">
+      <label>URL</label><input id="u-url" value="${esc(o.uk_url)}" placeholder="http://<monitor-host>:3001">
       <label>API Key ${o.uk_key_set?`<span class="muted">（已设，留空=不改）</span>`:''}</label>
       <input id="u-key" type="password" placeholder="${o.uk_key_set?'留空保持不变':'Settings → API Keys 里生成的 uk1_...'}">
       <div class="hint">只读走 /metrics，给的就是这个 API Key，不需要管理员账号。</div>

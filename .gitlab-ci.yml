@@ -2,13 +2,13 @@
 # 镜像双标签 :SHA(精确回滚) + :latest。单容器(Python + SQLite，前端内置)，比支付中台简单。
 #
 # 需在 GitLab 项目 Settings → CI/CD → Variables 配置（Masked 标注的勿泄漏）：
-#   HARBOR_REGISTRY=10.10.0.1      HARBOR_PROJECT=feishu-agent
+#   HARBOR_REGISTRY=<harbor-host>      HARBOR_PROJECT=feishu-agent
 #   HARBOR_USER / HARBOR_PASSWORD(Masked)          # Harbor 项目级机器人账号
-#   DEPLOY_HOST=192.168.110.51                     # .51(ubantu2) LAN 地址（overlay 10.10.0.3 亦可）
+#   DEPLOY_HOST=<deploy-host>                     # .51(ubantu2) LAN 地址（overlay <deploy-host-wg> 亦可）
 #   DEPLOY_DIR=/opt/feishu-agent                   # .51 上的部署目录
 #   DEPLOY_SSH_KEY=/root/.ssh/id_ed25519_deploy    # infra runner → .51 的免密私钥路径
 #   FEISHU_WEBHOOK(Masked) / FEISHU_SECRET(Masked，可选)
-# 前置：build runner(tags: build，shell executor，宿主有 docker + daemon.json insecure-registries:[10.10.0.1])；
+# 前置：build runner(tags: build，shell executor，宿主有 docker + daemon.json insecure-registries:[<harbor-host>])；
 #       .51 已放好 config.yaml（飞书凭证+管理员密码）与 data/。
 
 stages: [build, deploy, notify]
