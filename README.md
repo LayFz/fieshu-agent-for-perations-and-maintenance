@@ -1,87 +1,85 @@
-# feishu-agent
+# feishu-agent · 飞书数字员工平台
 
-公司内部的飞书智能助手。**飞书群里 @机器人说话 → 大模型 + 工具读写飞书文档/知识库 → 回群**，
-带**对话记忆**、**长期记忆**，并提供一个**管理后台**（登录后配置模型、看记忆、看工具、看 token 用量）。
+一个进程里跑**多个「数字员工」**的飞书机器人平台。每个数字员工 = 一个独立飞书机器人 + 绑定一个 AI 模型 + 勾选的工具 + 勾选的技能 + 自己的人设。
 
-- **只对内、不用公网**：飞书用**长连接**（机器人主动拨出），服务只出站、不开放入站端口；管理后台端口只在内网开。
-- **可换任意模型**：任何 OpenAI 兼容接口（DeepSeek / 通义 / OpenAI / 自建网关…），后台改 3 项即生效，不动代码。
-- **密钥不入库**：`config.yaml`（gitignore）或环境变量；运行时设置存 `data/agent.db`。
-- **一条命令 Docker 起**。
+> 群里 **@机器人** → 大模型 + 工具循环干活 → 回群。带对话记忆、长期记忆、定时任务，外加一个零构建的管理后台。
+
+- **多应用、四层隔离**：身份(独立飞书应用) + AI(各绑各的) + 工具(勾选子集) + 技能(勾选子集)，天然防越权。
+- **只对内、不用公网**：飞书走**长连接**（机器人主动拨出），服务只出站、不开入站端口。
+- **任意 OpenAI 兼容模型**：DeepSeek / 豆包 / 通义 / OpenAI / 自建网关…，后台配置即生效，不动代码。
+- **单容器**：Python + SQLite，前端内置，`docker compose up` 一条命令起。
+- **密钥不入库**：`config.yaml`(gitignore) 或环境变量；运行时配置存 SQLite。
+
+## 能力一览
+
+| 能力 | 说明 |
+|---|---|
+| 🤖 多数字员工 | 一套平台开多个应用，每个独立身份、模型、能力、人设 |
+| 🛠️ 工具(function calling) | 飞书文档读写、日志查询、服务器/服务监控、定时任务管理…按应用勾选 |
+| 📚 技能(skill) | 知识/工作方法包（如「公司架构」），渐进披露，按应用隔离 |
+| ⏰ 定时任务 | 到点自动跑指令并发回群（每天/每周/每隔N分钟）；对话或后台均可创建 |
+| 🧠 记忆 | 对话历史(滑动窗口) + 长期记忆(remember)，按应用隔离 |
+| 📊 可观测 | 只读接 OpenObserve(日志) / Beszel(服务器负载) / Uptime Kuma(服务状态) |
+| 🖥️ 管理后台 | 应用 / AI供应商 / 技能 / 定时任务 / 记忆 / 用量 / 可观测，全可视化配置 |
 
 ## 架构
 
 ```
-飞书群 ──长连接(出站)──▶  bot(后台线程)  ──▶  llm 编排(对话历史+长期记忆+工具循环)
-                                                   │  每次调用记 token 用量
-                                                   ▼
-                                         tools ──▶ 飞书 docx/wiki REST（读/写/建文档）
-管理员浏览器 ──:8800──▶  admin(FastAPI, 主线程)  ──▶  同一个 SQLite(data/agent.db)
-                          登录 / 配模型 / 看记忆 / 看工具 / 看用量
+飞书群 ──长连接(出站)──▶ bot(每应用一条长连接) ──▶ 编排(历史+记忆+技能 → 工具循环)
+                                                          │              │
+                                              工具池(按应用勾选)    绑定的 AI(OpenAI 兼容)
+                                          ┌───────┼───────┬──────────┐
+                                       文档读写  只读监控  定时任务   read_skill
+管理员浏览器 ──:8800──▶ 管理后台(FastAPI) ──▶ 同一个 SQLite
+调度线程 ──到点──▶ 跑指令 → 发回群
 ```
 
-bot 与 admin **同进程**：后台改了模型配置，bot 下一条消息就用新配置（都读同一个 DB）。
+依赖单向、好扩展：`core ← feishu/obs/sched ← llm ← web ← app`。
 
-## 目录
+## 核心概念
 
-```
-feishu-agent/                仓库根（领域分包，互不搅）
-├ app/      入口与装配
-│  └ main.py        播种(设置+管理员) → 起 bot 线程 + uvicorn(admin)
-├ core/     共享基座（谁都依赖）
-│  ├ config.py      引导配置：config.yaml < 环境变量
-│  └ store.py       数据层：设置/管理员/记忆/笔记/token 用量（单个 SQLite）
-├ feishu/   飞书域
-│  ├ bot.py         长连接：收群消息 → llm → 回群
-│  ├ auth.py        应用身份 tenant_access_token（自动续，不绑个人）
-│  ├ docs.py        飞书 docx/wiki 高层操作
-│  └ md2feishu.py   Markdown → 飞书块（含原生表格）
-├ llm/      大模型域
-│  ├ engine.py      编排：历史 + 记忆 + 工具循环 + token 计量（配置实时取自 DB）
-│  └ tools.py       工具定义(function calling) + 执行器
-├ web/      管理后台域
-│  ├ admin.py       FastAPI（登录 + 配置 + 记忆 + 工具 + 用量）
-│  └ static/index.html   前端单页（无需构建）
-└ Dockerfile / docker-compose.yml / config.example.yaml / requirements.txt
-data/        运行后生成：agent.db（gitignore）
+- **应用 = 数字员工 = 席位**：开一个应用就上岗一个数字员工。
+- **工具 vs 技能**：工具是「能做的动作」，技能是「该懂的知识/方法」。互不替代，都按应用勾选。
+- **定时任务**：用对应应用的 AI+工具+技能跑，结果发回原群；走 REST，不依赖长连接。
+- **可观测**：监控连接是只读集成，连接信息在后台「可观测」页配置（全局共享）。
 
-依赖单向、好扩展：core ← feishu ← llm ← web ← app（加新能力就平级再开个包，如 scheduler/）
-```
+## 快速开始
 
-## 本地跑
-
+### 本地
 ```bash
 pip install -r requirements.txt
-cp config.example.yaml config.yaml      # 填飞书凭证；模型可留空，登录后台再配
+cp config.example.yaml config.yaml      # 填飞书 app_id/app_secret + 管理员密码；模型可登录后台再配
 python -m app.main
+# 浏览器开 http://localhost:8800，用初始管理员账号登录
 ```
-首启会打印初始管理员账号（默认 `admin / admin12345`），浏览器开 **http://localhost:8800** 登录。
 
-## Docker 跑
-
+### Docker
 ```bash
 docker compose up -d --build
 docker compose logs -f                  # 看首启打印的管理员账号
+# 访问 http://<host>:8800
 ```
-访问 **http://<内网IP>:8800**。数据持久化在 `./data`（删容器不丢记忆/配置）。
-生产建议：在 compose 里用环境变量设强 `ADMIN_PASSWORD`，并固定 `WEB_SESSION_SECRET`（重启不掉登录态）。
+数据持久化在 `./data`（设置/记忆/用量，删容器不丢）。
 
-## 管理后台能干嘛
+## 飞书侧一次性配置
 
-| 页面 | 作用 |
-|---|---|
-| 概览 | 机器人在线/飞书/模型状态；累计消息、记忆、会话、token |
-| 大模型配置 | 改 base_url / model / API Key / 提示词 / 历史轮数，**保存即生效** |
-| 记忆系统 | 看长期记忆（可删）、按会话看对话历史 |
-| 工具 | 当前机器人可调用的工具清单 |
-| Token 用量 | 总量、按天、按模型、最近调用明细 |
-| 账号 | 改管理员密码 |
+1. 自建应用启用**机器人**，加进目标群。
+2. 事件订阅选 **长连接**（不是 webhook），订阅 `im.message.receive_v1`。
+3. 按用途开权限：纯聊天/运维只需 `im:message` + `im:message:send_as_bot`；要读写文档再加 `wiki:wiki` / `docx:document`(写文档加 `drive:drive`)。
+4. 改完权限/事件**重新发版**才生效。
 
-## 飞书侧前提（一次性）
+> ⚠️ 事件订阅必须走**长连接**——这是「免公网、只出站」方案成立的根。
 
-1. 自建应用启用**机器人**，把机器人**加进目标群**。
-2. 事件订阅选**长连接**方式，订阅 `im.message.receive_v1`。
-3. 开通权限：`im:message`、`im:message:send_as_bot`、`wiki:wiki`、`docx:document`（要写文档再加 `drive:drive`）。
-4. 把**群**作为成员加进目标知识库（文档权限收敛到群，群里有机器人即可操作）。
-5. 改完权限/事件要**重新发版**才生效。
+## 上手配一个数字员工（后台）
 
-> ⚠️ 关键：事件订阅必须走**长连接**（不是 webhook），这是内网免公网方案成立的根。
+1. **AI 供应商** → 加一个模型（任意 OpenAI 兼容接口）。
+2. **应用** → 新建：填飞书 App ID/Secret、绑 AI、勾工具、（可选）勾技能、写人设、启用 → **重启服务**让长连接上线。
+3.（可选）**技能** → 建知识包；**可观测** → 配监控连接；**定时任务** → 建周期报告。
+
+## 技术栈
+
+Python · FastAPI · uvicorn · lark-oapi(飞书) · openai(OpenAI 兼容) · SQLite(WAL) · 原生 JS 单文件前端。
+
+## 开发与坑
+
+工程约定、数据模型、以及若干**部署/并发/时区的隐蔽坑**见 [`CLAUDE.md`](./CLAUDE.md)。内网部署流程见 [`deploy/DEPLOY.md`](./deploy/DEPLOY.md)。
