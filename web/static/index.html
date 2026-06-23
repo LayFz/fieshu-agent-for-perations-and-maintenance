@@ -129,7 +129,7 @@
 <script>
 const $ = (s,r=document)=>r.querySelector(s);
 const fmt = n => (n==null?0:Number(n)).toLocaleString('en-US');
-const dt  = ts => ts ? new Date(ts*1000).toLocaleString('zh-CN',{hour12:false}) : '';
+const dt  = ts => ts ? new Date(ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}) : '';
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function toast(m){ const t=$('#toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
 function openModal(html){ $('#dlg').innerHTML=html; $('#modal').style.display='flex'; }
