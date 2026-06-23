@@ -13,6 +13,9 @@ services:
       - ./config.yaml:/code/config.yaml:ro
       # 设置/记忆/用量(SQLite) —— 持久化，部署/回滚都不要动它
       - ./data:/code/data
+      # 时区：用宿主机时区（Asia/Shanghai），否则容器默认 UTC 会让定时任务差 8 小时
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     ports:
       # 全网卡：公司 LAN 直接 http://192.168.110.51:8800 进后台；
       # 飞书是出站长连接，无需任何入站端口
