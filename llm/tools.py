@@ -89,6 +89,18 @@ TOOLS = [
         }},
     }},
     {"type": "function", "function": {
+        "name": "docker_containers",
+        "description": "查各服务器上正在运行的 Docker 容器(来自 Beszel):每个容器的 CPU/内存/网络占用,以及它在哪台机器上。"
+                       "用于「某项目/某服务部署在哪台机」(传 name 容器名关键字)、「哪个容器占用最多」(sort=cpu/mem + top)、"
+                       "「某台机上跑了哪些容器」(传 server)。",
+        "parameters": {"type": "object", "properties": {
+            "server": {"type": "string", "description": "可选,服务器名关键字,只看某台机,如 agent1"},
+            "name": {"type": "string", "description": "可选,容器名关键字,找某项目部署在哪台机,如 gitlab"},
+            "sort": {"type": "string", "enum": ["cpu", "mem", "name"], "description": "排序,默认 cpu(占用从高到低)"},
+            "top": {"type": "integer", "description": "可选,只返回前 N 个,找占用最多时用"},
+        }},
+    }},
+    {"type": "function", "function": {
         "name": "service_status",
         "description": "查各服务/站点的在线状态(来自 Uptime Kuma):是否在线、响应时间、HTTPS 证书剩余天数。"
                        "用于巡检哪些服务挂了、证书快到期没。无参数。",
@@ -183,6 +195,9 @@ def execute(name, args, ctx=None):
                                       args.get("period", "15m"), args.get("limit", 50))
         if name == "server_stats":
             return beszel.servers(args.get("name"))
+        if name == "docker_containers":
+            return beszel.containers(args.get("server"), args.get("name"),
+                                     args.get("sort", "cpu"), args.get("top"))
         if name == "service_status":
             return uptimekuma.status()
         if name == "schedule_task":
