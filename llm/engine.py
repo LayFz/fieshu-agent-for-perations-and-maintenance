@@ -35,8 +35,36 @@ def _record(app_id, chat_id, model, resp):
                        getattr(u, "total_tokens", 0) or 0)
 
 
-def run(app: dict, chat_id: str, user_text: str) -> str:
-    """app 为 store.get_app() 返回的字典（含 tools 列表、ai_provider_id 等）。"""
+def _group_brief(speaker, speaker_open_id):
+    """群聊身份感知：告诉模型当前是谁在说话、怎么 @ 人。"""
+    who = f"「{speaker}」" + (f"(open_id={speaker_open_id})" if speaker_open_id else "")
+    return (
+        "\n\n【群聊身份】你在一个多人飞书群里工作，像团队里的运维工程师一样对话。"
+        f"当前这条消息的发言人是 {who}。历史里每条用户发言都以「姓名」前缀标注是谁说的，"
+        "请据此分辨不同的人、记住各自交代的事。\n"
+        "需要 @ 某人时，在回复正文里直接写 `<at id=对方open_id></at>`，飞书会@到并通知他；"
+        "@当前发言人用上面的 open_id 即可，@别人先用 list_chat_members 工具查群成员拿 open_id。"
+        "只在确有必要（指派/确认/提醒某人）时 @，别逢人就 @。"
+    )
+
+
+def _proactive_brief():
+    """主动模式：没人点名时的旁观判断 + 沉默出口。"""
+    return (
+        "\n\n【主动模式】你正在群里旁听，没人点名 @ 你。只有当你确实能帮上忙时才开口，例如："
+        "有人报故障/报错/服务异常、有人提出你能回答或能查证的问题、或你发现该提醒某人跟进的事。"
+        "其余闲聊一律保持沉默。\n"
+        "判断此刻不该由你说话时，只回复 `__SILENT__`（不要任何其它字符）。\n"
+        "决定开口时：先用工具查清楚再说（查容器/日志/负载等），话要短、直接给结论，"
+        "该谁跟进就 @ 谁（<at id=open_id></at>）。宁可少说，绝不刷屏。"
+    )
+
+
+def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
+        speaker_open_id: str = "", proactive: bool = False):
+    """app 为 store.get_app() 返回的字典（含 tools 列表、ai_provider_id 等）。
+    speaker/speaker_open_id：群里这条消息的发言人姓名与 open_id（用于身份识别与 @）。
+    proactive=True：主动模式，模型可回 __SILENT__ 选择不说话，此时返回 None（不发消息）。"""
     aid = app["id"]
     prov = store.get_provider(app["ai_provider_id"]) if app.get("ai_provider_id") else None
     if not prov or not prov.get("api_key"):
@@ -50,10 +78,18 @@ def run(app: dict, chat_id: str, user_text: str) -> str:
         tools_schema = tools_schema + [SKILL_TOOL]
     turns = int(app.get("history_turns") or 12)
 
-    msgs = [{"role": "system", "content": _system(app, skills)}]
+    system = _system(app, skills)
+    if speaker:
+        system += _group_brief(speaker, speaker_open_id)
+    if proactive:
+        system += _proactive_brief()
+    # 用户发言带上「姓名」前缀，群里多人发言才分得清谁是谁（也会随历史留痕）
+    turn = f"「{speaker}」：{user_text}" if speaker else user_text
+
+    msgs = [{"role": "system", "content": system}]
     msgs += store.load_history(aid, chat_id, turns)
-    msgs.append({"role": "user", "content": user_text})
-    store.save(aid, chat_id, "user", user_text)
+    msgs.append({"role": "user", "content": turn})
+    store.save(aid, chat_id, "user", turn)
 
     ctx = {"app_id": aid, "chat_id": chat_id,
            "skills": {s["name"]: s.get("content") or "" for s in skills}}
@@ -67,7 +103,10 @@ def run(app: dict, chat_id: str, user_text: str) -> str:
             _record(aid, chat_id, model, resp)
             m = resp.choices[0].message
             if not m.tool_calls:
-                answer = (m.content or "").strip() or "(无输出)"
+                answer = (m.content or "").strip()
+                if proactive and (not answer or "__SILENT__" in answer):
+                    return None                      # 主动模式判定不该说话：不发、不存 assistant
+                answer = answer or "(无输出)"
                 store.save(aid, chat_id, "assistant", answer)
                 return answer
             msgs.append({
@@ -88,6 +127,8 @@ def run(app: dict, chat_id: str, user_text: str) -> str:
     finally:
         auth.reset_ctx(ctok)
 
+    if proactive:
+        return None                                  # 主动模式下查不动就别硬插话
     answer = "（工具调用过多，已中止；请把任务拆细一点再试）"
     store.save(aid, chat_id, "assistant", answer)
     return answer

@@ -101,6 +101,12 @@ TOOLS = [
         }},
     }},
     {"type": "function", "function": {
+        "name": "list_chat_members",
+        "description": "列出当前群的成员(姓名 + open_id)。当你要 @ 某人处理任务、又不知道他 open_id 时先调它，"
+                       "拿到 open_id 后在回复正文里写 <at id=该open_id></at> 即可 @ 到人。无参数。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
         "name": "service_status",
         "description": "查各服务/站点的在线状态(来自 Uptime Kuma):是否在线、响应时间、HTTPS 证书剩余天数。"
                        "用于巡检哪些服务挂了、证书快到期没。无参数。",
@@ -198,6 +204,16 @@ def execute(name, args, ctx=None):
         if name == "docker_containers":
             return beszel.containers(args.get("server"), args.get("name"),
                                      args.get("sort", "cpu"), args.get("top"))
+        if name == "list_chat_members":
+            from feishu import members
+            app = store.get_app(app_id)
+            if not app or not ctx.get("chat_id"):
+                return {"error": "缺少群上下文，无法读取群成员"}
+            r = members.roster(app, ctx["chat_id"])
+            if not r:
+                return {"count": 0, "members": [],
+                        "note": "读不到群成员（应用可能缺少「读取群成员」权限，或机器人不在该群）"}
+            return {"count": len(r), "members": r}
         if name == "service_status":
             return uptimekuma.status()
         if name == "schedule_task":
