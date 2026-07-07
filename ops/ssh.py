@@ -49,14 +49,26 @@ def blacklist():
     return _DEFAULT_BLACKLIST
 
 
-def _find_host(name):
+def _aliases(h):
+    """一台机的全部「叫法」：名字 + 连接地址 + 别名列表。别名支持字符串(逗号/空格/换行分隔)或数组。"""
+    raw = h.get("aliases")
+    if isinstance(raw, str):
+        raw = re.split(r"[,\s]+", raw)
+    names = [h.get("name"), h.get("host")] + list(raw or [])
+    return [str(x).strip() for x in names if x and str(x).strip()]
+
+
+def _find_host(target):
+    """按 target 解析受管主机：名字 / 连接地址 / 任意别名都能命中同一台。
+    命中后实际连接走的是 h['host']（登记的内网连接地址），与用户嘴上说哪个地址无关。"""
     hs = hosts()
     if not hs:
         return None, hs
-    if not name:                     # 只有一台就默认它；多台必须指名，避免打错机器
+    if not target:                   # 只有一台就默认它；多台必须指名，避免打错机器
         return (hs[0] if len(hs) == 1 else None), hs
+    t = str(target).strip().lower()
     for h in hs:
-        if h.get("name") == name:
+        if any(a.lower() == t for a in _aliases(h)):
             return h, hs
     return None, hs
 
@@ -72,10 +84,14 @@ def _blocked(command):
 
 
 def list_hosts():
-    """列出受管主机（不含密码）。"""
-    return {"hosts": [{"name": h.get("name"), "host": h.get("host"),
-                       "user": h.get("username", "root"), "port": int(h.get("port", 22))}
-                      for h in hosts()]}
+    """列出受管主机（不含密码）。connect=实际连接地址；aliases=用户可用来指代它的别名/其它地址。"""
+    out = []
+    for h in hosts():
+        extra = [a for a in _aliases(h) if a not in (h.get("name"), h.get("host"))]
+        out.append({"name": h.get("name"), "connect": h.get("host"),
+                    "aliases": extra, "user": h.get("username", "root"),
+                    "port": int(h.get("port", 22))})
+    return {"hosts": out}
 
 
 def run(target, command, timeout=30):
@@ -85,7 +101,13 @@ def run(target, command, timeout=30):
         return {"error": "命令为空"}
     h, hs = _find_host(target)
     if not h:
-        return {"error": f"没有匹配的受管主机；请指定 target。可用：{[x.get('name') for x in hs]}"}
+        avail = [{"name": x.get("name"), "connect": x.get("host"),
+                  "aliases": [a for a in _aliases(x) if a not in (x.get("name"), x.get("host"))]}
+                 for x in hs]
+        return {"error": f"目标「{target or '(未指定)'}」不在受管主机列表里，无法操作（安全隔离：只有后台"
+                         f"「SSH 运维」页配过的主机才能连）。当前可用：{avail or '（一台都还没配）'}。"
+                         f"若这台机确实该管，请去后台添加它、或把「{target}」加进对应主机的别名后再试。",
+                "hint_for_user": "去后台「SSH 运维」页添加该主机或补充其别名"}
     bad = _blocked(command)
     if bad:
         return {"error": f"命令被安全黑名单拦截（这是不可逆/毁灭级操作，已拒绝执行）。"

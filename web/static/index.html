@@ -639,10 +639,13 @@ function renderSshRows(){
     <div class="card" data-i="${i}">
       <div class="row">
         <div style="flex:0 0 140px"><label>名字</label><input class="sh-name" value="${esc(h.name||'')}" placeholder="default"></div>
-        <div><label>地址 host</label><input class="sh-host" value="${esc(h.host||'')}" placeholder="10.10.0.1"></div>
+        <div><label>连接地址（实际 SSH 走这个，填内网地址）</label><input class="sh-host" value="${esc(h.host||'')}" placeholder="192.168.110.18"></div>
         <div style="flex:0 0 90px"><label>端口</label><input class="sh-port" type="number" value="${h.port||22}"></div>
         <div style="flex:0 0 120px"><label>用户</label><input class="sh-user" value="${esc(h.username||'root')}"></div>
       </div>
+      <label>别名 / 其它地址（逗号分隔；用户说其中任意一个都能找到这台机，如 10.10.0.1, hub）</label>
+      <input class="sh-alias" value="${esc(h.aliases||'')}" placeholder="10.10.0.1, hub">
+      <div class="hint muted">例：连接地址填 <code>192.168.110.18</code>、别名填 <code>10.10.0.1</code>，则用户说 10.10.0.1 也会连到这台机、且实际走内网 192.168.110.18。</div>
       <div class="row">
         <div><label>密码 ${h.password_set?'<span class="muted">(已设,留空=不改)</span>':''}</label><input class="sh-pass" type="password" placeholder="${h.password_set?'留空保持不变':'SSH 密码(或用私钥)'}"></div>
         <div><label>sudo 密码 ${h.sudo_password_set?'<span class="muted">(已设)</span>':'<span class="muted">(非root且sudo需密码才填)</span>'}</label><input class="sh-sudo" type="password" placeholder="${h.sudo_password_set?'留空保持不变':'一般留空'}"></div>
@@ -659,6 +662,7 @@ function _collectSshRows(){
   return [...document.querySelectorAll('#ssh-hosts .card')].map(card=>{
     const q=s=>card.querySelector(s);
     const rec={ name:q('.sh-name').value.trim(), host:q('.sh-host').value.trim(),
+      aliases:q('.sh-alias').value.trim(),
       port:Number(q('.sh-port').value)||22, username:q('.sh-user').value.trim()||'root' };
     const p=q('.sh-pass').value; if(p) rec.password=p;
     const su=q('.sh-sudo').value; if(su) rec.sudo_password=su;

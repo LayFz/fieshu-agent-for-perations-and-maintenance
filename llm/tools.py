@@ -115,8 +115,9 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "list_ssh_hosts",
-        "description": "列出可 SSH 操作的受管服务器（名字/地址/登录用户）。要在某台机上跑命令前，"
-                       "不确定 target 写哪个时先调它。无参数。",
+        "description": "列出可 SSH 操作的受管服务器：每台含 name、connect(实际连接地址)、aliases(别名/其它地址)。"
+                       "一台机可能有多个叫法（如 default 的别名含 10.10.0.1、连接地址是内网 192.168.110.18），"
+                       "它们都指同一台。要在某台机上跑命令前、或用户报的地址你不确定是哪台时，先调它。无参数。",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
@@ -131,9 +132,12 @@ TOOLS = [
             "- 危险/不可逆/可能扩大故障（删数据、格式化、关机重启、改防火墙把自己锁死、动不了解的东西）——"
             "【拒绝执行】，说明理由，请用户确认或改由人工操作。\n"
             "- 拿不准就先查（用只读命令探明状态、结合你掌握的网络拓扑），别赌。宁可不做，绝不乱做。\n"
-            "破坏性命令另有硬黑名单会直接拦截，但你不能依赖它——判断责任在你。"),
+            "破坏性命令另有硬黑名单会直接拦截，但你不能依赖它——判断责任在你。\n"
+            "【目标主机】target 填主机名或它的任意别名/地址都行（如 default、10.10.0.1、192.168.110.18 可能都指同一台）；"
+            "系统会自动解析到对应主机、并用它登记的内网连接地址去连，你不用操心走哪个地址。"
+            "若返回「不在受管列表」，说明这台机还没登记——如实告诉用户去后台「SSH 运维」页添加或补别名，别反复重试、别假装成功。"),
         "parameters": {"type": "object", "properties": {
-            "target": {"type": "string", "description": "受管主机名（见 list_ssh_hosts）。只有一台时可省略。"},
+            "target": {"type": "string", "description": "主机名或其别名/地址（见 list_ssh_hosts，如 default 或 10.10.0.1）。只有一台时可省略。"},
             "command": {"type": "string", "description": "要执行的完整 shell 命令"},
             "timeout": {"type": "integer", "description": "超时秒数，默认 30，最多 300"},
         }, "required": ["command"]},

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -447,7 +448,11 @@ def ssh_get(request: Request):
     from ops import ssh as ops_ssh
     hosts = []
     for h in ops_ssh.hosts():                     # 不回密码/私钥明文，只回是否已设
+        al = h.get("aliases")
+        if isinstance(al, list):
+            al = ", ".join(al)
         hosts.append({"name": h.get("name"), "host": h.get("host"),
+                      "aliases": al or "",
                       "port": int(h.get("port", 22)), "username": h.get("username", "root"),
                       "password_set": bool(h.get("password")), "key_set": bool(h.get("key")),
                       "sudo_password_set": bool(h.get("sudo_password"))})
@@ -471,6 +476,10 @@ async def ssh_set(request: Request):
         rec = {"name": name, "host": h["host"].strip(),
                "port": int(h.get("port") or 22),
                "username": (h.get("username") or "root").strip()}
+        aliases = h.get("aliases")                # 别名：字符串(逗号/空格分隔)或数组 -> 存成去重列表
+        if isinstance(aliases, str):
+            aliases = re.split(r"[,\s]+", aliases)
+        rec["aliases"] = [a.strip() for a in (aliases or []) if a and a.strip()]
         # 密码/私钥/sudo密码：传了才更新，留空则沿用旧值（同密码「留空=不改」范式）
         rec["password"] = h["password"] if h.get("password") else prev.get("password", "")
         rec["key"] = h["key"] if h.get("key") else prev.get("key", "")
