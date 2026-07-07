@@ -44,22 +44,25 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 ## 数据模型（core/store.py，单个 SQLite）
 
 - `ai_providers` — 多个 AI 模型（name/base_url/model/api_key，任意 OpenAI 兼容接口）
-- `apps` — 多个应用（数字员工）：飞书凭证 + `ai_provider_id` + `tools`(JSON 名单) + `skills`(JSON id 名单) + `system_prompt` + `history_turns` + `enabled`
+- `apps` — 多个应用（数字员工）：飞书凭证 + `ai_provider_id` + `tools`(JSON 名单) + `skills`(JSON id 名单) + `mcp`(JSON id 名单，勾选的 MCP server) + `system_prompt` + `history_turns` + `enabled`
+- `mcp_servers` — 外部 MCP server 注册表（name/url/headers(JSON 鉴权头)/enabled）；应用按 server 整体勾选后，其暴露的工具进该应用的工具循环
 - `skills` — 技能库（name/description/content），知识/工作方法包，应用按需勾选
 - `schedules` — 定时任务（app_id/chat_id/title/instruction/kind/spec/next_run_ts）
 - `msgs` / `notes` / `token_usage` — 对话记忆 / 长期笔记 / 用量，**都带 app_id 按应用隔离**
-- `kv` — 引导配置 + 全局设置（如 OpenObserve/Beszel/UptimeKuma 连接 `oo_*`/`bz_*`/`uk_*`）；`admin` — 管理员
+- `kv` — 引导配置 + 全局设置（OpenObserve/Beszel/UptimeKuma 连接 `oo_*`/`bz_*`/`uk_*`；SSH 受管主机+凭证 `ssh_hosts`、硬黑名单 `ssh_blacklist`）；`admin` — 管理员
 
 ## 核心概念
 
 - **应用 = 数字员工 = 席位**。四层隔离：身份(独立飞书应用) + AI(各绑各的) + 工具(勾选子集) + 技能(勾选子集)。防越权靠这套，不靠代码自觉。
 - **工具(tool) vs 技能(skill)**：工具是「能做的动作」(查日志/发文档)；技能是「该懂的知识/方法」(如「公司架构」)。技能用**渐进披露**：系统提示词只注入名称+简介，模型需要详情时调 `read_skill(name)` 拉全文，且只能读本应用勾选的技能。
 - **定时任务**：到点用对应应用的 AI+工具+技能跑 instruction，结果发回原群(REST，不依赖长连接)。两种创建途径同一张表：对话创建(给应用勾 `schedule_task` 工具) + 后台「定时任务」页。
-- **监控集成是只读原生工具**(非 MCP)：`query_logs`/`server_stats`/`service_status`，连接信息走后台「可观测」页存 kv。MCP 客户端化是后续产品化时的方向，当前未实现。
+- **监控集成是只读原生工具**(非 MCP)：`query_logs`/`server_stats`/`service_status`，连接信息走后台「可观测」页存 kv。这些是内置在 `llm/tools.py` 里的固定工具。
+- **MCP 工具是「外挂」工具**：后台「MCP 工具」页注册远程 HTTP MCP server（endpoint URL + 鉴权头），应用按 server 整体勾选 → 运行时 `llm/mcp.py` 连上它、把它 `tools/list` 出来的工具转成 OpenAI schema 挂进工具循环，名字统一 `mcp__{server_id}__{tool}` 便于路由与防撞名。**只支持远程 HTTP（Streamable HTTP，兼容 SSE 响应），不支持 stdio 本地进程。** 隔离照旧靠「勾了才有」。
+- **SSH 运维是高风险原生工具**：`ops/ssh.py`（paramiko）提供 `ssh_exec`/`list_ssh_hosts`，让数字员工在受管服务器上跑真实命令（如网掉了 `sudo wg-quick up wg0`）。受管主机+凭证存 kv（`ssh_hosts`/`ssh_blacklist`），后台「SSH 运维」页配。三层闸门：**① 模型判断为主**（工具说明里写死了「危险/不可逆就拒绝」，再叠加应用系统提示词+网络拓扑技能）；**② 硬黑名单兜底**（`ops.ssh._DEFAULT_BLACKLIST`，只挡 rm -rf /、mkfs、dd 到裸盘等不可逆命令，连接前就拦，不挡正常运维）；**③ 隔离**（应用勾了才有）。**铁律：绝不给「主动旁听」类应用勾 `ssh_exec`**——那等于让没人点名时也能自己 root 执行。
 
 ## 约定
 
-- **加一个工具**：在 `llm/tools.py` 的 `TOOLS` 池加 schema，`execute()` 加分支；要按应用上下文就用 `ctx`(含 `app_id`/`chat_id`/`skills`)。然后应用在后台勾选即可用。
+- **加一个工具**：在 `llm/tools.py` 的 `TOOLS` 池加 schema，`execute()` 加分支；要按应用上下文就用 `ctx`(含 `app_id`/`chat_id`/`skills`)。然后应用在后台勾选即可用。**若能力来自外部 MCP server，别写死进 tools.py——去后台「MCP 工具」注册 server，应用勾选即可，不用改代码。**
 - **配置存哪**：每应用的配置 → `apps` 表；全局/连接类 → `kv`(`store.get_setting`/`set_setting`)。
 - **记忆/用量一律按 `app_id` 隔离**。
 - 前端无构建，直接改 `web/static/index.html`（`admin.py` 每次请求从磁盘读它）。
@@ -74,6 +77,7 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 5. **新增顶层包要在 Dockerfile 加 `COPY`**：`COPY obs ./obs` / `COPY sched ./sched`，漏了容器 import 即崩。
 6. **新应用要重启服务才建立长连接**：`bot.start_all()` 只在启动时为已启用应用起连接；后台新建/改飞书凭证/改启用状态后需重启进程（后台有「重启服务」按钮，或 `docker restart`）。人设/工具/AI/技能/定时任务是即时生效的。
 7. **前端时间显示强制 `Asia/Shanghai`**：`dt()` 写死 `timeZone:'Asia/Shanghai'`，否则按访问者浏览器时区渲染会误导。
+8. **MCP 客户端是手写同步的，别换成官方异步 SDK**：`llm/mcp.py` 用同步 `requests` 手写 Streamable HTTP 传输，正是为了不碰坑#2——官方 `mcp` SDK 是 asyncio 的，塞进多线程 bot 会重演「全局事件循环已在运行」。每次工具调用**独立连接一次**（initialize→initialized→tools/call，用完关），无跨线程 loop、无持久连接，最贴合本仓库同步风格。工具清单按 server 缓存 `_CACHE_TTL`(默认 300s) 避免每条消息都 `tools/list`；server 配置改动/删除时 `mcp.invalidate(id)` 清缓存（admin 里已接）。某个 server 连不上时 `tools_for_app` 只跳过它、不让整轮对话崩。
 
 ## 运行 / 部署
 

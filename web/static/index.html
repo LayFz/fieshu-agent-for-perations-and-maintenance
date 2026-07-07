@@ -113,10 +113,12 @@
       <a data-page="apps">应用</a>
       <a data-page="providers">AI 供应商</a>
       <a data-page="skills">技能</a>
+      <a data-page="mcp">MCP 工具</a>
       <a data-page="schedules">定时任务</a>
       <a data-page="memory">记忆系统</a>
       <a data-page="usage">Token 用量</a>
       <a data-page="obs">可观测(日志)</a>
+      <a data-page="ssh">SSH 运维</a>
       <a data-page="account">账号</a>
     </nav>
     <main id="content"></main>
@@ -158,7 +160,7 @@ function enterApp(username){ $('#login').style.display='none'; $('#app').style.d
 $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
-const PAGES = { overview, apps, providers, skills, schedules, memory, usage, obs, account };
+const PAGES = { overview, apps, providers, skills, mcp, schedules, memory, usage, obs, ssh, account };
 function go(page){ document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on', a.dataset.page===page)); PAGES[page](); }
 document.querySelectorAll('nav a').forEach(a=> a.onclick=()=>go(a.dataset.page));
 
@@ -193,12 +195,13 @@ async function overview(){
 }
 
 /* ---------- 应用 ---------- */
-let _provCache=[], _toolPool=[], _skillPool=[];
+let _provCache=[], _toolPool=[], _skillPool=[], _mcpPool=[];
 async function apps(){
   const c=$('#content'); c.innerHTML='<h2>应用</h2><p class="desc">加载中…</p>';
-  const [{apps},{providers},{tools},sk] = await Promise.all([
-    api('GET','/api/apps'), api('GET','/api/providers'), api('GET','/api/tools/pool'), api('GET','/api/skills')]);
-  _provCache=providers; _toolPool=tools; _skillPool=sk.skills;
+  const [{apps},{providers},{tools},sk,mc] = await Promise.all([
+    api('GET','/api/apps'), api('GET','/api/providers'), api('GET','/api/tools/pool'),
+    api('GET','/api/skills'), api('GET','/api/mcp')]);
+  _provCache=providers; _toolPool=tools; _skillPool=sk.skills; _mcpPool=mc.servers;
   const provName=id=>{ const p=providers.find(x=>x.id===id); return p?p.name:'未绑定'; };
   const list = apps.length ? `<div class="cards">${apps.map(a=>`
       <div class="appcard">
@@ -232,6 +235,8 @@ function _appForm(a){
       <span><span class="tn">${esc(t.name)}</span><br><span class="td">${esc(t.description)}</span></span></label>`).join('');
   const skills = _skillPool.map(s=>`<label><input type="checkbox" class="sk" value="${s.id}" ${(a.skills||[]).includes(s.id)?'checked':''}>
       <span><span class="tn">${esc(s.name)}</span><br><span class="td">${esc(s.description||'')}</span></span></label>`).join('');
+  const mcp = _mcpPool.map(s=>`<label><input type="checkbox" class="mc" value="${s.id}" ${(a.mcp||[]).includes(s.id)?'checked':''}>
+      <span><span class="tn">${esc(s.name)}${s.enabled?'':'（已停用）'}</span><br><span class="td">${esc(s.url||'')}</span></span></label>`).join('');
   const sset=a.feishu_secret_set;
   return `<h3>${a.id?'编辑应用':'新建应用'}</h3>
     <p class="desc">数字员工的身份、大脑与能力。</p>
@@ -254,6 +259,8 @@ function _appForm(a){
     <div class="toolpick">${tools||'<span class="muted">工具池为空</span>'}</div>
     <label>可用技能（知识/工作方法包——只勾该应用该懂的）</label>
     <div class="toolpick">${skills||'<span class="muted">还没有技能，去「技能」页新建</span>'}</div>
+    <label>MCP 工具（挂外部 MCP server——勾了它其暴露的全部工具即可用）</label>
+    <div class="toolpick">${mcp||'<span class="muted">还没有 MCP server，去「MCP 工具」页添加</span>'}</div>
     <div class="save-bar"><button class="btn" onclick="saveApp(${a.id||0})">保存</button>
       <button class="btn ghost" onclick="closeModal()">取消</button></div>`;
 }
@@ -269,6 +276,7 @@ async function saveApp(id){
     enabled:Number($('#ap-enabled').value),
     tools:[...document.querySelectorAll('.tk:checked')].map(x=>x.value),
     skills:[...document.querySelectorAll('.sk:checked')].map(x=>Number(x.value)),
+    mcp:[...document.querySelectorAll('.mc:checked')].map(x=>Number(x.value)),
   };
   const sec=$('#ap-fsec').value.trim(); if(sec) body.feishu_app_secret=sec;
   if(!body.name){ toast('请填应用名称'); return; }
@@ -360,6 +368,60 @@ async function saveSkill(id){
     closeModal(); toast('已保存'); skills(); }catch(e){ toast(e.message); }
 }
 async function delSkill(id,name){ if(!confirm('删除技能「'+name+'」？勾选了它的应用会失去这项知识。')) return; await api('DELETE','/api/skills/'+id); toast('已删除'); skills(); }
+
+/* ---------- MCP 工具（挂外部 MCP server） ---------- */
+async function mcp(){
+  const c=$('#content'); c.innerHTML='<h2>MCP 工具</h2><p class="desc">加载中…</p>';
+  const {servers}=await api('GET','/api/mcp');
+  const rows = servers.length ? servers.map(s=>`<tr>
+      <td>${esc(s.name)} ${s.enabled?'':'<span class="tag off">停用</span>'}</td>
+      <td class="muted" style="word-break:break-all">${esc(s.url||'')}</td>
+      <td class="muted">${s.headers_set?esc((s.header_keys||[]).join(', ')):'—'}</td>
+      <td style="white-space:nowrap">
+        <a href="#" onclick="testMcp(${s.id});return false">测试</a> ·
+        <a href="#" onclick='editMcp(${JSON.stringify(s)});return false'>编辑</a> ·
+        <a href="#" onclick="delMcp(${s.id},'${esc(s.name)}');return false">删除</a></td></tr>`).join('')
+    : '<tr><td colspan="4" class="muted">还没有 MCP server。添加一个远程 MCP server（填其 HTTP endpoint URL + 鉴权头），应用在「应用」里勾选后即可用它暴露的工具。</td></tr>';
+  c.innerHTML=`
+    <div class="head"><div><h2>MCP 工具</h2><p class="desc">挂外部 MCP server（远程 HTTP / Streamable HTTP）。全局注册，应用按 server 整体勾选，其工具即进入该应用的工具循环——隔离沿用「勾了才有」。</p></div>
+      <button class="btn" onclick="newMcp()">+ 添加 MCP server</button></div>
+    <table><thead><tr><th>名称</th><th>Endpoint URL</th><th>鉴权头</th><th>操作</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    <div id="mcp-tools"></div>`;
+}
+function _mcpForm(s){
+  s=s||{};
+  return `<h3>${s.id?'编辑 MCP server':'添加 MCP server'}</h3>
+    <p class="desc">只支持远程 HTTP MCP server：填它的 endpoint URL；需要鉴权就在下面按 <code>Key: Value</code> 每行一个填请求头（如 <code>Authorization: Bearer xxx</code>）。</p>
+    <label>名称</label><input id="m-name" value="${esc(s.name||'')}" placeholder="如：内部工单系统">
+    <label>Endpoint URL</label><input id="m-url" value="${esc(s.url||'')}" placeholder="https://mcp.example.com/mcp">
+    <label>鉴权头 ${s.headers_set?`<span class="muted">（已设 ${esc((s.header_keys||[]).join(', '))}，留空=不改）</span>`:'<span class="muted">（可选，每行 Key: Value）</span>'}</label>
+    <textarea id="m-headers" placeholder="${s.headers_set?'留空保持不变':'Authorization: Bearer xxx'}"></textarea>
+    <label>启用</label><select id="m-enabled"><option value="1" ${s.enabled!==false?'selected':''}>启用</option><option value="0" ${s.enabled===false?'selected':''}>停用</option></select>
+    <div class="save-bar"><button class="btn" onclick="saveMcp(${s.id||0})">保存</button>
+      <button class="btn ghost" onclick="closeModal()">取消</button>
+      <span class="hint">鉴权头不入库到代码，仅存运行时 DB。</span></div>`;
+}
+function newMcp(){ openModal(_mcpForm({})); }
+function editMcp(s){ openModal(_mcpForm(s)); }
+async function saveMcp(id){
+  const body={ name:$('#m-name').value.trim(), url:$('#m-url').value.trim(),
+    enabled:Number($('#m-enabled').value) };
+  const ht=$('#m-headers').value; if(ht.trim()) body.headers_text=ht;
+  if(!body.name){ toast('请填名称'); return; }
+  try{ if(id) await api('PUT','/api/mcp/'+id,body); else await api('POST','/api/mcp',body);
+    closeModal(); toast('已保存'); mcp(); }catch(e){ toast(e.message); }
+}
+async function delMcp(id,name){ if(!confirm('删除 MCP server「'+name+'」？勾选了它的应用会失去这些工具。')) return; await api('DELETE','/api/mcp/'+id); toast('已删除'); mcp(); }
+async function testMcp(id){
+  const box=$('#mcp-tools'); box.innerHTML='<p class="desc">连接并拉取工具中…</p>';
+  const r=await api('POST','/api/mcp/'+id+'/test');
+  if(!r.ok){ box.innerHTML=`<div class="card" style="border-color:#f0a"><b>连接失败</b><br><span class="muted">${esc(r.error||'')}</span></div>`; return; }
+  const items=r.tools.map(t=>`<tr><td><span class="tn">${esc(t.name)}</span></td><td class="muted">${esc(t.description||'')}</td></tr>`).join('')
+    || '<tr><td colspan="2" class="muted">该 server 没有暴露任何工具</td></tr>';
+  box.innerHTML=`<div class="card"><b>连接成功 · 发现 ${r.count} 个工具</b>
+    <table style="margin-top:8px"><thead><tr><th>工具名</th><th>说明</th></tr></thead><tbody>${items}</tbody></table></div>`;
+}
 
 /* ---------- 定时任务 ---------- */
 const _kindText = (k,s)=> k==='daily'?('每天 '+s) : k==='weekly'?('每周'+s.replace('@',' ')) : ('每 '+s+' 分钟');
@@ -545,6 +607,86 @@ async function saveObs(){
   const bp=$('#b-pass').value.trim(); if(bp) body.bz_pass=bp;
   const uk=$('#u-key').value.trim(); if(uk) body.uk_key=uk;
   await api('POST','/api/obs',body); toast('已保存'); obs();
+}
+
+/* ---------- SSH 运维（受管主机 + 硬黑名单，供 ssh_exec 工具用） ---------- */
+let _sshHosts=[];
+async function ssh(){
+  const c=$('#content'); c.innerHTML='<h2>SSH 运维</h2><p class="desc">加载中…</p>';
+  const o=await api('GET','/api/ssh');
+  _sshHosts=o.hosts||[];
+  c.innerHTML=`
+    <h2>SSH 运维 · 受管服务器</h2>
+    <p class="desc">给数字员工配可 SSH 操作的服务器。给应用勾上 <code>ssh_exec</code> / <code>list_ssh_hosts</code> 工具后，它就能在这些机器上跑命令（如网掉了 <code>sudo wg-quick up wg0</code>）。</p>
+    <div class="card" style="border-color:#f0a;background:#fff6fa">
+      <b>⚠️ 这是全平台风险最高的能力。</b><span class="muted">
+      root + 群里触发的大模型 = 提示注入/幻觉可造成毁灭性后果。务必：① 只给你信任、明确 @ 触发的运维应用勾 ssh_exec，
+      <b>绝不给「主动旁听」应用勾</b>；② 尽量用非 root、最小权限账号；③ 保留下面的硬黑名单兜底。
+      安全判断主要靠模型——请在该应用的系统提示词里写清可做/不可做，并挂上网络拓扑技能。</span>
+    </div>
+    <div class="head"><div><h3 style="margin:0">受管主机</h3></div>
+      <button class="btn ghost" onclick="addSshRow()">+ 加一台</button></div>
+    <div id="ssh-hosts"></div>
+    <label style="margin-top:16px">硬黑名单（正则，每行一条；命中即拒绝执行。默认已覆盖不可逆/毁灭级命令）</label>
+    <textarea id="ssh-bl" style="min-height:140px;font-family:monospace;font-size:12px">${esc((o.blacklist||[]).join('\n'))}</textarea>
+    <div class="save-bar"><button class="btn" onclick="saveSsh()">保存全部</button>
+      <span class="hint">密码/私钥不入库到代码，仅存运行时 DB。</span></div>`;
+  renderSshRows();
+}
+function renderSshRows(){
+  const box=$('#ssh-hosts');
+  box.innerHTML = _sshHosts.length ? _sshHosts.map((h,i)=>`
+    <div class="card" data-i="${i}">
+      <div class="row">
+        <div style="flex:0 0 140px"><label>名字</label><input class="sh-name" value="${esc(h.name||'')}" placeholder="default"></div>
+        <div><label>地址 host</label><input class="sh-host" value="${esc(h.host||'')}" placeholder="10.10.0.1"></div>
+        <div style="flex:0 0 90px"><label>端口</label><input class="sh-port" type="number" value="${h.port||22}"></div>
+        <div style="flex:0 0 120px"><label>用户</label><input class="sh-user" value="${esc(h.username||'root')}"></div>
+      </div>
+      <div class="row">
+        <div><label>密码 ${h.password_set?'<span class="muted">(已设,留空=不改)</span>':''}</label><input class="sh-pass" type="password" placeholder="${h.password_set?'留空保持不变':'SSH 密码(或用私钥)'}"></div>
+        <div><label>sudo 密码 ${h.sudo_password_set?'<span class="muted">(已设)</span>':'<span class="muted">(非root且sudo需密码才填)</span>'}</label><input class="sh-sudo" type="password" placeholder="${h.sudo_password_set?'留空保持不变':'一般留空'}"></div>
+      </div>
+      <label>私钥 ${h.key_set?'<span class="muted">(已设,留空=不改)</span>':'<span class="muted">(可选,PEM;有私钥可不填密码)</span>'}</label>
+      <textarea class="sh-key" style="min-height:60px;font-family:monospace;font-size:12px" placeholder="${h.key_set?'留空保持不变':'-----BEGIN OPENSSH PRIVATE KEY-----'}"></textarea>
+      <div class="save-bar">
+        <a href="#" onclick="testSsh(${i});return false">测试连接</a> ·
+        <a href="#" onclick="delSshRow(${i});return false">移除</a>
+        <span class="sh-result muted"></span></div>
+    </div>`).join('') : '<p class="muted">还没有受管主机，点「+ 加一台」。</p>';
+}
+function _collectSshRows(){
+  return [...document.querySelectorAll('#ssh-hosts .card')].map(card=>{
+    const q=s=>card.querySelector(s);
+    const rec={ name:q('.sh-name').value.trim(), host:q('.sh-host').value.trim(),
+      port:Number(q('.sh-port').value)||22, username:q('.sh-user').value.trim()||'root' };
+    const p=q('.sh-pass').value; if(p) rec.password=p;
+    const su=q('.sh-sudo').value; if(su) rec.sudo_password=su;
+    const k=q('.sh-key').value; if(k.trim()) rec.key=k;
+    return rec;
+  });
+}
+function addSshRow(){ _sshHosts=_collectSshRows(); _sshHosts.push({name:'',host:'',port:22,username:'root'}); renderSshRows(); }
+function delSshRow(i){ _sshHosts=_collectSshRows(); _sshHosts.splice(i,1); renderSshRows(); }
+async function saveSsh(){
+  const hosts=_collectSshRows().filter(h=>h.name&&h.host);
+  const blacklist=$('#ssh-bl').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  try{ await api('POST','/api/ssh',{hosts,blacklist}); toast('已保存'); ssh(); }
+  catch(e){ toast(e.message); }
+}
+async function testSsh(i){
+  const card=document.querySelector('#ssh-hosts .card[data-i="'+i+'"]');
+  const res=card.querySelector('.sh-result');
+  // 先存盘再测（否则新填的密码还没落库）
+  const hosts=_collectSshRows().filter(h=>h.name&&h.host);
+  const name=card.querySelector('.sh-name').value.trim();
+  res.textContent=' 连接中…';
+  try{
+    await api('POST','/api/ssh',{hosts});
+    const r=await api('POST','/api/ssh/test',{target:name});
+    if(r.error){ res.innerHTML=' <span style="color:#c00">失败：'+esc(r.error)+'</span>'; }
+    else{ res.innerHTML=' <span style="color:#080">OK · '+esc((r.stdout||'').trim().replace(/\n/g,' | '))+'</span>'; }
+  }catch(e){ res.textContent=' '+e.message; }
 }
 
 /* ---------- 账号 ---------- */

@@ -9,6 +9,7 @@ from datetime import datetime
 from core import store
 from feishu import docs as feishu_docs
 from obs import openobserve, beszel, uptimekuma
+from ops import ssh as ops_ssh
 
 
 def _fmt_ts(ts):
@@ -111,6 +112,31 @@ TOOLS = [
         "description": "查各服务/站点的在线状态(来自 Uptime Kuma):是否在线、响应时间、HTTPS 证书剩余天数。"
                        "用于巡检哪些服务挂了、证书快到期没。无参数。",
         "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "list_ssh_hosts",
+        "description": "列出可 SSH 操作的受管服务器（名字/地址/登录用户）。要在某台机上跑命令前，"
+                       "不确定 target 写哪个时先调它。无参数。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "ssh_exec",
+        "description": (
+            "在受管服务器上执行一条 shell 命令并返回结果（stdout/stderr/退出码）。这是【高风险】能力，"
+            "命令会真实作用于生产服务器。\n"
+            "【执行前你必须自己判断安全性】：\n"
+            "- 只读/诊断（如 systemctl status、docker ps、journalctl、df、ip a、wg show）——可直接执行。\n"
+            "- 有变更但可逆、且用户明确要做的（如 sudo wg-quick up wg0 起网卡、systemctl restart 某服务）——"
+            "先说清你要在哪台机跑什么、影响是什么，再执行。\n"
+            "- 危险/不可逆/可能扩大故障（删数据、格式化、关机重启、改防火墙把自己锁死、动不了解的东西）——"
+            "【拒绝执行】，说明理由，请用户确认或改由人工操作。\n"
+            "- 拿不准就先查（用只读命令探明状态、结合你掌握的网络拓扑），别赌。宁可不做，绝不乱做。\n"
+            "破坏性命令另有硬黑名单会直接拦截，但你不能依赖它——判断责任在你。"),
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "受管主机名（见 list_ssh_hosts）。只有一台时可省略。"},
+            "command": {"type": "string", "description": "要执行的完整 shell 命令"},
+            "timeout": {"type": "integer", "description": "超时秒数，默认 30，最多 300"},
+        }, "required": ["command"]},
     }},
     {"type": "function", "function": {
         "name": "schedule_task",
@@ -216,6 +242,10 @@ def execute(name, args, ctx=None):
             return {"count": len(r), "members": r}
         if name == "service_status":
             return uptimekuma.status()
+        if name == "list_ssh_hosts":
+            return ops_ssh.list_hosts()
+        if name == "ssh_exec":
+            return ops_ssh.run(args.get("target"), args.get("command"), args.get("timeout", 30))
         if name == "schedule_task":
             if not ctx.get("chat_id"):
                 return {"error": "无法确定要发送的群（缺少会话上下文）"}

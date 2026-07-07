@@ -70,6 +70,13 @@ _conn.executescript("""
         description TEXT,
         content TEXT,
         ts REAL);
+    CREATE TABLE IF NOT EXISTS mcp_servers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        url TEXT,
+        headers TEXT DEFAULT '{}',
+        enabled INTEGER DEFAULT 1,
+        ts REAL);
     CREATE TABLE IF NOT EXISTS schedules(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         app_id INTEGER, chat_id TEXT,
@@ -93,6 +100,7 @@ _ensure_col("msgs", "app_id", "INTEGER")
 _ensure_col("notes", "app_id", "INTEGER")
 _ensure_col("token_usage", "app_id", "INTEGER")
 _ensure_col("apps", "skills", "TEXT DEFAULT '[]'")
+_ensure_col("apps", "mcp", "TEXT DEFAULT '[]'")     # 应用勾选的 MCP server id 名单
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_msgs_app ON msgs(app_id, chat_id, id)")
 _conn.commit()
 
@@ -167,7 +175,7 @@ def delete_provider(pid):
 # ---------- 应用（数字员工/席位） ----------
 def _app_row(r):
     d = dict(r)
-    for col in ("tools", "skills"):
+    for col in ("tools", "skills", "mcp"):
         try:
             d[col] = json.loads(d.get(col) or "[]")
         except Exception:
@@ -188,15 +196,16 @@ def get_app(aid):
     return _app_row(r) if r else None
 
 def create_app(name, feishu_app_id="", feishu_app_secret="", ai_provider_id=None,
-               system_prompt="", history_turns=12, tools=None, enabled=1, skills=None):
+               system_prompt="", history_turns=12, tools=None, enabled=1, skills=None, mcp=None):
     with _lock:
         cur = _conn.execute(
             "INSERT INTO apps(name,feishu_app_id,feishu_app_secret,ai_provider_id,system_prompt,"
-            "history_turns,tools,skills,enabled,ts) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "history_turns,tools,skills,mcp,enabled,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (name, feishu_app_id or "", feishu_app_secret or "", ai_provider_id,
              system_prompt or "", int(history_turns or 12),
              json.dumps(tools or [], ensure_ascii=False),
-             json.dumps(skills or [], ensure_ascii=False), 1 if enabled else 0, time.time()))
+             json.dumps(skills or [], ensure_ascii=False),
+             json.dumps(mcp or [], ensure_ascii=False), 1 if enabled else 0, time.time()))
         _conn.commit()
         return cur.lastrowid
 
@@ -210,6 +219,8 @@ def update_app(aid, **f):
         sets.append("tools=?"); vals.append(json.dumps(f["tools"], ensure_ascii=False))
     if "skills" in f and f["skills"] is not None:
         sets.append("skills=?"); vals.append(json.dumps(f["skills"], ensure_ascii=False))
+    if "mcp" in f and f["mcp"] is not None:
+        sets.append("mcp=?"); vals.append(json.dumps(f["mcp"], ensure_ascii=False))
     if f.get("feishu_app_secret"):              # 仅非空才更新 secret
         sets.append("feishu_app_secret=?"); vals.append(f["feishu_app_secret"])
     if not sets:
@@ -226,6 +237,56 @@ def delete_app(aid):
 
 def apps_count():
     return _conn.execute("SELECT COUNT(*) n FROM apps").fetchone()["n"]
+
+
+# ---------- MCP server（全局注册表，应用按 server 整体勾选） ----------
+def _mcp_row(r):
+    d = dict(r)
+    try:
+        d["headers"] = json.loads(d.get("headers") or "{}")
+    except Exception:
+        d["headers"] = {}
+    d["enabled"] = bool(d.get("enabled"))
+    return d
+
+def list_mcp_servers():
+    rows = _conn.execute("SELECT * FROM mcp_servers ORDER BY id").fetchall()
+    return [_mcp_row(r) for r in rows]
+
+def get_mcp_server(mid):
+    r = _conn.execute("SELECT * FROM mcp_servers WHERE id=?", (mid,)).fetchone()
+    return _mcp_row(r) if r else None
+
+def create_mcp_server(name, url="", headers=None, enabled=1):
+    with _lock:
+        cur = _conn.execute(
+            "INSERT INTO mcp_servers(name,url,headers,enabled,ts) VALUES(?,?,?,?,?)",
+            (name, url or "", json.dumps(headers or {}, ensure_ascii=False),
+             1 if enabled else 0, time.time()))
+        _conn.commit()
+        return cur.lastrowid
+
+def update_mcp_server(mid, **f):
+    sets, vals = [], []
+    if f.get("name"):
+        sets.append("name=?"); vals.append(f["name"])
+    if "url" in f and f["url"] is not None:
+        sets.append("url=?"); vals.append(f["url"])
+    if "headers" in f and f["headers"] is not None:   # 只在传了新 headers 时才覆盖（否则保留旧密钥）
+        sets.append("headers=?"); vals.append(json.dumps(f["headers"], ensure_ascii=False))
+    if "enabled" in f and f["enabled"] is not None:
+        sets.append("enabled=?"); vals.append(1 if f["enabled"] else 0)
+    if not sets:
+        return
+    vals.append(mid)
+    with _lock:
+        _conn.execute(f"UPDATE mcp_servers SET {','.join(sets)} WHERE id=?", vals)
+        _conn.commit()
+
+def delete_mcp_server(mid):
+    with _lock:
+        _conn.execute("DELETE FROM mcp_servers WHERE id=?", (mid,))
+        _conn.commit()
 
 def providers_count():
     return _conn.execute("SELECT COUNT(*) n FROM ai_providers").fetchone()["n"]

@@ -11,6 +11,7 @@ COPY core ./core
 COPY feishu ./feishu
 COPY llm ./llm
 COPY obs ./obs
+COPY ops ./ops
 COPY sched ./sched
 COPY web ./web
 

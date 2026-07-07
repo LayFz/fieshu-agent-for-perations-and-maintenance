@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse
 
 from core import store
 from feishu import auth, bot
+from llm import mcp as mcp_mod
 from llm.tools import all_tools, tool_list_for
 
 app = FastAPI(title="数字员工平台 管理后台", docs_url=None, redoc_url=None)
@@ -172,6 +173,81 @@ def tools_pool(request: Request):
     return {"tools": all_tools()}
 
 
+# ---------- MCP server（全局注册表；应用按 server 整体勾选后其工具进工具循环） ----------
+def _parse_headers(text):
+    """把 'Key: Value' 多行文本解析成鉴权头字典（放 Authorization 之类）。"""
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        if k:
+            out[k] = v.strip()
+    return out
+
+def _mcp_view(s):
+    h = s.get("headers") or {}
+    return {"id": s["id"], "name": s["name"], "url": s.get("url") or "",
+            "enabled": s["enabled"],
+            "header_keys": list(h.keys()), "headers_set": bool(h)}   # 只回键名，值(可能含密钥)不外泄
+
+@app.get("/api/mcp")
+def mcp_list(request: Request):
+    _auth(request)
+    return {"servers": [_mcp_view(s) for s in store.list_mcp_servers()]}
+
+@app.post("/api/mcp")
+async def mcp_create(request: Request):
+    _auth(request)
+    b = await _body(request)
+    name = (b.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请填 MCP server 名称")
+    mid = store.create_mcp_server(name, (b.get("url") or "").strip(),
+                                  _parse_headers(b.get("headers_text")),
+                                  1 if b.get("enabled", True) else 0)
+    return {"ok": True, "id": mid}
+
+@app.put("/api/mcp/{mid}")
+async def mcp_edit(mid: int, request: Request):
+    _auth(request)
+    b = await _body(request)
+    f = {}
+    if "name" in b:    f["name"] = (b["name"] or "").strip()
+    if "url" in b:     f["url"] = (b["url"] or "").strip()
+    if "enabled" in b: f["enabled"] = 1 if b["enabled"] else 0
+    ht = b.get("headers_text")                     # 留空=不改（保留旧鉴权头，同密码范式）
+    if ht is not None and ht.strip():
+        f["headers"] = _parse_headers(ht)
+    store.update_mcp_server(mid, **f)
+    mcp_mod.invalidate(mid)                         # 配置变了，清工具缓存
+    return {"ok": True}
+
+@app.delete("/api/mcp/{mid}")
+def mcp_remove(mid: int, request: Request):
+    _auth(request)
+    store.delete_mcp_server(mid)
+    mcp_mod.invalidate(mid)
+    return {"ok": True}
+
+@app.post("/api/mcp/{mid}/test")
+def mcp_test(mid: int, request: Request):
+    _auth(request)
+    s = store.get_mcp_server(mid)
+    if not s:
+        raise HTTPException(status_code=404, detail="MCP server 不存在")
+    try:
+        tools = mcp_mod.fetch_tools(s)
+        mcp_mod.invalidate(mid)                     # 下次运行按最新工具清单拉
+        return {"ok": True, "count": len(tools),
+                "tools": [{"name": t.get("name"), "description": t.get("description") or ""}
+                          for t in tools]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # ---------- 技能（知识/工作方法包） ----------
 @app.get("/api/skills")
 def skills(request: Request):
@@ -266,6 +342,7 @@ def _app_view(a):
         "history_turns": int(a.get("history_turns") or 12),
         "tools": a.get("tools") or [],
         "skills": a.get("skills") or [],
+        "mcp": a.get("mcp") or [],
         "enabled": a["enabled"],
         "running": bot.is_running(a["id"]),
     }
@@ -285,6 +362,8 @@ def app_detail(aid: int, request: Request):
     v["tool_list"] = tool_list_for(a.get("tools"))
     v["skill_list"] = [{"id": s["id"], "name": s["name"], "description": s.get("description")}
                        for s in store.skills_for(a.get("skills"))]
+    v["mcp_list"] = [{"id": s["id"], "name": s["name"]}
+                     for s in (store.get_mcp_server(i) for i in a.get("mcp") or []) if s]
     return v
 
 @app.post("/api/apps")
@@ -298,7 +377,8 @@ async def create_app(request: Request):
         name, (b.get("feishu_app_id") or "").strip(), (b.get("feishu_app_secret") or "").strip(),
         b.get("ai_provider_id"), b.get("system_prompt") or "",
         int(b.get("history_turns") or 12), b.get("tools") or [],
-        1 if b.get("enabled", True) else 0, skills=b.get("skills") or [])
+        1 if b.get("enabled", True) else 0, skills=b.get("skills") or [],
+        mcp=b.get("mcp") or [])
     return {"ok": True, "id": aid, "note": "新应用的飞书长连接需重启服务后建立"}
 
 @app.put("/api/apps/{aid}")
@@ -306,7 +386,7 @@ async def edit_app(aid: int, request: Request):
     _auth(request)
     b = await _body(request)
     fields = {k: b[k] for k in ("name", "feishu_app_id", "ai_provider_id",
-                                "system_prompt", "history_turns", "tools", "skills", "enabled") if k in b}
+                                "system_prompt", "history_turns", "tools", "skills", "mcp", "enabled") if k in b}
     if "enabled" in fields:
         fields["enabled"] = 1 if fields["enabled"] else 0
     if b.get("feishu_app_secret"):
@@ -358,6 +438,58 @@ async def obs_set(request: Request):
     if "uk_url" in b:   store.set_setting("uk_url", (b["uk_url"] or "").strip())
     if b.get("uk_key"): store.set_setting("uk_api_key", b["uk_key"].strip())
     return {"ok": True}
+
+
+# ---------- SSH 运维（受管主机 + 硬黑名单，供 ssh_exec 工具用） ----------
+@app.get("/api/ssh")
+def ssh_get(request: Request):
+    _auth(request)
+    from ops import ssh as ops_ssh
+    hosts = []
+    for h in ops_ssh.hosts():                     # 不回密码/私钥明文，只回是否已设
+        hosts.append({"name": h.get("name"), "host": h.get("host"),
+                      "port": int(h.get("port", 22)), "username": h.get("username", "root"),
+                      "password_set": bool(h.get("password")), "key_set": bool(h.get("key")),
+                      "sudo_password_set": bool(h.get("sudo_password"))})
+    bl = store.get_setting("ssh_blacklist")
+    return {"hosts": hosts,
+            "blacklist": json.loads(bl) if bl else ops_ssh._DEFAULT_BLACKLIST,
+            "blacklist_is_default": not bl}
+
+@app.post("/api/ssh")
+async def ssh_set(request: Request):
+    _auth(request)
+    from ops import ssh as ops_ssh
+    b = await _body(request)
+    old = {h.get("name"): h for h in ops_ssh.hosts()}
+    merged = []
+    for h in b.get("hosts") or []:
+        name = (h.get("name") or "").strip()
+        if not name or not (h.get("host") or "").strip():
+            continue                              # 名字/地址缺一不可
+        prev = old.get(name, {})
+        rec = {"name": name, "host": h["host"].strip(),
+               "port": int(h.get("port") or 22),
+               "username": (h.get("username") or "root").strip()}
+        # 密码/私钥/sudo密码：传了才更新，留空则沿用旧值（同密码「留空=不改」范式）
+        rec["password"] = h["password"] if h.get("password") else prev.get("password", "")
+        rec["key"] = h["key"] if h.get("key") else prev.get("key", "")
+        rec["sudo_password"] = h["sudo_password"] if h.get("sudo_password") else prev.get("sudo_password", "")
+        merged.append(rec)
+    store.set_setting("ssh_hosts", json.dumps(merged, ensure_ascii=False))
+    if "blacklist" in b:                          # 空列表 = 用户显式清空；不传 = 不改
+        bl = b["blacklist"]
+        if isinstance(bl, list):
+            store.set_setting("ssh_blacklist", json.dumps(bl, ensure_ascii=False))
+    return {"ok": True, "count": len(merged)}
+
+@app.post("/api/ssh/test")
+async def ssh_test(request: Request):
+    _auth(request)
+    from ops import ssh as ops_ssh
+    b = await _body(request)
+    r = ops_ssh.run(b.get("target"), "whoami && hostname && uptime", timeout=15)
+    return r
 
 
 # ---------- 服务重启（建立新应用的长连接） ----------

@@ -9,6 +9,7 @@ from openai import OpenAI
 
 from core import store
 from feishu import auth
+from . import mcp as mcp_mod
 from .tools import tools_for, execute, SKILL_TOOL
 
 _MAX_TOOL_LOOPS = 6
@@ -76,6 +77,8 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
     tools_schema = tools_for(app.get("tools"))
     if skills:                                   # 有技能才挂 read_skill（保持隔离）
         tools_schema = tools_schema + [SKILL_TOOL]
+    mcp_schema, mcp_routes = mcp_mod.tools_for_app(app)  # 应用勾选的 MCP server 暴露的工具
+    tools_schema = tools_schema + mcp_schema
     turns = int(app.get("history_turns") or 12)
 
     system = _system(app, skills)
@@ -121,7 +124,10 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
                     args = json.loads(tc.function.arguments or "{}")
                 except Exception:
                     args = {}
-                result = execute(tc.function.name, args, ctx)
+                if tc.function.name in mcp_routes:      # MCP 工具走 MCP 客户端
+                    result = mcp_mod.call(mcp_routes[tc.function.name], args)
+                else:
+                    result = execute(tc.function.name, args, ctx)
                 msgs.append({"role": "tool", "tool_call_id": tc.id,
                              "content": json.dumps(result, ensure_ascii=False)})
     finally:
