@@ -40,9 +40,10 @@ deploy:
     - if: '$CI_COMMIT_BRANCH == "main"'
       when: on_success
   variables:
-    SSH: "ssh -i $DEPLOY_SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 root@$DEPLOY_HOST"
-    SCP: "scp -i $DEPLOY_SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+    SSH: "ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 root@$DEPLOY_HOST"
+    SCP: "scp -i /tmp/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=10"
   script:
+    - install -m600 "$DEPLOY_KEY" /tmp/deploy_key
     - $SSH "mkdir -p $DEPLOY_DIR"
     - $SCP deploy/compose.yml "root@$DEPLOY_HOST:$DEPLOY_DIR/compose.yml"
     - $SCP deploy/deploy.sh "root@$DEPLOY_HOST:$DEPLOY_DIR/deploy.sh"
