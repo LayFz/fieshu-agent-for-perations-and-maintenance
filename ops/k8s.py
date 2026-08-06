@@ -30,11 +30,19 @@ _DEFAULT_BLACKLIST = [
     r"\bdelete\b.*--all\b",                                     # delete xxx --all：批量清空
 ]
 
-# 只读 verb 白名单：集群标了 read_only 时，只放行这些（第一个非选项 token 必须命中）。
+# 只读 verb 白名单：集群标了 read_only 时，只放行这些。
 _READONLY_VERBS = {
     "get", "describe", "logs", "top", "explain", "events", "wait",
     "api-resources", "api-versions", "version", "cluster-info", "config", "diff",
 }
+# 会改动集群的 verb（用于从命令里认出「真正的动词」，不被 -n/-l 的取值骗到）。
+_WRITE_VERBS = {
+    "create", "apply", "edit", "patch", "replace", "delete", "scale", "rollout",
+    "autoscale", "expose", "run", "set", "label", "annotate", "taint",
+    "cordon", "uncordon", "drain", "exec", "cp", "attach", "port-forward",
+    "proxy", "debug", "kustomize",
+}
+_ALL_VERBS = _READONLY_VERBS | _WRITE_VERBS
 
 
 def clusters():
@@ -90,7 +98,15 @@ def _blocked(command):
 
 
 def _first_verb(argv):
-    """取第一个非选项 token 作为 kubectl 动词（如 'get pods -A' -> 'get'）。"""
+    """认出真正的 kubectl 动词：跳过 -n/-l 这类旗标【及其取值】，返回第一个已知动词。
+    例 '-n argocd get applications' -> 'get'（而不是把 -n 的取值 argocd 当动词）。
+    找不到已知动词时退回第一个非旗标 token（未知命令，交给只读白名单去拦，安全）。"""
+    for tok in argv:
+        if tok.startswith("-"):
+            continue
+        if tok in _ALL_VERBS:
+            return tok
+        # 非旗标、又不是已知动词：多半是某旗标的取值（如 -n 后的 argocd），跳过继续找
     for tok in argv:
         if not tok.startswith("-"):
             return tok
