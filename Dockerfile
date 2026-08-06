@@ -6,6 +6,18 @@ ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# kubectl 二进制（给 kubectl 工具用，直连集群 API）。版本与集群 v1.36 对齐（skew ≤1 minor）。
+# 注：kubectl 是二进制，不进 pip；随镜像走。amd64 构建；换 arch 改 ARCH 即可。
+ARG KUBECTL_VERSION=v1.36.2
+ARG KUBECTL_ARCH=amd64
+RUN set -eux; \
+    apt-get update; apt-get install -y --no-install-recommends curl ca-certificates; \
+    curl -fsSL -o /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl"; \
+    chmod +x /usr/local/bin/kubectl; \
+    kubectl version --client; \
+    apt-get purge -y curl; apt-get autoremove -y; rm -rf /var/lib/apt/lists/*
+
 COPY app ./app
 COPY core ./core
 COPY feishu ./feishu

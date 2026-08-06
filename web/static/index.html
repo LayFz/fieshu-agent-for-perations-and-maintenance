@@ -119,6 +119,7 @@
       <a data-page="usage">Token 用量</a>
       <a data-page="obs">可观测(日志)</a>
       <a data-page="ssh">SSH 运维</a>
+      <a data-page="k8s">K8s 运维</a>
       <a data-page="account">账号</a>
     </nav>
     <main id="content"></main>
@@ -160,7 +161,7 @@ function enterApp(username){ $('#login').style.display='none'; $('#app').style.d
 $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
-const PAGES = { overview, apps, providers, skills, mcp, schedules, memory, usage, obs, ssh, account };
+const PAGES = { overview, apps, providers, skills, mcp, schedules, memory, usage, obs, ssh, k8s, account };
 function go(page){ document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on', a.dataset.page===page)); PAGES[page](); }
 document.querySelectorAll('nav a').forEach(a=> a.onclick=()=>go(a.dataset.page));
 
@@ -690,6 +691,87 @@ async function testSsh(i){
     const r=await api('POST','/api/ssh/test',{target:name});
     if(r.error){ res.innerHTML=' <span style="color:#c00">失败：'+esc(r.error)+'</span>'; }
     else{ res.innerHTML=' <span style="color:#080">OK · '+esc((r.stdout||'').trim().replace(/\n/g,' | '))+'</span>'; }
+  }catch(e){ res.textContent=' '+e.message; }
+}
+
+/* ---------- K8s 运维（受管集群 kubeconfig + 硬黑名单，供 kubectl 工具用） ---------- */
+let _k8sClusters=[];
+async function k8s(){
+  const c=$('#content'); c.innerHTML='<h2>K8s 运维</h2><p class="desc">加载中…</p>';
+  const o=await api('GET','/api/k8s');
+  _k8sClusters=o.clusters||[];
+  c.innerHTML=`
+    <h2>K8s 运维 · 受管集群</h2>
+    <p class="desc">给数字员工配可 <code>kubectl</code> 直连的 k8s 集群。给应用勾上 <code>kubectl</code> / <code>list_k8s_clusters</code> 工具后，它就能查/管集群（如看异常 pod、查 CNPG 主备、rollout restart 生效密钥）。</p>
+    <div class="card" style="border-color:#f0a;background:#fff6fa">
+      <b>⚠️ 这是继 SSH 之后第二高风险的能力。</b><span class="muted">
+      整个生产集群 + 群里触发的大模型。务必：① 只给你信任、明确 @ 触发的运维应用勾 kubectl，
+      <b>绝不给「主动旁听」应用勾</b>；② 只读排查够用就把集群设为 <b>只读</b>；③ 保留下面的硬黑名单兜底。
+      <b>GitOps 铁律</b>：业务资源变更走 gitops 仓 git push，别让它用 kubectl 直接改（会被 ArgoCD 自愈覆盖）——请在应用系统提示词/技能里写清，并挂上 k8s-ops 技能。</span>
+    </div>
+    <div class="card" style="background:#f7f8fa">
+      <b>接入提示：</b><span class="muted">粘贴集群的 kubeconfig（如 <code>/etc/rancher/k3s/k3s.yaml</code>），
+      并把里面的 <code>server: https://127.0.0.1:6443</code> 改成集群 API 的可达地址（如 <code>https://192.168.110.18:6443</code>）。
+      平台进程必须能网络到达该地址（内网/WG）。若报 x509 SAN 不匹配，可在 kubeconfig 的 cluster 下加 <code>insecure-skip-tls-verify: true</code>（内网可接受）。点「测试连接」验证。</span>
+    </div>
+    <div class="head"><div><h3 style="margin:0">受管集群</h3></div>
+      <button class="btn ghost" onclick="addK8sRow()">+ 加一个</button></div>
+    <div id="k8s-clusters"></div>
+    <label style="margin-top:16px">硬黑名单（正则，每行一条；命中即拒绝执行。默认已覆盖 delete cluster/pvc/pv/ns/node、--all 等不可逆命令）</label>
+    <textarea id="k8s-bl" style="min-height:120px;font-family:monospace;font-size:12px">${esc((o.blacklist||[]).join('\n'))}</textarea>
+    <div class="save-bar"><button class="btn" onclick="saveK8s()">保存全部</button>
+      <span class="hint">kubeconfig 不入库到代码，仅存运行时 DB。</span></div>`;
+  renderK8sRows();
+}
+function renderK8sRows(){
+  const box=$('#k8s-clusters');
+  box.innerHTML = _k8sClusters.length ? _k8sClusters.map((c,i)=>`
+    <div class="card" data-i="${i}">
+      <div class="row">
+        <div style="flex:0 0 180px"><label>名字</label><input class="k8-name" value="${esc(c.name||'')}" placeholder="upmore"></div>
+        <div><label>别名（逗号分隔；用户说其中任意一个都能找到这个集群）</label><input class="k8-alias" value="${esc(c.aliases||'')}" placeholder="prod, k3s, upmore-cluster"></div>
+        <div style="flex:0 0 130px"><label>只读</label>
+          <label class="muted" style="display:flex;align-items:center;gap:6px;font-weight:400">
+            <input class="k8-ro" type="checkbox" ${c.read_only?'checked':''} style="width:auto"> 只允许 get/describe/logs 等</label></div>
+      </div>
+      <label>kubeconfig ${c.kubeconfig_set?'<span class="muted">(已设,留空=不改)</span>':'<span class="muted">(粘贴完整 YAML;记得改 server 地址)</span>'}</label>
+      <textarea class="k8-kc" style="min-height:120px;font-family:monospace;font-size:12px" placeholder="${c.kubeconfig_set?'留空保持不变':'apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: https://192.168.110.18:6443\n...'}"></textarea>
+      <div class="save-bar">
+        <a href="#" onclick="testK8s(${i});return false">测试连接</a> ·
+        <a href="#" onclick="delK8sRow(${i});return false">移除</a>
+        <span class="k8-result muted"></span></div>
+    </div>`).join('') : '<p class="muted">还没有受管集群，点「+ 加一个」。</p>';
+}
+function _collectK8sRows(){
+  return [...document.querySelectorAll('#k8s-clusters .card')].map(card=>{
+    const q=s=>card.querySelector(s);
+    const rec={ name:q('.k8-name').value.trim(), aliases:q('.k8-alias').value.trim(),
+      read_only:q('.k8-ro').checked };
+    const kc=q('.k8-kc').value; if(kc.trim()) rec.kubeconfig=kc;
+    return rec;
+  });
+}
+function addK8sRow(){ _k8sClusters=_collectK8sRows(); _k8sClusters.push({name:'',aliases:'',read_only:false}); renderK8sRows(); }
+function delK8sRow(i){ _k8sClusters=_collectK8sRows(); _k8sClusters.splice(i,1); renderK8sRows(); }
+async function saveK8s(){
+  const clusters=_collectK8sRows().filter(c=>c.name);
+  const blacklist=$('#k8s-bl').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  try{ await api('POST','/api/k8s',{clusters,blacklist}); toast('已保存'); k8s(); }
+  catch(e){ toast(e.message); }
+}
+async function testK8s(i){
+  const card=document.querySelector('#k8s-clusters .card[data-i="'+i+'"]');
+  const res=card.querySelector('.k8-result');
+  // 先存盘再测（否则新填的 kubeconfig 还没落库）
+  const clusters=_collectK8sRows().filter(c=>c.name);
+  const name=card.querySelector('.k8-name').value.trim();
+  res.textContent=' 连接中…';
+  try{
+    await api('POST','/api/k8s',{clusters});
+    const r=await api('POST','/api/k8s/test',{target:name});
+    if(r.error){ res.innerHTML=' <span style="color:#c00">失败：'+esc(r.error)+'</span>'; }
+    else if(r.exit_code!==0){ res.innerHTML=' <span style="color:#c00">kubectl 退出码 '+r.exit_code+'：'+esc((r.stderr||'').trim())+'</span>'; }
+    else{ res.innerHTML=' <span style="color:#080">OK · '+esc((r.stdout||'').trim().split('\n').slice(0,4).join(' | '))+'</span>'; }
   }catch(e){ res.textContent=' '+e.message; }
 }
 

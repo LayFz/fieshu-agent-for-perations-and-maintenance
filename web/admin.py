@@ -501,6 +501,62 @@ async def ssh_test(request: Request):
     return r
 
 
+# ---------- K8s 运维（受管集群 kubeconfig + 硬黑名单，供 kubectl 工具用） ----------
+@app.get("/api/k8s")
+def k8s_get(request: Request):
+    _auth(request)
+    from ops import k8s as ops_k8s
+    clusters = []
+    for c in ops_k8s.clusters():                  # 不回 kubeconfig 明文，只回是否已设
+        al = c.get("aliases")
+        if isinstance(al, list):
+            al = ", ".join(al)
+        clusters.append({"name": c.get("name"), "aliases": al or "",
+                         "read_only": bool(c.get("read_only")),
+                         "kubeconfig_set": bool(c.get("kubeconfig"))})
+    bl = store.get_setting("k8s_blacklist")
+    return {"clusters": clusters,
+            "blacklist": json.loads(bl) if bl else ops_k8s._DEFAULT_BLACKLIST,
+            "blacklist_is_default": not bl}
+
+
+@app.post("/api/k8s")
+async def k8s_set(request: Request):
+    _auth(request)
+    from ops import k8s as ops_k8s
+    b = await _body(request)
+    old = {c.get("name"): c for c in ops_k8s.clusters()}
+    merged = []
+    for c in b.get("clusters") or []:
+        name = (c.get("name") or "").strip()
+        if not name:
+            continue
+        prev = old.get(name, {})
+        rec = {"name": name, "read_only": bool(c.get("read_only"))}
+        aliases = c.get("aliases")                 # 别名：字符串(逗号/空格分隔)或数组 -> 去重列表
+        if isinstance(aliases, str):
+            aliases = re.split(r"[,\s]+", aliases)
+        rec["aliases"] = [a.strip() for a in (aliases or []) if a and a.strip()]
+        # kubeconfig：传了才更新，留空则沿用旧值（同 SSH 密码「留空=不改」范式）
+        rec["kubeconfig"] = c["kubeconfig"] if c.get("kubeconfig") else prev.get("kubeconfig", "")
+        merged.append(rec)
+    store.set_setting("k8s_clusters", json.dumps(merged, ensure_ascii=False))
+    if "blacklist" in b:                           # 空列表 = 用户显式清空；不传 = 不改
+        bl = b["blacklist"]
+        if isinstance(bl, list):
+            store.set_setting("k8s_blacklist", json.dumps(bl, ensure_ascii=False))
+    return {"ok": True, "count": len(merged)}
+
+
+@app.post("/api/k8s/test")
+async def k8s_test(request: Request):
+    _auth(request)
+    from ops import k8s as ops_k8s
+    b = await _body(request)
+    r = ops_k8s.run(b.get("target"), "get nodes -o wide", timeout=15)
+    return r
+
+
 # ---------- 服务重启（建立新应用的长连接） ----------
 @app.post("/api/restart")
 def restart(request: Request):

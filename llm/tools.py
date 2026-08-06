@@ -10,6 +10,7 @@ from core import store
 from feishu import docs as feishu_docs
 from obs import openobserve, beszel, uptimekuma
 from ops import ssh as ops_ssh
+from ops import k8s as ops_k8s
 
 
 def _fmt_ts(ts):
@@ -143,6 +144,38 @@ TOOLS = [
         }, "required": ["command"]},
     }},
     {"type": "function", "function": {
+        "name": "list_k8s_clusters",
+        "description": "列出可用 kubectl 操作的受管 k8s 集群：每个含 name、aliases(别名)、read_only(是否只读)。"
+                       "一个集群可能有多个叫法。要对某集群跑 kubectl 前、或用户报的集群名你不确定是哪个时，先调它。无参数。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "kubectl",
+        "description": (
+            "对受管 k8s 集群执行一条 kubectl 命令并返回结果（stdout/stderr/退出码）。这是【高风险】能力，"
+            "命令会真实作用于生产集群。\n"
+            "【⚠️ GitOps 护栏，务必遵守】：这个集群的所有业务 app 都开了 ArgoCD 自愈(selfHeal+prune)——"
+            "业务资源（deployment/service/configmap/secret/ingress 等）的正式变更【必须改 gitops 仓 git push】，"
+            "别用 kubectl edit/apply/delete/rollout 直接改，几分钟内会被 ArgoCD 拉回或当孤儿删掉，白改还误导。"
+            "kubectl 只用于：只读排查、运维态操作（rollout restart 让改过的密钥生效、CNPG 手动 failover、起临时诊断 pod）。\n"
+            "【执行前你必须自己判断安全性】：\n"
+            "- 只读/诊断（get、describe、logs、top、get events、get cluster、get applications）——可直接执行。\n"
+            "- 有变更但可逆、且用户明确要做的（如 rollout restart deploy/xxx、delete 单个 pod 触发重建）——"
+            "先说清你要在哪个集群、哪个命名空间做什么、影响是什么，再执行。\n"
+            "- 危险/不可逆/可能扩大故障（delete cluster/pvc/pv/namespace/node、同时动多个 etcd 节点、delete --all、"
+            "改 kube-system）——【拒绝执行】，说明理由，请用户确认或改由人工操作。\n"
+            "- 拿不准就先用只读命令探明状态（结合 k8s-ops 技能里的集群拓扑与铁律），别赌。宁可不做，绝不乱做。\n"
+            "破坏性命令另有硬黑名单会直接拦截，但你不能依赖它——判断责任在你。\n"
+            "【目标集群】target 填集群名或它的任意别名（见 list_k8s_clusters）；只有一个集群时可省略。"
+            "【命令】command 只填 kubectl 的子命令，不含前导 kubectl（如 'get pods -A'、'-n argocd get applications'）。"
+            "若返回「不在受管列表」，说明这个集群还没登记——如实告诉用户去后台「K8s 运维」页添加，别反复重试、别假装成功。"),
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "集群名或其别名（见 list_k8s_clusters）。只有一个集群时可省略。"},
+            "command": {"type": "string", "description": "kubectl 子命令（不含前导 kubectl），如 'get pods -A'"},
+            "timeout": {"type": "integer", "description": "超时秒数，默认 30，最多 300"},
+        }, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
         "name": "schedule_task",
         "description": "创建一个定时任务：到点自动执行一段指令，并把结果发回当前群。"
                        "适合「每天下班前出运维报告」「每周一发周报」这类需求。"
@@ -250,6 +283,10 @@ def execute(name, args, ctx=None):
             return ops_ssh.list_hosts()
         if name == "ssh_exec":
             return ops_ssh.run(args.get("target"), args.get("command"), args.get("timeout", 30))
+        if name == "list_k8s_clusters":
+            return ops_k8s.list_clusters()
+        if name == "kubectl":
+            return ops_k8s.run(args.get("target"), args.get("command"), args.get("timeout", 30))
         if name == "schedule_task":
             if not ctx.get("chat_id"):
                 return {"error": "无法确定要发送的群（缺少会话上下文）"}
