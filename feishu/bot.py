@@ -76,48 +76,102 @@ def _tables_to_text(text):
 
 
 def _md_card(text):
-    md = _tables_to_text(text)                                   # 表格 → 分行列表（飞书卡片不支持 md 表格）
+    """流式/中途用：单个 markdown 元素，md 表格降级为分行列表（飞书 markdown 不渲染表格）。"""
+    md = _tables_to_text(text)
     md = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", r"**\1**", md, flags=re.M)
     return {"config": {"wide_screen_mode": True},
             "elements": [{"tag": "markdown", "content": md}]}
 
 
-def _reply(app, chat_id, text):
+def _table_element(header, rows):
+    """一张 markdown 表格 → 飞书原生 table 组件（真表格）。"""
+    if not header:
+        return None
+    cols = [{"name": f"c{j}", "display_name": (h or f"列{j+1}"), "data_type": "text",
+             "horizontal_align": "left"} for j, h in enumerate(header)]
+    out_rows = [{f"c{j}": (cells[j] if j < len(cells) else "") for j in range(len(header))}
+                for cells in rows]
+    return {"tag": "table", "columns": cols, "rows": out_rows}
+
+
+def _rich_card(text):
+    """最终定版用：普通文字走 markdown，markdown 表格渲染成飞书原生 table 组件（真表格）。"""
+    elements, buf = [], []
+    def flush():
+        if buf:
+            md = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", r"**\1**", "\n".join(buf), flags=re.M).strip("\n")
+            if md.strip():
+                elements.append({"tag": "markdown", "content": md})
+            buf.clear()
+    lines = text.split("\n")
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        if ln.strip().startswith("|") and i + 1 < n and re.match(r"^\s*\|[\s:|\-]+\|\s*$", lines[i + 1]):
+            header = [c.strip() for c in ln.strip().strip("|").split("|")]
+            i += 2
+            rows = []
+            while i < n and lines[i].strip().startswith("|"):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                i += 1
+                if any(cells):
+                    rows.append(cells)
+            tbl = _table_element(header, rows)
+            if tbl:
+                flush()
+                elements.append(tbl)
+            continue
+        buf.append(ln)
+        i += 1
+    flush()
+    if not elements:
+        elements = [{"tag": "markdown", "content": text}]
+    return {"config": {"wide_screen_mode": True}, "elements": elements}
+
+
+def _create_card(app, chat_id, card):
     req = (CreateMessageRequest.builder().receive_id_type("chat_id")
            .request_body(CreateMessageRequestBody.builder().receive_id(chat_id)
-                         .msg_type("interactive")
-                         .content(json.dumps(_md_card(text))).build()).build())
-    resp = _send_client(app).im.v1.message.create(req)
+                         .msg_type("interactive").content(json.dumps(card)).build()).build())
+    return _send_client(app).im.v1.message.create(req)
+
+
+def _reply(app, chat_id, text, rich=False):
+    """发一条卡片消息。rich=True 用原生表格；被飞书拒了自动退回分行 markdown。"""
+    resp = _create_card(app, chat_id, _rich_card(text) if rich else _md_card(text))
+    if not resp.success() and rich:
+        resp = _create_card(app, chat_id, _md_card(text))     # 真表格被拒 → 退回分行
     if not resp.success():
         print(f"[app {app['id']}] 回消息失败:", resp.code, resp.msg, flush=True)
 
 
 def post(app, chat_id, text):
     """对外发消息（定时任务等主动推送用）。app 为 store.get_app() 字典。"""
-    _reply(app, chat_id, text)
+    _reply(app, chat_id, text, rich=True)
 
 
 def _send_card(app, chat_id, text):
     """发一张交互卡片，返回 message_id（供后续原地更新）；失败返回 None。"""
-    req = (CreateMessageRequest.builder().receive_id_type("chat_id")
-           .request_body(CreateMessageRequestBody.builder().receive_id(chat_id)
-                         .msg_type("interactive")
-                         .content(json.dumps(_md_card(text))).build()).build())
-    resp = _send_client(app).im.v1.message.create(req)
+    resp = _create_card(app, chat_id, _md_card(text))
     if not resp.success():
         print(f"[app {app['id']}] 发卡片失败:", resp.code, resp.msg, flush=True)
         return None
     return getattr(resp.data, "message_id", None)
 
 
-def _update_card(app, message_id, text):
-    """原地更新一张已发的卡片（PATCH）。message_id 为空则跳过。返回是否成功；失败只记日志、不抛。"""
+def _patch_card(app, message_id, card):
+    req = (PatchMessageRequest.builder().message_id(message_id)
+           .request_body(PatchMessageRequestBody.builder().content(json.dumps(card)).build()).build())
+    return _send_client(app).im.v1.message.patch(req)
+
+
+def _update_card(app, message_id, text, rich=False):
+    """原地更新卡片（PATCH）。rich=True 用原生表格；被拒则退回分行 markdown。返回是否成功。"""
     if not message_id:
         return False
-    req = (PatchMessageRequest.builder().message_id(message_id)
-           .request_body(PatchMessageRequestBody.builder()
-                         .content(json.dumps(_md_card(text))).build()).build())
-    resp = _send_client(app).im.v1.message.patch(req)
+    resp = _patch_card(app, message_id, _rich_card(text) if rich else _md_card(text))
+    if not resp.success() and rich:
+        resp = _patch_card(app, message_id, _md_card(text))    # 真表格被拒 → 退回分行
     if not resp.success():
         print(f"[app {app['id']}] 更新卡片失败:", resp.code, resp.msg, flush=True)
         return False
@@ -253,8 +307,8 @@ def _handle(app_id, chat_id, text, sender_open_id=""):
         ans = llm_run(app, chat_id, text, speaker=speaker, speaker_open_id=sender_open_id,
                       on_step=on_step, on_delta=on_delta)
         print(f"[app {app_id}] 已回复 {ans[:80]!r}", flush=True)
-        if not (mid and _update_card(app, mid, ans)):    # 最终答案完整落一版（也兜底 patch 失败 / 没卡片）
-            _reply(app, chat_id, ans)
+        if not (mid and _update_card(app, mid, ans, rich=True)):   # 最终定版：原生真表格（被拒自动退分行）
+            _reply(app, chat_id, ans, rich=True)
     except Exception as e:
         import traceback
         print(f"[app {app_id}] 处理消息出错:", e, flush=True)
