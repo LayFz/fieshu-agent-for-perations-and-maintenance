@@ -109,6 +109,10 @@ _POST_COOLDOWN = 30        # 同一个群两次主动发言至少间隔（秒）
 _last_post = {}            # chat_id -> ts
 _inflight = set()          # 正在主动研判中的 chat_id，避免并发风暴
 _pro_lock = threading.Lock()
+# 「刚交互过」窗口：某人点名（@/喊名/单聊）之后，这段时间内 ta 的追问也算「对机器人说话」，
+# 不必每句都 @——连续对话更自然。按 (chat_id, 发言人) 隔离，只惠及正在跟它聊的那个人。
+_FOLLOWUP_WINDOW = 180     # 秒
+_last_engaged = {}         # (chat_id, sender_open_id) -> ts
 
 
 def _name_called(text):
@@ -164,6 +168,7 @@ def _handle(app_id, chat_id, text, sender_open_id=""):
     # 解析发言人姓名（best-effort，无权限时回退 open_id 短码）
     speaker = members.name_of(app, chat_id, sender_open_id) if sender_open_id else ""
     try:
+        _reply(app, chat_id, "收到，正在处理…")            # 即时回执：长任务（多轮查工具）期间先给反馈，避免"黑屏"干等
         ans = llm_run(app, chat_id, text, speaker=speaker, speaker_open_id=sender_open_id)
         print(f"[app {app_id}] 已回复 {ans[:80]!r}", flush=True)
         _reply(app, chat_id, ans)
@@ -202,9 +207,20 @@ def _on_message(app_id, data):
         app = store.get_app(app_id)
         if not app:
             return
-        addressed = (chat_type == "p2p") or _is_bot_mentioned(app, mentions) or _name_called(text)
+        now = time.time()
+        ekey = (chat_id, sender_open_id)
+        # 显式点名：@ / 喊名字 / 单聊
+        called = (chat_type == "p2p") or _is_bot_mentioned(app, mentions) or _name_called(text)
+        # 刚交互过：同一个人点名后 _FOLLOWUP_WINDOW 秒内的追问，也算对它说话（不必再 @）
+        engaged = bool(sender_open_id) and (now - _last_engaged.get(ekey, 0) < _FOLLOWUP_WINDOW)
+        addressed = called or engaged
+        if addressed and sender_open_id:                 # 刷新窗口，让连续对话保持"在聊"
+            if len(_last_engaged) > 2000:
+                _last_engaged.clear()
+            _last_engaged[ekey] = now
+        tag = "回应" if called else ("回应(追问)" if engaged else "旁听")
         print(f"[app {app_id}] 收到 id={msg_id} chat={chat_id} from={sender_open_id[-6:]} "
-              f"{'回应' if addressed else '旁听'} -> {text!r}", flush=True)
+              f"{tag} -> {text!r}", flush=True)
         if addressed:
             threading.Thread(target=_handle, args=(app_id, chat_id, text, sender_open_id), daemon=True).start()
         else:
