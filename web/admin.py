@@ -344,6 +344,7 @@ def _app_view(a):
         "tools": a.get("tools") or [],
         "skills": a.get("skills") or [],
         "mcp": a.get("mcp") or [],
+        "thinking": bool(a.get("thinking", True)),
         "enabled": a["enabled"],
         "running": bot.is_running(a["id"]),
     }
@@ -380,16 +381,20 @@ async def create_app(request: Request):
         int(b.get("history_turns") or 12), b.get("tools") or [],
         1 if b.get("enabled", True) else 0, skills=b.get("skills") or [],
         mcp=b.get("mcp") or [])
+    if "thinking" in b:
+        store.update_app(aid, thinking=1 if b["thinking"] else 0)
     return {"ok": True, "id": aid, "note": "新应用的飞书长连接需重启服务后建立"}
 
 @app.put("/api/apps/{aid}")
 async def edit_app(aid: int, request: Request):
     _auth(request)
     b = await _body(request)
-    fields = {k: b[k] for k in ("name", "feishu_app_id", "ai_provider_id",
-                                "system_prompt", "history_turns", "tools", "skills", "mcp", "enabled") if k in b}
+    fields = {k: b[k] for k in ("name", "feishu_app_id", "ai_provider_id", "system_prompt",
+                                "history_turns", "tools", "skills", "mcp", "enabled", "thinking") if k in b}
     if "enabled" in fields:
         fields["enabled"] = 1 if fields["enabled"] else 0
+    if "thinking" in fields:
+        fields["thinking"] = 1 if fields["thinking"] else 0
     if b.get("feishu_app_secret"):
         fields["feishu_app_secret"] = b["feishu_app_secret"].strip()
     store.update_app(aid, **fields)

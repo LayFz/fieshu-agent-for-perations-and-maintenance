@@ -26,8 +26,8 @@ def _system(app, skills):
     return prompt
 
 
-def _record(app_id, chat_id, model, resp):
-    u = getattr(resp, "usage", None)
+def _record(app_id, chat_id, model, usage):
+    u = usage
     if not u:
         return
     store.record_usage(app_id, chat_id, model,
@@ -61,6 +61,64 @@ def _proactive_brief():
     )
 
 
+def _consume_stream(stream, on_delta):
+    """消费一次流式响应。把最终答案的 content 增量喂给 on_delta（reasoning 思考内容丢弃、不展示）。
+    返回 (content, tool_calls, usage)。tool_calls 为 [{'id','name','args'}]，按 index 重组。"""
+    parts = []
+    tool_map = {}          # index -> {'id','name','args'}
+    usage = None
+    for chunk in stream:
+        if getattr(chunk, "usage", None):
+            usage = chunk.usage
+        if not getattr(chunk, "choices", None):
+            continue
+        d = chunk.choices[0].delta
+        piece = getattr(d, "content", None)
+        if piece:
+            parts.append(piece)
+            if on_delta:
+                try:
+                    on_delta(piece)
+                except Exception:
+                    pass
+        # reasoning_content（思考）：不累积、不转发
+        for tc in (getattr(d, "tool_calls", None) or []):
+            slot = tool_map.setdefault(tc.index, {"id": None, "name": "", "args": ""})
+            if tc.id:
+                slot["id"] = tc.id
+            if tc.function:
+                if tc.function.name:
+                    slot["name"] = tc.function.name
+                if tc.function.arguments:
+                    slot["args"] += tc.function.arguments
+    tool_calls = [tool_map[i] for i in sorted(tool_map)] if tool_map else []
+    return "".join(parts), tool_calls, usage
+
+
+def _call(client, model, msgs, tools, extra_body, on_delta):
+    """跑一次模型调用（默认流式）。流式失败则退回非流式一次性调用，保证有结果。
+    返回 (content, tool_calls[{'id','name','args'}], usage)。"""
+    kwargs = {"model": model, "messages": msgs, "extra_body": extra_body}
+    if tools:
+        kwargs["tools"] = tools
+    try:
+        stream = client.chat.completions.create(
+            stream=True, stream_options={"include_usage": True}, **kwargs)
+        return _consume_stream(stream, on_delta)
+    except Exception:
+        resp = client.chat.completions.create(**kwargs)   # 回退：非流式一次性
+        m = resp.choices[0].message
+        content = m.content or ""
+        if content and on_delta:
+            try:
+                on_delta(content)
+            except Exception:
+                pass
+        tcs = [{"id": tc.id, "name": tc.function.name, "args": tc.function.arguments or ""}
+               for tc in (m.tool_calls or [])]
+        return content, tcs, getattr(resp, "usage", None)
+
+
 def _tool_label(name, args_json):
     """把一次工具调用压成一句给人看的短进度，如 'kubectl get pods -A' / '查日志 k8s_upmore_api'。"""
     try:
@@ -84,7 +142,7 @@ def _tool_label(name, args_json):
 
 
 def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
-        speaker_open_id: str = "", proactive: bool = False, on_step=None):
+        speaker_open_id: str = "", proactive: bool = False, on_step=None, on_delta=None):
     """app 为 store.get_app() 返回的字典（含 tools 列表、ai_provider_id 等）。
     speaker/speaker_open_id：群里这条消息的发言人姓名与 open_id（用于身份识别与 @）。
     proactive=True：主动模式，模型可回 __SILENT__ 选择不说话，此时返回 None（不发消息）。"""
@@ -119,16 +177,15 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
     ctx = {"app_id": aid, "chat_id": chat_id,
            "skills": {s["name"]: s.get("content") or "" for s in skills}}
     ctok = auth.use_app(app.get("feishu_app_id"), app.get("feishu_app_secret"))  # 文档工具用本应用凭证
+    thinking_on = bool(app.get("thinking", True))
+    extra_body = {"thinking": {"type": "enabled" if thinking_on else "disabled"}}  # 豆包思考开关（默认开）
+    deliver = on_delta if not proactive else None        # 主动模式不流式（不显卡片）
     try:
         for _ in range(_MAX_TOOL_LOOPS):
-            kwargs = {"model": model, "messages": msgs}
-            if tools_schema:
-                kwargs["tools"] = tools_schema
-            resp = client.chat.completions.create(**kwargs)
-            _record(aid, chat_id, model, resp)
-            m = resp.choices[0].message
-            if not m.tool_calls:
-                answer = (m.content or "").strip()
+            content, tool_calls, usage = _call(client, model, msgs, tools_schema, extra_body, deliver)
+            _record(aid, chat_id, model, usage)
+            if not tool_calls:
+                answer = (content or "").strip()
                 if proactive and (not answer or "__SILENT__" in answer):
                     return None                      # 主动模式判定不该说话：不发、不存 assistant
                 answer = answer or "(无输出)"
@@ -136,40 +193,41 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
                 return answer
             msgs.append({
                 "role": "assistant",
-                "content": m.content or "",
-                "tool_calls": [{"id": tc.id, "type": "function",
-                                "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                               for tc in m.tool_calls],
+                "content": content or "",
+                "tool_calls": [{"id": t["id"], "type": "function",
+                                "function": {"name": t["name"], "arguments": t["args"]}}
+                               for t in tool_calls],
             })
             if on_step:                                  # 进度回调：让 bot 把「这轮在跑什么」刷到卡片上
                 try:
-                    on_step([_tool_label(tc.function.name, tc.function.arguments) for tc in m.tool_calls])
+                    on_step([_tool_label(t["name"], t["args"]) for t in tool_calls])
                 except Exception:
                     pass
-            for tc in m.tool_calls:
+            for t in tool_calls:
                 try:
-                    args = json.loads(tc.function.arguments or "{}")
+                    args = json.loads(t["args"] or "{}")
                 except Exception:
                     args = {}
-                if tc.function.name in mcp_routes:      # MCP 工具走 MCP 客户端
-                    result = mcp_mod.call(mcp_routes[tc.function.name], args)
+                if t["name"] in mcp_routes:             # MCP 工具走 MCP 客户端
+                    result = mcp_mod.call(mcp_routes[t["name"]], args)
                 else:
-                    result = execute(tc.function.name, args, ctx)
-                msgs.append({"role": "tool", "tool_call_id": tc.id,
+                    result = execute(t["name"], args, ctx)
+                msgs.append({"role": "tool", "tool_call_id": t["id"],
                              "content": json.dumps(result, ensure_ascii=False)})
     finally:
         auth.reset_ctx(ctok)
 
     if proactive:
         return None                                  # 主动模式下查不动就别硬插话
-    # 轮数用尽：不直接放弃，强制「不带工具」再问一次，让它用已查到的信息给出当前最佳结论（优雅降级）
+    # 轮数用尽：不直接放弃，强制「不带工具」再问一次（同样流式），用已查到的信息给出当前最佳结论（优雅降级）
     try:
-        final = client.chat.completions.create(model=model, messages=msgs + [
+        content, _tc, usage = _call(client, model, msgs + [
             {"role": "user",
              "content": "（已达工具调用上限，别再调用任何工具）请基于以上已经查到的信息，直接给出你目前"
-                        "能得出的结论；若还不完整，就说清已确认了什么、还差什么，给用户一个有用的阶段性答复。"}])
-        _record(aid, chat_id, model, final)
-        answer = (final.choices[0].message.content or "").strip() or "（暂未得出明确结论，请把问题说得更具体点再试）"
+                        "能得出的结论；若还不完整，就说清已确认了什么、还差什么，给用户一个有用的阶段性答复。"}],
+            None, extra_body, deliver)
+        _record(aid, chat_id, model, usage)
+        answer = (content or "").strip() or "（暂未得出明确结论，请把问题说得更具体点再试）"
     except Exception:
         answer = "（这次排查比较复杂、暂未收敛；把问题缩小一点范围再试试）"
     store.save(aid, chat_id, "assistant", answer)

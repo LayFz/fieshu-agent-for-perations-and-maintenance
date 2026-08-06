@@ -198,19 +198,36 @@ def _handle(app_id, chat_id, text, sender_open_id=""):
     # 即时回执 + 实时进度：先发一张「处理中」卡片，边查边把「正在跑什么」刷进同一张卡，最后更新为结论
     mid = _send_card(app, chat_id, "🔍 收到，正在处理…")
     steps = []
-    def on_step(labels):
+    ans_buf = [""]
+    last = [0.0]
+    def _render():
+        blocks = []
+        if steps:
+            shown = steps[-10:]
+            more = f"…（前 {len(steps) - len(shown)} 步略）\n" if len(steps) > len(shown) else ""
+            blocks.append("🔍 处理中…\n" + more + "\n".join(f"- {s}" for s in shown))
+        if ans_buf[0]:
+            blocks.append(ans_buf[0])
+        return "\n\n".join(blocks) or "🔍 收到，正在处理…"
+    def on_step(labels):                                 # 进入新一轮工具调用：追加步骤 + 清掉上一轮零碎输出
         if not mid:
             return
         steps.extend(labels or [])
-        shown = steps[-10:]                              # 只显示最近 10 步，避免卡片过长
-        more = f"…（前 {len(steps) - len(shown)} 步略）\n" if len(steps) > len(shown) else ""
-        body = "🔍 正在处理…\n\n" + more + "\n".join(f"- {s}" for s in shown)
-        _update_card(app, mid, body)
+        ans_buf[0] = ""
+        _update_card(app, mid, _render())
+    def on_delta(piece):                                 # 最终答案的流式增量：累积 + 节流刷卡片
+        if not mid:
+            return
+        ans_buf[0] += piece
+        now = time.time()
+        if now - last[0] >= 0.5:                          # 最多每 0.5s 刷一次（在飞书更新限流内）
+            last[0] = now
+            _update_card(app, mid, _render())
     try:
-        ans = llm_run(app, chat_id, text, speaker=speaker,
-                      speaker_open_id=sender_open_id, on_step=on_step)
+        ans = llm_run(app, chat_id, text, speaker=speaker, speaker_open_id=sender_open_id,
+                      on_step=on_step, on_delta=on_delta)
         print(f"[app {app_id}] 已回复 {ans[:80]!r}", flush=True)
-        if not (mid and _update_card(app, mid, ans)):    # 更新失败或没卡片：普通回一条，保证用户拿到答案
+        if not (mid and _update_card(app, mid, ans)):    # 最终答案完整落一版（也兜底 patch 失败 / 没卡片）
             _reply(app, chat_id, ans)
     except Exception as e:
         import traceback

@@ -254,6 +254,7 @@ function _appForm(a){
     <textarea id="ap-prompt" placeholder="例如：你是负责公众号选题与发布的营销助手……">${esc(a.system_prompt||'')}</textarea>
     <div class="row">
       <div style="flex:0 0 160px"><label>历史轮数</label><input id="ap-turns" type="number" min="0" value="${a.history_turns||12}"></div>
+      <div style="flex:0 0 160px"><label>思考模式(reasoning)</label><select id="ap-think"><option value="1" ${a.thinking!==false?'selected':''}>开启(默认)</option><option value="0" ${a.thinking===false?'selected':''}>关闭</option></select></div>
       <div><label>启用</label><select id="ap-enabled"><option value="1" ${a.enabled!==false?'selected':''}>启用</option><option value="0" ${a.enabled===false?'selected':''}>停用</option></select></div>
     </div>
     <label>可用工具（只勾该应用该有的——能力隔离）</label>
@@ -274,6 +275,7 @@ async function saveApp(id){
     feishu_app_id:$('#ap-fid').value.trim(),
     system_prompt:$('#ap-prompt').value,
     history_turns:Number($('#ap-turns').value)||12,
+    thinking:Number($('#ap-think').value),
     enabled:Number($('#ap-enabled').value),
     tools:[...document.querySelectorAll('.tk:checked')].map(x=>x.value),
     skills:[...document.querySelectorAll('.sk:checked')].map(x=>Number(x.value)),

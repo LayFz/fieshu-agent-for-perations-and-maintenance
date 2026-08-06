@@ -101,6 +101,7 @@ _ensure_col("notes", "app_id", "INTEGER")
 _ensure_col("token_usage", "app_id", "INTEGER")
 _ensure_col("apps", "skills", "TEXT DEFAULT '[]'")
 _ensure_col("apps", "mcp", "TEXT DEFAULT '[]'")     # 应用勾选的 MCP server id 名单
+_ensure_col("apps", "thinking", "INTEGER DEFAULT 1")  # 是否开启模型「思考(reasoning)」模式，默认开
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_msgs_app ON msgs(app_id, chat_id, id)")
 _conn.commit()
 
@@ -181,6 +182,7 @@ def _app_row(r):
         except Exception:
             d[col] = []
     d["enabled"] = bool(d.get("enabled"))
+    d["thinking"] = bool(d.get("thinking", 1))
     return d
 
 def list_apps():
@@ -211,10 +213,10 @@ def create_app(name, feishu_app_id="", feishu_app_secret="", ai_provider_id=None
 
 def update_app(aid, **f):
     sets, vals = [], []
-    for k in ("name", "feishu_app_id", "ai_provider_id", "system_prompt", "history_turns", "enabled"):
+    for k in ("name", "feishu_app_id", "ai_provider_id", "system_prompt", "history_turns", "enabled", "thinking"):
         if k in f and f[k] is not None:
             sets.append(f"{k}=?")
-            vals.append(int(f[k]) if k in ("history_turns", "enabled", "ai_provider_id") else f[k])
+            vals.append(int(f[k]) if k in ("history_turns", "enabled", "ai_provider_id", "thinking") else f[k])
     if "tools" in f and f["tools"] is not None:
         sets.append("tools=?"); vals.append(json.dumps(f["tools"], ensure_ascii=False))
     if "skills" in f and f["skills"] is not None:
