@@ -50,8 +50,34 @@ def _send_client(app):
     return c
 
 
+def _tables_to_text(text):
+    """飞书卡片 markdown 不支持表格：把 | a | b | 表格转成「- **首列**：列名 值 · 列名 值」的分行列表。
+    未识别为表格的内容原样返回；流式中途的半张表也能容错处理。"""
+    lines = text.split("\n")
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        # 表格头：本行是 |...| 且下一行是分隔行 |---|---|
+        if ln.strip().startswith("|") and i + 1 < n and re.match(r"^\s*\|[\s:|\-]+\|\s*$", lines[i + 1]):
+            header = [c.strip() for c in ln.strip().strip("|").split("|")]
+            i += 2
+            while i < n and lines[i].strip().startswith("|"):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                i += 1
+                if not any(cells):
+                    continue
+                first = cells[0]
+                rest = [f"{h} {v}".strip() for h, v in zip(header[1:], cells[1:]) if v]
+                out.append(f"- **{first}**" + ("：" + " · ".join(rest) if rest else ""))
+            continue
+        out.append(ln)
+        i += 1
+    return "\n".join(out)
+
+
 def _md_card(text):
-    md = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", r"**\1**", text, flags=re.M)
+    md = _tables_to_text(text)                                   # 表格 → 分行列表（飞书卡片不支持 md 表格）
+    md = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", r"**\1**", md, flags=re.M)
     return {"config": {"wide_screen_mode": True},
             "elements": [{"tag": "markdown", "content": md}]}
 
