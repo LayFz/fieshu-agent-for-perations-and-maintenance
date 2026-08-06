@@ -12,7 +12,7 @@ from feishu import auth
 from . import mcp as mcp_mod
 from .tools import tools_for, execute, SKILL_TOOL
 
-_MAX_TOOL_LOOPS = 6
+_MAX_TOOL_LOOPS = 40
 
 
 def _system(app, skills):
@@ -135,6 +135,15 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
 
     if proactive:
         return None                                  # 主动模式下查不动就别硬插话
-    answer = "（工具调用过多，已中止；请把任务拆细一点再试）"
+    # 轮数用尽：不直接放弃，强制「不带工具」再问一次，让它用已查到的信息给出当前最佳结论（优雅降级）
+    try:
+        final = client.chat.completions.create(model=model, messages=msgs + [
+            {"role": "user",
+             "content": "（已达工具调用上限，别再调用任何工具）请基于以上已经查到的信息，直接给出你目前"
+                        "能得出的结论；若还不完整，就说清已确认了什么、还差什么，给用户一个有用的阶段性答复。"}])
+        _record(aid, chat_id, model, final)
+        answer = (final.choices[0].message.content or "").strip() or "（暂未得出明确结论，请把问题说得更具体点再试）"
+    except Exception:
+        answer = "（这次排查比较复杂、暂未收敛；把问题缩小一点范围再试试）"
     store.save(aid, chat_id, "assistant", answer)
     return answer
