@@ -10,7 +10,8 @@ import threading
 import time
 
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+from lark_oapi.api.im.v1 import (CreateMessageRequest, CreateMessageRequestBody,
+                                 PatchMessageRequest, PatchMessageRequestBody)
 
 from core import store
 from feishu import members
@@ -68,6 +69,33 @@ def _reply(app, chat_id, text):
 def post(app, chat_id, text):
     """对外发消息（定时任务等主动推送用）。app 为 store.get_app() 字典。"""
     _reply(app, chat_id, text)
+
+
+def _send_card(app, chat_id, text):
+    """发一张交互卡片，返回 message_id（供后续原地更新）；失败返回 None。"""
+    req = (CreateMessageRequest.builder().receive_id_type("chat_id")
+           .request_body(CreateMessageRequestBody.builder().receive_id(chat_id)
+                         .msg_type("interactive")
+                         .content(json.dumps(_md_card(text))).build()).build())
+    resp = _send_client(app).im.v1.message.create(req)
+    if not resp.success():
+        print(f"[app {app['id']}] 发卡片失败:", resp.code, resp.msg, flush=True)
+        return None
+    return getattr(resp.data, "message_id", None)
+
+
+def _update_card(app, message_id, text):
+    """原地更新一张已发的卡片（PATCH）。message_id 为空则跳过。返回是否成功；失败只记日志、不抛。"""
+    if not message_id:
+        return False
+    req = (PatchMessageRequest.builder().message_id(message_id)
+           .request_body(PatchMessageRequestBody.builder()
+                         .content(json.dumps(_md_card(text))).build()).build())
+    resp = _send_client(app).im.v1.message.patch(req)
+    if not resp.success():
+        print(f"[app {app['id']}] 更新卡片失败:", resp.code, resp.msg, flush=True)
+        return False
+    return True
 
 
 def _extract_text(message):
@@ -167,15 +195,29 @@ def _handle(app_id, chat_id, text, sender_open_id=""):
         return
     # 解析发言人姓名（best-effort，无权限时回退 open_id 短码）
     speaker = members.name_of(app, chat_id, sender_open_id) if sender_open_id else ""
+    # 即时回执 + 实时进度：先发一张「处理中」卡片，边查边把「正在跑什么」刷进同一张卡，最后更新为结论
+    mid = _send_card(app, chat_id, "🔍 收到，正在处理…")
+    steps = []
+    def on_step(labels):
+        if not mid:
+            return
+        steps.extend(labels or [])
+        shown = steps[-10:]                              # 只显示最近 10 步，避免卡片过长
+        more = f"…（前 {len(steps) - len(shown)} 步略）\n" if len(steps) > len(shown) else ""
+        body = "🔍 正在处理…\n\n" + more + "\n".join(f"- {s}" for s in shown)
+        _update_card(app, mid, body)
     try:
-        _reply(app, chat_id, "收到，正在处理…")            # 即时回执：长任务（多轮查工具）期间先给反馈，避免"黑屏"干等
-        ans = llm_run(app, chat_id, text, speaker=speaker, speaker_open_id=sender_open_id)
+        ans = llm_run(app, chat_id, text, speaker=speaker,
+                      speaker_open_id=sender_open_id, on_step=on_step)
         print(f"[app {app_id}] 已回复 {ans[:80]!r}", flush=True)
-        _reply(app, chat_id, ans)
+        if not (mid and _update_card(app, mid, ans)):    # 更新失败或没卡片：普通回一条，保证用户拿到答案
+            _reply(app, chat_id, ans)
     except Exception as e:
         import traceback
         print(f"[app {app_id}] 处理消息出错:", e, flush=True)
         traceback.print_exc()
+        if mid:
+            _update_card(app, mid, "处理出错了，稍后再试～")
 
 
 def _on_message(app_id, data):

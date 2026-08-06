@@ -61,8 +61,30 @@ def _proactive_brief():
     )
 
 
+def _tool_label(name, args_json):
+    """把一次工具调用压成一句给人看的短进度，如 'kubectl get pods -A' / '查日志 k8s_upmore_api'。"""
+    try:
+        a = json.loads(args_json or "{}")
+    except Exception:
+        a = {}
+    if name == "kubectl":
+        return "kubectl " + (a.get("command") or "")
+    if name == "ssh_exec":
+        return "ssh " + (a.get("command") or "")[:50]
+    if name == "query_logs":
+        return "查日志 " + (a.get("stream") or "") + (f"（{a.get('where')}）" if a.get("where") else "")
+    if name == "read_skill":
+        return "读技能 " + (a.get("name") or "")
+    if name in ("server_stats", "docker_containers", "service_status", "list_log_streams",
+                "list_ssh_hosts", "list_k8s_clusters"):
+        return {"server_stats": "查服务器负载", "docker_containers": "查容器",
+                "service_status": "查服务状态", "list_log_streams": "列日志流",
+                "list_ssh_hosts": "列受管主机", "list_k8s_clusters": "列受管集群"}[name]
+    return name
+
+
 def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
-        speaker_open_id: str = "", proactive: bool = False):
+        speaker_open_id: str = "", proactive: bool = False, on_step=None):
     """app 为 store.get_app() 返回的字典（含 tools 列表、ai_provider_id 等）。
     speaker/speaker_open_id：群里这条消息的发言人姓名与 open_id（用于身份识别与 @）。
     proactive=True：主动模式，模型可回 __SILENT__ 选择不说话，此时返回 None（不发消息）。"""
@@ -119,6 +141,11 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
                                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                                for tc in m.tool_calls],
             })
+            if on_step:                                  # 进度回调：让 bot 把「这轮在跑什么」刷到卡片上
+                try:
+                    on_step([_tool_label(tc.function.name, tc.function.arguments) for tc in m.tool_calls])
+                except Exception:
+                    pass
             for tc in m.tool_calls:
                 try:
                     args = json.loads(tc.function.arguments or "{}")
