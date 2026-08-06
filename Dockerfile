@@ -8,15 +8,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # kubectl 二进制（给 kubectl 工具用，直连集群 API）。版本与集群 v1.36 对齐（skew ≤1 minor）。
 # 注：kubectl 是二进制，不进 pip；随镜像走。amd64 构建；换 arch 改 ARCH 即可。
+# kubectl 二进制（给 kubectl 工具用，直连集群 API）。版本与集群 v1.36 对齐（skew ≤1 minor）。
+# 用 base 镜像自带的 python+ca 证书直接下载，不装 apt/curl——避免构建时 apt-get 打 Debian 公网镜像卡死
+# （构建机不走出海代理时 apt-get update 会挂）。只碰 dl.k8s.io（构建机可直连）。amd64；换 arch 改 KUBECTL_ARCH。
 ARG KUBECTL_VERSION=v1.36.2
 ARG KUBECTL_ARCH=amd64
-RUN set -eux; \
-    apt-get update; apt-get install -y --no-install-recommends curl ca-certificates; \
-    curl -fsSL -o /usr/local/bin/kubectl \
-      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl"; \
-    chmod +x /usr/local/bin/kubectl; \
-    kubectl version --client; \
-    apt-get purge -y curl; apt-get autoremove -y; rm -rf /var/lib/apt/lists/*
+RUN python -c "import urllib.request; urllib.request.urlretrieve('https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl', '/usr/local/bin/kubectl')" \
+    && chmod +x /usr/local/bin/kubectl \
+    && kubectl version --client
 
 COPY app ./app
 COPY core ./core
