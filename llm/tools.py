@@ -68,15 +68,22 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "list_log_streams",
-        "description": "列出 OpenObserve 里可查的日志流(stream)名称。不确定查哪个流时先调它。",
-        "parameters": {"type": "object", "properties": {}},
+        "description": "列出 OpenObserve 各组织(org)下可查的日志流(stream)名称，按 org 分组返回。"
+                       "OpenObserve 按 org 隔离数据(如 default 是应用/集群日志、rum 是前端埋点)，"
+                       "不确定查哪个流、或者不确定在哪个 org 时，先调它。",
+        "parameters": {"type": "object", "properties": {
+            "org": {"type": "string", "description": "可选，只列某个组织，如 default / rum；不传列全部已配置组织"},
+        }},
     }},
     {"type": "function", "function": {
         "name": "query_logs",
         "description": "查 OpenObserve 日志。给出日志流名、可选过滤条件、时间窗，返回最近的日志记录。"
-                       "用于排查应用运行情况，例如某次发布是否失败、有没有报错。",
+                       "用于排查应用运行情况，例如某次发布是否失败、有没有报错。"
+                       "OpenObserve 按组织(org)隔离数据，不同 org 的数据流不同(如 default / rum)，"
+                       "用 org 参数指定；不传则查默认组织。不确定流名时先调 list_log_streams。",
         "parameters": {"type": "object", "properties": {
             "stream": {"type": "string", "description": "日志流名，例如 app_mp_publisher"},
+            "org": {"type": "string", "description": "可选，组织名，如 default / rum；不传查默认组织"},
             "where": {"type": "string", "description": "可选 SQL 过滤条件（不含 WHERE），例如 level='error'"},
             "period": {"type": "string", "description": "时间窗，如 15m/1h/24h/7d，默认 15m"},
             "limit": {"type": "integer", "description": "返回条数上限，默认 50，最多 500"},
@@ -258,10 +265,11 @@ def execute(name, args, ctx=None):
             store.add_note(app_id, args["note"])
             return {"ok": True}
         if name == "list_log_streams":
-            return openobserve.list_streams()
+            return openobserve.list_streams(args.get("org"))
         if name == "query_logs":
             return openobserve.search(args["stream"], args.get("where"),
-                                      args.get("period", "15m"), args.get("limit", 50))
+                                      args.get("period", "15m"), args.get("limit", 50),
+                                      args.get("org"))
         if name == "server_stats":
             return beszel.servers(args.get("name"))
         if name == "docker_containers":

@@ -409,6 +409,49 @@ def remove_app(aid: int, request: Request):
 
 
 # ---------- 全局可观测配置（OpenObserve，供 query_logs 工具用） ----------
+def _oo_sources_raw():
+    """读 oo_sources（额外组织）：OpenObserve 按 org 隔离，每个 org 一套 service account。"""
+    try:
+        v = json.loads(store.get_setting("oo_sources", "") or "[]")
+    except Exception:
+        v = []
+    return v if isinstance(v, list) else []
+
+
+def _oo_sources_public():
+    """回给前端的额外组织配置（密码只回是否已设，不回明文）。"""
+    out = []
+    for s in _oo_sources_raw():
+        if not isinstance(s, dict) or not (s.get("org") or "").strip():
+            continue
+        out.append({
+            "name": (s.get("name") or s["org"]).strip(),
+            "org": s["org"].strip(),
+            "user": (s.get("user") or "").strip(),
+            "pass_set": bool(s.get("pass")),
+        })
+    return out
+
+
+def _save_oo_sources(rows):
+    """保存额外组织；某行没传新密码时沿用旧密码（前端留空=不改）。"""
+    old = {(s.get("org") or "").strip().lower(): s
+           for s in _oo_sources_raw() if isinstance(s, dict)}
+    out, seen = [], set()
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        org = (r.get("org") or "").strip()
+        key = org.lower()
+        if not org or key in seen:
+            continue
+        seen.add(key)
+        pw = (r.get("pass") or "").strip() or (old.get(key) or {}).get("pass") or ""
+        out.append({"name": (r.get("name") or org).strip(), "org": org,
+                    "user": (r.get("user") or "").strip(), "pass": pw})
+    store.set_setting("oo_sources", json.dumps(out, ensure_ascii=False))
+
+
 @app.get("/api/obs")
 def obs_get(request: Request):
     _auth(request)
@@ -421,6 +464,7 @@ def obs_get(request: Request):
         "org": store.get_setting("oo_org", "default"),
         "user": store.get_setting("oo_user", ""),
         "pass_masked": _mask(oo_pw), "pass_set": bool(oo_pw),
+        "org_sources": _oo_sources_public(),
         # Beszel（服务器负载）
         "bz_url": store.get_setting("bz_url", ""),
         "bz_user": store.get_setting("bz_user", ""),
@@ -438,6 +482,7 @@ async def obs_set(request: Request):
     if "org" in b:      store.set_setting("oo_org", (b["org"] or "default").strip())
     if "user" in b:     store.set_setting("oo_user", (b["user"] or "").strip())
     if b.get("pass"):   store.set_setting("oo_pass", b["pass"].strip())
+    if "org_sources" in b: _save_oo_sources(b.get("org_sources"))
     if "bz_url" in b:   store.set_setting("bz_url", (b["bz_url"] or "").strip())
     if "bz_user" in b:  store.set_setting("bz_user", (b["bz_user"] or "").strip())
     if b.get("bz_pass"): store.set_setting("bz_pass", b["bz_pass"].strip())

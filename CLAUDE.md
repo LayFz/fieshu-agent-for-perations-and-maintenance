@@ -50,6 +50,7 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 - `schedules` — 定时任务（app_id/chat_id/title/instruction/kind/spec/next_run_ts）
 - `msgs` / `notes` / `token_usage` — 对话记忆 / 长期笔记 / 用量，**都带 app_id 按应用隔离**
 - `kv` — 引导配置 + 全局设置（OpenObserve/Beszel/UptimeKuma 连接 `oo_*`/`bz_*`/`uk_*`；SSH 受管主机+凭证 `ssh_hosts`、硬黑名单 `ssh_blacklist`）；`admin` — 管理员
+  - OpenObserve 按 **org** 隔离数据：`oo_org/oo_user/oo_pass` 是主 org，`oo_sources`（JSON 数组）存其余 org 各自的 service account；`query_logs`/`list_log_streams` 用可选 `org` 参数切换。每个 org 要用它自己建的 service account，主 org 的账号访问不了别的 org
 
 ## 核心概念
 

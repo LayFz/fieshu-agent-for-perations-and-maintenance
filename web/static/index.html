@@ -579,6 +579,10 @@ async function obs(){
         <div><label>密码/Token ${o.pass_set?`<span class="muted">（已设，留空=不改）</span>`:''}</label>
           <input id="o-pass" type="password" placeholder="${o.pass_set?'留空保持不变':'粘贴密码/Token'}"></div>
       </div>
+      <div class="hint">OpenObserve 按<b>组织(org)</b>隔离数据：每个 org 一份数据、一个 service account，互相看不见。
+        用不同 org（如前端埋点 <span class="mono">rum</span>）就在这里各加一行，别把主 org 的账号填进去——它访问不了别的 org。</div>
+      <div id="o-src-rows" style="margin-top:8px"></div>
+      <div><button class="btn ghost sm" type="button" onclick="_oAddSrc()">＋ 添加组织</button></div>
     </div>
 
     <div class="card">
@@ -602,10 +606,38 @@ async function obs(){
 
     <div class="save-bar"><button class="btn" onclick="saveObs()">保存全部</button>
       <span class="hint">不入库到代码，仅存运行时 DB。</span></div>`;
+  _oSources=(o.org_sources||[]).map(s=>({...s}));
+  _oRenderSrc();
 }
+let _oSources=[];
+function _oRenderSrc(){
+  const box=$('#o-src-rows'); if(!box) return;
+  box.innerHTML=_oSources.map((s,i)=>`
+    <div class="row" data-src="${i}">
+      <div style="flex:0 0 130px"><label>组织 org</label><input class="o-src-org" value="${esc(s.org||'')}" placeholder="rum"></div>
+      <div><label>账号(Service Account)</label><input class="o-src-user" value="${esc(s.user||'')}" placeholder="feishu-rum@xxx"></div>
+      <div style="flex:0 0 220px"><label>密码/Token ${s.pass_set?'<span class="muted">（已设，留空=不改）</span>':''}</label>
+        <input class="o-src-pass" type="password" placeholder="${s.pass_set?'留空保持不变':'粘贴该 org 的 Token'}"></div>
+      <div style="flex:0 0 auto;display:flex;align-items:flex-end"><button class="btn danger" type="button" onclick="_oDelSrc(${i})">删除</button></div>
+    </div>`).join('') || '<div class="hint" style="margin:4px 0">暂无额外组织。</div>';
+}
+function _oCollectSrc(){
+  document.querySelectorAll('#o-src-rows [data-src]').forEach((el,i)=>{
+    const s=_oSources[i]||{};
+    s.org=el.querySelector('.o-src-org').value;
+    s.user=el.querySelector('.o-src-user').value;
+    const p=el.querySelector('.o-src-pass').value.trim(); if(p) s.pass=p;
+    _oSources[i]=s;
+  });
+}
+function _oAddSrc(){ _oCollectSrc(); _oSources.push({org:'',user:'',pass_set:false}); _oRenderSrc(); }
+function _oDelSrc(i){ _oCollectSrc(); _oSources.splice(i,1); _oRenderSrc(); }
 async function saveObs(){
+  _oCollectSrc();
   const body={ base_url:$('#o-url').value, org:$('#o-org').value, user:$('#o-user').value,
-    bz_url:$('#b-url').value, bz_user:$('#b-user').value, uk_url:$('#u-url').value };
+    bz_url:$('#b-url').value, bz_user:$('#b-user').value, uk_url:$('#u-url').value,
+    org_sources:_oSources.map(s=>({org:(s.org||'').trim(),user:(s.user||'').trim(),pass:s.pass||''}))
+                        .filter(s=>s.org) };
   const p=$('#o-pass').value.trim(); if(p) body.pass=p;
   const bp=$('#b-pass').value.trim(); if(bp) body.bz_pass=bp;
   const uk=$('#u-key').value.trim(); if(uk) body.uk_key=uk;
