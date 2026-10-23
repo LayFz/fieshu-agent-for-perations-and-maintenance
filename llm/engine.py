@@ -223,7 +223,8 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
     rec.emit("user/message", {"content": turn})
 
     ctx = {"app_id": aid, "chat_id": chat_id,
-           "skills": {s["name"]: s.get("content") or "" for s in skills}}
+           "skills": {s["name"]: {"content": s.get("content") or "", "files": s.get("files") or {}}
+                      for s in skills}}
     ctok = auth.use_app(app.get("feishu_app_id"), app.get("feishu_app_secret"))  # 文档工具用本应用凭证
     thinking_on = bool(app.get("thinking", True))
     extra_body = {"thinking": {"type": "enabled" if thinking_on else "disabled"}}  # 豆包思考开关（默认开）

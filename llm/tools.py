@@ -258,9 +258,11 @@ def meta_for(name, args):
 SKILL_TOOL = {"type": "function", "function": {
     "name": "read_skill",
     "description": "读取一个技能(skill)的完整内容（知识/工作方法/背景资料）。系统提示词里列了你可用的技能名与简介，"
-                   "需要某个技能的详细内容时调用它。",
+                   "需要某个技能的详细内容时调用它。返回里的 files 是该技能附带的参考文件（如 references/xx.md、脚本），"
+                   "正文里提到它们、需要细节时，再带上 file 参数读取。",
     "parameters": {"type": "object", "properties": {
         "name": {"type": "string", "description": "技能名称（见系统提示词中的技能清单）"},
+        "file": {"type": "string", "description": "可选，附带文件的相对路径（取自上次返回的 files），不传读正文"},
     }, "required": ["name"]},
 }}
 
@@ -291,7 +293,20 @@ def execute(name, args, ctx=None):
             if sk is None:
                 return {"error": "没有这个技能或本应用未启用它",
                         "available": list(skills.keys())}
-            return {"name": args.get("name"), "content": sk}
+            if isinstance(sk, str):                   # 兼容旧调用方：只有正文
+                sk = {"content": sk, "files": {}}
+            files = sk.get("files") or {}
+            if args.get("file"):
+                f = str(args["file"]).strip()
+                f = f[2:] if f.startswith("./") else f
+                if f not in files:
+                    return {"error": f"技能「{args.get('name')}」没有附带文件 {args['file']}",
+                            "files": sorted(files)}
+                return {"name": args.get("name"), "file": f, "content": files[f]}
+            out = {"name": args.get("name"), "content": sk.get("content") or ""}
+            if files:
+                out["files"] = sorted(files)
+            return out
         if name == "list_knowledge_bases":
             return feishu_docs.list_kbs()
         if name == "list_nodes":

@@ -8,7 +8,7 @@ import time
 import traceback
 
 from core import store
-from harness import runs
+from harness import runs, skills
 
 _started = False
 _PURGE_EVERY = 6 * 3600     # 运行记录（runs/events）过期清理间隔
@@ -31,12 +31,16 @@ def _fire(sc):
 
 def _loop():
     last_purge = 0.0
+    last_skill_check = 0.0
     while True:
         try:
             now = time.time()
             for sc in store.due_schedules(now):
                 store.mark_schedule_ran(sc["id"], now)   # 先标记下次时间，避免本轮重复触发
                 threading.Thread(target=_fire, args=(sc,), daemon=True).start()
+            if now - last_skill_check >= 60:              # 技能源到期就同步（另起线程，不挡定时任务）
+                last_skill_check = now
+                threading.Thread(target=skills.sync_due, name="skill-sync", daemon=True).start()
             if now - last_purge >= _PURGE_EVERY:          # 顺手清理过期运行记录
                 last_purge = now
                 n = runs.purge_old()

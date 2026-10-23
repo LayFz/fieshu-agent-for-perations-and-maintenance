@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse
 from core import store
 from feishu import auth, bot
 from harness import policy
+from harness import skills as skills_sync
 from llm import mcp as mcp_mod
 from llm.tools import all_tools, tool_list_for
 
@@ -269,9 +270,24 @@ async def create_skill(request: Request):
         raise HTTPException(status_code=400, detail="技能名称已存在")
     return {"ok": True, "id": sid}
 
+def _manual_skill_or_400(sid):
+    sk = store.get_skill(sid)
+    if sk and sk.get("source_id"):
+        raise HTTPException(status_code=400, detail="这个技能从 Git 同步而来，后台只读；要改请到对应能力仓提 MR，删除请在技能源里取消同步")
+    return sk
+
+@app.get("/api/skills/{sid}")
+def skill_detail(sid: int, request: Request):
+    _auth(request)
+    sk = store.get_skill(sid)
+    if not sk:
+        raise HTTPException(status_code=404, detail="技能不存在")
+    return sk
+
 @app.put("/api/skills/{sid}")
 async def edit_skill(sid: int, request: Request):
     _auth(request)
+    _manual_skill_or_400(sid)
     b = await _body(request)
     store.update_skill(sid, name=b.get("name"), description=b.get("description"), content=b.get("content"))
     return {"ok": True}
@@ -279,8 +295,99 @@ async def edit_skill(sid: int, request: Request):
 @app.delete("/api/skills/{sid}")
 def remove_skill(sid: int, request: Request):
     _auth(request)
+    _manual_skill_or_400(sid)
     store.delete_skill(sid)
     return {"ok": True}
+
+
+# ---------- 技能源（从 Git 同步技能，harness.skills） ----------
+def _source_view(s):
+    v = {k: s.get(k) for k in ("id", "name", "kind", "url", "branch", "subdir", "username", "rewrite", "plugins",
+                               "enabled", "interval_min", "last_sync", "last_status", "last_error", "last_report")}
+    v["token_masked"] = _mask(s.get("token"))
+    v["token_set"] = bool(s.get("token"))
+    v["skill_count"] = len(store.skills_by_source(s["id"]))
+    return v
+
+def _split_list(v):
+    if isinstance(v, str):
+        v = re.split(r"[\s,，]+", v)
+    return [str(x).strip() for x in (v or []) if str(x).strip()]
+
+def _source_fields(b, creating):
+    f = {}
+    if creating or "name" in b:
+        f["name"] = (b.get("name") or "").strip()
+        if not f["name"]:
+            raise HTTPException(status_code=400, detail="请填技能源名称")
+    if creating or "kind" in b:
+        f["kind"] = b.get("kind") or "marketplace"
+        if f["kind"] not in ("marketplace", "repo"):
+            raise HTTPException(status_code=400, detail="类型只能是 marketplace（索引仓）或 repo（单个能力仓）")
+    if creating or "url" in b:
+        f["url"] = (b.get("url") or "").strip()
+        if not (f["url"].startswith(("https://", "http://")) or os.path.isabs(f["url"])):
+            raise HTTPException(status_code=400, detail="仓库地址需为 https:// 开头（ssh 地址请用改写规则转成 https）")
+    for k in ("branch", "subdir", "username"):
+        if k in b:
+            f[k] = (b.get(k) or "").strip()
+    if b.get("token"):
+        f["token"] = b["token"].strip()
+    if "plugins" in b:
+        f["plugins"] = _split_list(b.get("plugins"))
+    if "rewrite" in b:
+        raw = b.get("rewrite") or []
+        if isinstance(raw, str):                         # 每行「from => to」
+            raw = [ln.split("=>", 1) for ln in raw.splitlines() if "=>" in ln]
+        rules = []
+        for r in raw:
+            if not (isinstance(r, (list, tuple)) and len(r) == 2 and str(r[0]).strip() and str(r[1]).strip()):
+                raise HTTPException(status_code=400, detail="改写规则格式：每行「原前缀 => 新前缀」")
+            rules.append([str(r[0]).strip(), str(r[1]).strip()])
+        f["rewrite"] = rules
+    if "enabled" in b:
+        f["enabled"] = 1 if b["enabled"] else 0
+    if "interval_min" in b:
+        try:
+            f["interval_min"] = max(5, int(b.get("interval_min") or 60))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="同步间隔需为分钟数")
+    return f
+
+@app.get("/api/skill-sources")
+def skill_sources(request: Request):
+    _auth(request)
+    return {"sources": [_source_view(s) for s in store.list_skill_sources()]}
+
+@app.post("/api/skill-sources")
+async def create_skill_source(request: Request):
+    _auth(request)
+    sid = store.create_skill_source(**_source_fields(await _body(request), creating=True))
+    return {"ok": True, "id": sid}
+
+@app.put("/api/skill-sources/{sid}")
+async def edit_skill_source(sid: int, request: Request):
+    _auth(request)
+    if not store.get_skill_source(sid):
+        raise HTTPException(status_code=404, detail="技能源不存在")
+    store.update_skill_source(sid, **_source_fields(await _body(request), creating=False))
+    return {"ok": True}
+
+@app.delete("/api/skill-sources/{sid}")
+def remove_skill_source(sid: int, request: Request):
+    _auth(request)
+    store.delete_skill_source(sid)
+    return {"ok": True}
+
+@app.post("/api/skill-sources/{sid}/sync")
+def sync_skill_source(sid: int, request: Request):
+    """立即同步（同步执行，可能要几十秒）。"""
+    _auth(request)
+    try:
+        rep = skills_sync.sync_source(sid)
+    except skills_sync.SyncError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "report": rep, "source": _source_view(store.get_skill_source(sid))}
 
 
 # ---------- 定时任务 ----------

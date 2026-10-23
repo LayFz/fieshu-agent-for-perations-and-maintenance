@@ -379,21 +379,105 @@ async function saveProv(id){
 async function delProv(id,name){ if(!confirm('删除 AI「'+name+'」？绑定它的应用会暂时无 AI 可用。')) return; await api('DELETE','/api/providers/'+id); toast('已删除'); providers(); }
 
 /* ---------- 技能（知识/工作方法包） ---------- */
+let _srcCache=[];
+const SYNC_STATUS={ok:['同步正常','g'],partial:['部分失败','y'],error:['同步失败','r']};
 async function skills(){
   const c=$('#content'); c.innerHTML='<h2>技能</h2><p class="desc">加载中…</p>';
-  const {skills}=await api('GET','/api/skills');
+  const [{skills},{sources}]=await Promise.all([api('GET','/api/skills'),api('GET','/api/skill-sources')]);
+  _srcCache=sources;
+  const srcName=id=>{ const s=sources.find(x=>x.id===id); return s?s.name:('#'+id); };
+  const srcRows = sources.length ? sources.map(s=>{
+    const [st,dot]=SYNC_STATUS[s.last_status]||['未同步',''];
+    return `<tr><td style="max-width:0;width:100%"><b>${esc(s.name)}</b>${s.enabled?'':' <span class="tag off">已停用</span>'}
+      <div class="muted mono" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(s.url)}">${esc(s.url)}${s.branch?' @'+esc(s.branch):''}</div></td>
+      <td class="muted">${s.kind==='marketplace'?'索引仓':'能力仓'}${(s.plugins||[]).length?'<br>只同步 '+esc(s.plugins.join('、')):''}</td>
+      <td><span class="chip" style="padding:2px 10px"><span class="dot ${dot}"></span>${st}</span>
+        <div class="muted" style="font-size:12px">${s.last_sync?dt(s.last_sync):''} · ${s.skill_count} 个技能 · 每 ${s.interval_min} 分钟</div>
+        ${s.last_error?`<div style="color:var(--err);font-size:12px;white-space:pre-wrap">${esc(s.last_error)}</div>`:''}</td>
+      <td style="white-space:nowrap"><button class="btn sm" id="sync-${s.id}" onclick="syncSource(${s.id})">立即同步</button>
+        <button class="btn ghost sm" onclick="editSource(${s.id})">编辑</button>
+        <button class="btn danger" onclick="delSource(${s.id},'${esc(s.name)}')">删除</button></td></tr>`;}).join('')
+    : '<tr><td colspan="4" class="muted">还没有技能源。添加公司 GitLab 的 skill marketplace 后，架构知识（k8s-fleet、k8s-ops…）会自动同步进来，和 Claude Code 共用一份。</td></tr>';
   const rows = skills.length ? skills.map(s=>`<tr>
       <td>${esc(s.name)}</td><td class="muted">${esc(s.description||'')}</td>
-      <td class="muted">${(s.content||'').length} 字</td>
-      <td><button class="btn sm" onclick='editSkill(${JSON.stringify(s)})'>编辑</button>
-          <button class="btn danger" onclick="delSkill(${s.id},'${esc(s.name)}')">删除</button></td></tr>`).join('')
-    : '<tr><td colspan="4" class="muted">还没有技能。技能=喂给数字员工的知识/工作方法（如「服务器情况」「公众号选题规范」），应用按需勾选。</td></tr>';
+      <td class="muted">${s.source_id?`<span class="tag">Git</span> ${esc(s.plugin||'')}<br><span class="mono" style="font-size:11px">${esc(srcName(s.source_id))} · ${esc((s.revision||'').slice(0,8))}</span>`:'手工'}</td>
+      <td class="muted">${(s.content||'').length} 字${(s.file_names||[]).length?' + '+s.file_names.length+' 个文件':''}</td>
+      <td style="white-space:nowrap">${s.source_id?`<button class="btn ghost sm" onclick="viewSkill(${s.id})">查看</button>`
+        :`<button class="btn sm" onclick='editSkill(${JSON.stringify(s)})'>编辑</button>
+          <button class="btn danger" onclick="delSkill(${s.id},'${esc(s.name)}')">删除</button>`}</td></tr>`).join('')
+    : '<tr><td colspan="5" class="muted">还没有技能。技能=喂给数字员工的知识/工作方法（如「服务器情况」「公众号选题规范」），应用按需勾选。</td></tr>';
   c.innerHTML=`
     <div class="head"><div><h2>技能</h2><p class="desc">知识/工作方法包，区别于工具(动作)；应用各自勾选，按应用隔离。</p></div>
       <button class="btn" onclick="newSkill()">+ 新建技能</button></div>
-    <div class="card"><table><thead><tr><th style="width:200px">名称</th><th>简介</th><th style="width:90px">篇幅</th><th style="width:140px"></th></tr></thead>
+    <div class="card"><div style="display:flex;align-items:center;margin-bottom:8px"><b>技能源（从 Git 同步）</b>
+        <span class="muted" style="margin-left:8px;font-size:12px">Git 来源的技能后台只读，改动请到能力仓提 MR</span>
+        <button class="btn ghost sm" style="margin-left:auto" onclick="newSource()">+ 添加技能源</button></div>
+      <table><thead><tr><th>名称 / 地址</th><th style="width:150px">类型</th><th style="width:260px">状态</th><th style="width:230px"></th></tr></thead>
+      <tbody>${srcRows}</tbody></table></div>
+    <div class="card"><table><thead><tr><th style="width:180px">名称</th><th>简介</th><th style="width:170px">来源</th><th style="width:120px">篇幅</th><th style="width:130px"></th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
 }
+async function viewSkill(id){
+  const s=await api('GET','/api/skills/'+id);
+  const files=Object.entries(s.files||{});
+  openModal(`<h3>${esc(s.name)}</h3><p class="desc">${esc(s.description||'')}</p>
+    <div class="muted mono" style="margin-bottom:8px">plugin ${esc(s.plugin||'')} · ${esc(s.path||'')} · ${esc((s.revision||'').slice(0,12))} · 同步于 ${dt(s.synced)}</div>
+    <pre style="background:#f7f8fa;padding:10px;border-radius:6px;max-height:320px;overflow:auto;white-space:pre-wrap">${esc(s.content)}</pre>
+    ${files.map(([k,v])=>`<details><summary class="mono">${esc(k)}（${v.length} 字）</summary><pre style="background:#f7f8fa;padding:10px;border-radius:6px;max-height:240px;overflow:auto;white-space:pre-wrap">${esc(v)}</pre></details>`).join('')}
+    <div class="save-bar"><button class="btn ghost" onclick="closeModal()">关闭</button></div>`);
+}
+function _sourceForm(s){
+  const rw=(s.rewrite||[['ssh://git@192.168.110.44:10022/','https://gitlab.layfz.com/']]).map(r=>r[0]+' => '+r[1]).join('\n');
+  return `<h3>${s.id?'编辑技能源':'添加技能源'}</h3>
+    <p class="desc">用只读 Deploy Token（scope 只勾 read_repository）。令牌只会发给与仓库地址同一主机的地址。</p>
+    <div class="row">
+      <div><label>名称</label><input id="ss-name" value="${esc(s.name||'')}" placeholder="如：公司 skill marketplace"></div>
+      <div style="flex:0 0 200px"><label>类型</label><select id="ss-kind">
+        <option value="marketplace" ${s.kind!=='repo'?'selected':''}>索引仓（marketplace）</option>
+        <option value="repo" ${s.kind==='repo'?'selected':''}>单个能力仓</option></select></div>
+    </div>
+    <div class="row">
+      <div><label>仓库地址（https）</label><input id="ss-url" value="${esc(s.url||'https://gitlab.layfz.com/claude-skills/marketplace.git')}"></div>
+      <div style="flex:0 0 140px"><label>分支</label><input id="ss-branch" value="${esc(s.branch||'')}" placeholder="默认分支"></div>
+    </div>
+    <div class="row">
+      <div><label>Deploy Token 用户名</label><input id="ss-user" value="${esc(s.username||'')}" placeholder="gitlab+deploy-token-1"></div>
+      <div><label>Deploy Token ${s.token_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label>
+        <input id="ss-token" type="password" placeholder="${s.token_set?'留空保持不变':'粘贴令牌'}"></div>
+    </div>
+    <label>只同步这些 plugin（逗号或换行分隔，留空＝索引里的全部；敏感能力不想给数字员工就别列）</label>
+    <input id="ss-plugins" value="${esc((s.plugins||[]).join(', '))}" placeholder="k8s-fleet, k8s-ops, fleet-network">
+    <label>能力仓子目录（仅「单个能力仓」用，monorepo 时填）</label>
+    <input id="ss-subdir" value="${esc(s.subdir||'')}" placeholder="留空＝仓根">
+    <label>地址改写（每行「原前缀 => 新前缀」，把索引里的 ssh 地址转成 https）</label>
+    <textarea id="ss-rewrite" class="mono" style="min-height:60px">${esc(rw)}</textarea>
+    <div class="row">
+      <div style="flex:0 0 160px"><label>同步间隔（分钟）</label><input id="ss-interval" type="number" min="5" value="${s.interval_min||60}"></div>
+      <div style="flex:0 0 160px"><label>启用</label><select id="ss-enabled"><option value="1" ${s.enabled!==false?'selected':''}>启用</option><option value="0" ${s.enabled===false?'selected':''}>停用</option></select></div>
+    </div>
+    <div class="save-bar"><button class="btn" onclick="saveSource(${s.id||0})">保存</button>
+      <button class="btn ghost" onclick="closeModal()">取消</button></div>`;
+}
+function newSource(){ openModal(_sourceForm({})); }
+function editSource(id){ openModal(_sourceForm(_srcCache.find(s=>s.id===id)||{})); }
+async function saveSource(id){
+  const body={ name:$('#ss-name').value.trim(), kind:$('#ss-kind').value, url:$('#ss-url').value.trim(),
+    branch:$('#ss-branch').value.trim(), username:$('#ss-user').value.trim(), plugins:$('#ss-plugins').value,
+    subdir:$('#ss-subdir').value.trim(), rewrite:$('#ss-rewrite').value, interval_min:Number($('#ss-interval').value)||60,
+    enabled:Number($('#ss-enabled').value) };
+  const tk=$('#ss-token').value.trim(); if(tk) body.token=tk;
+  try{ if(id) await api('PUT','/api/skill-sources/'+id,body); else await api('POST','/api/skill-sources',body);
+    closeModal(); toast('已保存，点「立即同步」拉取'); skills(); }catch(e){ toast(e.message); }
+}
+async function syncSource(id){
+  const b=$('#sync-'+id); if(b){ b.disabled=true; b.textContent='同步中…'; }
+  try{ const {report:r}=await api('POST','/api/skill-sources/'+id+'/sync');
+    toast(r.error?('同步失败：'+r.error):`同步完成：新增 ${r.added.length}、更新 ${r.updated.length}、删除 ${r.removed.length}`+(r.conflicts.length?`、冲突 ${r.conflicts.length}`:'')); }
+  catch(e){ toast(e.message); }
+  skills();
+}
+async function delSource(id,name){ if(!confirm('删除技能源「'+name+'」？它同步来的技能会一并删除，勾选了这些技能的应用会失去它们。')) return;
+  await api('DELETE','/api/skill-sources/'+id); toast('已删除'); skills(); }
 function _skillForm(s){
   return `<h3>${s.id?'编辑技能':'新建技能'}</h3>
     <p class="desc">简介会常驻在数字员工的提示词里；正文在它需要时通过 read_skill 拉取。</p>

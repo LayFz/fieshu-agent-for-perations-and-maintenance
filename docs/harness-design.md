@@ -1,7 +1,7 @@
 # feishu-agent harness 设计与路线
 
 > 本文档是 harness 改造的依据，随实现同步更新。工程约定和坑见 [`CLAUDE.md`](../CLAUDE.md)。
-> 最近更新：2026-10-22（P0、P1 已完成；P2 代码完成，待飞书联调）。
+> 最近更新：2026-10-22（P0、P1 已完成；P2、P2b 代码完成，待真实环境联调）。
 
 ## 1. 目标
 
@@ -24,7 +24,7 @@
 | P0 | `runs` / `events` 事件日志；后台「运行记录」页 | ✅ 已完成（d7898f0） |
 | P1 | 工具执行管道 `run_tool()`；策略预设（兼容/只读/自定义）；guard（not_exposed、proactive、ssh_blacklist、k8s_precheck）；工具元数据 | ✅ 已完成（9ffa887） |
 | P2 | 审批：飞书卡片回调、`approvals` 表、审批人、「审批」预设 | 🟡 代码完成、测试通过，待飞书后台订阅回调后联调 |
-| P2b | 技能从 Git 同步 | 待开始 |
+| P2b | 技能从 Git 同步 | 🟡 代码完成、测试通过，待在内网接公司 GitLab 联调 |
 | P2c | 自动审查预设（可选） | 待开始 |
 | P3 | 代码工作区执行器 | 待开始 |
 | P4 | 大输出外存 + `read_spill` | 待开始 |
@@ -153,14 +153,20 @@ engine 里每次工具调用都走 `run_tool()`：
 
 审查模型**只看**：固定审查策略、应用人设、人亲手写的话（带来源）、待执行调用。**看不到**工具结果、主模型输出和任何外部内容，所以已被注入的主模型说服不了它。输出严格 JSON，解析失败、超时一律按 deny。放行后仍要过 guard。每次审查写 `tool/review` 事件。
 
-## 7. 技能从 Git 同步（P2b）
+## 7. 技能从 Git 同步（P2b，代码完成）
 
-**架构知识只维护一份**：直接读公司 GitLab skill marketplace 里的 SKILL.md（`k8s-fleet`、`k8s-ops`、`fleet-network` 等），和 Claude Code 共用。
+**架构知识只维护一份**：直接读公司 GitLab skill marketplace（`claude-skills` group）里的 SKILL.md（`k8s-fleet`、`k8s-ops`、`fleet-network` 等），和 Claude Code 共用。实现：`harness/skills.py`；表 `skill_sources`，`skills` 新增 `source_id / plugin / path / revision / files / synced`。
 
-- 后台登记技能源：仓库地址、分支、只读 Deploy Token、子目录。
-- 定时或手动同步：拉取后解析 SKILL.md 的 frontmatter（name、description）和正文，写入 `skills` 表，标注 `source=git`、提交号。Git 来源的技能在后台只读，改动走 MR。
-- 引用文件（SKILL.md 里链接的其他 md）一并收进，`read_skill` 支持按路径读子文件。
-- 同步失败保留上一版，不让技能突然消失。
+- **两种技能源**：`marketplace`（中央索引仓，读 `.claude-plugin/marketplace.json`，支持 `url`、`git-subdir`、索引仓内相对路径三种 source）和 `repo`（单个能力仓，可选子目录）。能力仓里仓根 `SKILL.md` 或 `skills/*/SKILL.md` 各算一个技能。
+- **git 用 dulwich**（纯 Python，`requirements.txt`），镜像不装 git，避开构建机 apt 卡死；远程地址浅克隆。
+- **认证**：只读 Deploy Token（scope 仅 `read_repository`）走 HTTPS basic auth。索引里的 `ssh://git@192.168.110.44:10022/` 按技能源的改写规则转成 `https://gitlab.layfz.com/`（同 git `insteadOf`）。
+- **按名单同步**：`plugins` 名单为空=全部；敏感能力（如 `fleet-vpn`）不想给数字员工就不列。移出名单的技能下次同步删除。
+- **安全**：令牌只发给与技能源同一主机的地址，索引里写了别的主机一律拒绝且不访问；索引相对路径、`git-subdir` 的 `path`、`subdir` 用 `../` 跳出克隆目录一律拒绝；符号链接（可能指向容器内任意文件）、二进制、超过 100KB 的文件不收；单技能附属文件总量上限 512KB；报告和错误里不出现令牌。
+- **容错**：某个能力仓拉取失败，它的技能保留上一版（只有拉取成功且确认技能已不存在才删）；同名冲突（和手工技能或别的来源撞名）跳过并记录，不覆盖；更新保留技能 id，应用的勾选不丢。
+- **触发**：调度线程每分钟检查一次，到期（默认 60 分钟、最短 5 分钟）的启用技能源另起线程同步，同步之间互斥；后台「立即同步」同步执行并返回报告。
+- **使用**：`read_skill(name)` 返回正文和附属文件清单 `files`；`read_skill(name, file=…)` 读附属文件（如 `references/clusters.md`）。Git 来源的技能后台只读（编辑/删除返回 400），改动走能力仓 MR。
+
+联调前提：服务所在机器能访问 `gitlab.layfz.com`（开发机外网不通，需在内网或部署后验证），并在 GitLab 给 `claude-skills` group 或相应能力仓建只读 Deploy Token。
 
 ## 8. 代码工作区执行器（P3）
 

@@ -104,6 +104,13 @@ _ensure_col("apps", "mcp", "TEXT DEFAULT '[]'")     # 应用勾选的 MCP server
 _ensure_col("apps", "thinking", "INTEGER DEFAULT 1")  # 是否开启模型「思考(reasoning)」模式，默认开
 _ensure_col("apps", "policy", "TEXT DEFAULT '{}'")    # 工具调用策略（harness.policy），空=默认「兼容」预设
 _ensure_col("apps", "approvers", "TEXT DEFAULT '[]'")  # 审批人 open_id 名单（harness.approval），空=谁都批不了
+# 技能来源（harness.skills）：source_id 为空=后台手工技能；非空=从 Git 同步，后台只读
+_ensure_col("skills", "source_id", "INTEGER")
+_ensure_col("skills", "plugin", "TEXT")          # 所属 plugin（能力仓）名
+_ensure_col("skills", "path", "TEXT")            # SKILL.md 所在目录（相对能力仓根）
+_ensure_col("skills", "revision", "TEXT")        # 同步时的提交号
+_ensure_col("skills", "files", "TEXT DEFAULT '{}'")   # 附属文本文件 {相对路径: 内容}
+_ensure_col("skills", "synced", "REAL")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_msgs_app ON msgs(app_id, chat_id, id)")
 _conn.commit()
 
@@ -141,6 +148,18 @@ _conn.executescript("""
         message_id TEXT,
         created REAL, decided REAL);
     CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+    CREATE TABLE IF NOT EXISTS skill_sources(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        kind TEXT DEFAULT 'marketplace',
+        url TEXT, branch TEXT, subdir TEXT,
+        username TEXT, token TEXT,
+        rewrite TEXT DEFAULT '[]',
+        plugins TEXT DEFAULT '[]',
+        enabled INTEGER DEFAULT 1,
+        interval_min INTEGER DEFAULT 60,
+        last_sync REAL, last_status TEXT, last_error TEXT, last_report TEXT,
+        ts REAL);
 """)
 _conn.commit()
 
@@ -346,13 +365,51 @@ def providers_count():
 
 
 # ---------- 技能（知识/工作方法包，按应用勾选） ----------
+def _skill_row(r, with_files=True):
+    d = dict(r)
+    try:
+        files = json.loads(d.get("files") or "{}")
+    except Exception:
+        files = {}
+    if with_files:
+        d["files"] = files
+    else:
+        d.pop("files", None)
+    d["file_names"] = sorted(files)
+    return d
+
 def list_skills():
-    rows = _conn.execute("SELECT id,name,description,content,ts FROM skills ORDER BY id").fetchall()
-    return [dict(r) for r in rows]
+    """后台列表用：不带附属文件内容（只给文件名），避免列表过大。"""
+    rows = _conn.execute("SELECT * FROM skills ORDER BY id").fetchall()
+    return [_skill_row(r, with_files=False) for r in rows]
 
 def get_skill(sid):
-    r = _conn.execute("SELECT id,name,description,content,ts FROM skills WHERE id=?", (sid,)).fetchone()
-    return dict(r) if r else None
+    r = _conn.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone()
+    return _skill_row(r) if r else None
+
+def get_skill_by_name(name):
+    r = _conn.execute("SELECT * FROM skills WHERE name=?", (name,)).fetchone()
+    return _skill_row(r) if r else None
+
+def skills_by_source(source_id):
+    rows = _conn.execute("SELECT * FROM skills WHERE source_id=? ORDER BY id", (source_id,)).fetchall()
+    return [_skill_row(r, with_files=False) for r in rows]
+
+def upsert_git_skill(source_id, plugin, path, name, description, content, files, revision, skill_id=None):
+    """写入/更新一条 Git 同步来的技能。skill_id 给定=更新，否则插入。返回 id。"""
+    vals = (name, description or "", content or "", json.dumps(files or {}, ensure_ascii=False),
+            revision or "", time.time())
+    with _lock:
+        if skill_id:
+            _conn.execute("UPDATE skills SET name=?,description=?,content=?,files=?,revision=?,synced=? "
+                          "WHERE id=? AND source_id=?", vals + (skill_id, source_id))
+            _conn.commit()
+            return skill_id
+        cur = _conn.execute("INSERT INTO skills(name,description,content,files,revision,synced,source_id,plugin,path,ts) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)", vals + (source_id, plugin, path, time.time()))
+        _conn.commit()
+        return cur.lastrowid
+
 
 def create_skill(name, description, content):
     with _lock:
@@ -389,6 +446,72 @@ def skills_for(ids):
         if sk:
             out.append(sk)
     return out
+
+
+# ---------- 技能源（Git，harness.skills 同步） ----------
+def _source_row(r):
+    d = dict(r)
+    for col, default in (("rewrite", []), ("plugins", []), ("last_report", {})):
+        try:
+            d[col] = json.loads(d.get(col) or json.dumps(default))
+        except Exception:
+            d[col] = default
+    d["enabled"] = bool(d.get("enabled"))
+    return d
+
+def list_skill_sources():
+    return [_source_row(r) for r in _conn.execute("SELECT * FROM skill_sources ORDER BY id").fetchall()]
+
+def get_skill_source(sid):
+    r = _conn.execute("SELECT * FROM skill_sources WHERE id=?", (sid,)).fetchone()
+    return _source_row(r) if r else None
+
+_SOURCE_FIELDS = ("name", "kind", "url", "branch", "subdir", "username", "token", "rewrite", "plugins",
+                  "enabled", "interval_min")
+
+def _source_val(k, v):
+    if k in ("rewrite", "plugins"):
+        return json.dumps(v or [], ensure_ascii=False)
+    if k in ("enabled", "interval_min"):
+        return int(v)
+    return v
+
+def create_skill_source(**f):
+    cols = [k for k in _SOURCE_FIELDS if k in f and f[k] is not None]
+    with _lock:
+        cur = _conn.execute(f"INSERT INTO skill_sources({','.join(cols + ['ts'])}) "
+                            f"VALUES({','.join('?' * (len(cols) + 1))})",
+                            [_source_val(k, f[k]) for k in cols] + [time.time()])
+        _conn.commit()
+        return cur.lastrowid
+
+def update_skill_source(sid, **f):
+    sets, vals = [], []
+    for k in _SOURCE_FIELDS:
+        if k not in f or f[k] is None:
+            continue
+        if k == "token" and not f[k]:            # 仅非空才更新 token，避免掩码覆盖真值
+            continue
+        sets.append(f"{k}=?"); vals.append(_source_val(k, f[k]))
+    if not sets:
+        return
+    vals.append(sid)
+    with _lock:
+        _conn.execute(f"UPDATE skill_sources SET {','.join(sets)} WHERE id=?", vals)
+        _conn.commit()
+
+def set_skill_source_result(sid, status, error="", report=None):
+    with _lock:
+        _conn.execute("UPDATE skill_sources SET last_sync=?, last_status=?, last_error=?, last_report=? WHERE id=?",
+                      (time.time(), status, error or "", json.dumps(report or {}, ensure_ascii=False), sid))
+        _conn.commit()
+
+def delete_skill_source(sid):
+    """删技能源连同它同步来的技能。"""
+    with _lock:
+        _conn.execute("DELETE FROM skills WHERE source_id=?", (sid,))
+        _conn.execute("DELETE FROM skill_sources WHERE id=?", (sid,))
+        _conn.commit()
 
 
 # ---------- 定时任务（按应用） ----------
