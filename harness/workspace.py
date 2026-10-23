@@ -195,20 +195,60 @@ def read_file(ws, rel, start=1, end=None):
             "content": "\n".join(body), "more": end < len(lines)}
 
 
+def _expand_braces(pat):
+    """{a,b} 展开：'**/*.{yaml,yml}' → ['**/*.yaml', '**/*.yml']（支持多组、不支持嵌套）。"""
+    m = re.search(r"\{([^{}]*)\}", pat)
+    if not m:
+        return [pat]
+    out = []
+    for alt in m.group(1).split(","):
+        out += _expand_braces(pat[:m.start()] + alt + pat[m.end():])
+    return out
+
+
+def _glob_regex(pat):
+    """glob → 正则：** 跨任意层目录，* 和 ? 不跨 /。"""
+    i, out = 0, []
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out.append("(?:.*/)?"); i += 3
+        elif pat.startswith("**", i):
+            out.append(".*"); i += 2
+        elif pat[i] == "*":
+            out.append("[^/]*"); i += 1
+        elif pat[i] == "?":
+            out.append("[^/]"); i += 1
+        else:
+            out.append(re.escape(pat[i])); i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def glob_matcher(glob):
+    """返回 rel_path -> bool。不含 / 的模式（如 *.yaml）按文件名在任意深度匹配（同 ripgrep/git 习惯）。"""
+    pats = [p[2:] if p.startswith("./") else p for p in (x.strip() for x in _expand_braces(glob.strip())) if p]
+    rxs = [(_glob_regex(p), "/" not in p) for p in pats]
+    return lambda rel: any(rx.match(rel.rsplit("/", 1)[-1] if base_only else rel) for rx, base_only in rxs)
+
+
 def search(ws, pattern, glob=None, max_hits=MAX_SEARCH_HITS):
     try:
         rx = re.compile(pattern)
     except re.error as e:
         raise WorkspaceError(f"正则写法有误：{e}")
+    match = glob_matcher(glob) if glob else None
     root = _repo_dir(ws).resolve()
-    hits = []
+    hits, scanned, in_glob = [], 0, 0
     for d, dirs, files in os.walk(root):
         dirs[:] = sorted(x for x in dirs if x not in _SKIP)
         for f in sorted(files):
             p = Path(d) / f
             rel = p.relative_to(root).as_posix()
-            if p.is_symlink() or (glob and not Path(rel).match(glob)):
+            if p.is_symlink():
                 continue
+            scanned += 1
+            if match and not match(rel):
+                continue
+            in_glob += 1
             try:
                 if p.stat().st_size > MAX_READ_BYTES * 5:
                     continue
@@ -221,8 +261,15 @@ def search(ws, pattern, glob=None, max_hits=MAX_SEARCH_HITS):
                 if rx.search(ln):
                     hits.append(f"{rel}:{i}: {ln.strip()[:300]}")
                     if len(hits) >= max_hits:
-                        return {"hits": hits, "truncated": True}
-    return {"hits": hits, "truncated": False}
+                        return {"hits": hits, "truncated": True, "files_scanned": scanned,
+                                "note": f"已达 {max_hits} 条上限，请用更具体的 pattern 或 glob 缩小范围"}
+    out = {"hits": hits, "truncated": False, "files_scanned": scanned, "files_matched_glob": in_glob}
+    if match and in_glob == 0:
+        out["note"] = (f"glob「{glob}」一个文件都没匹配上（共扫描 {scanned} 个文件）——是过滤条件的问题，不代表仓库里没有。"
+                       "可去掉 glob 重试，或用 *.yaml、apps/**/*.yaml 这类写法。")
+    elif not hits:
+        out["note"] = f"在 {in_glob} 个文件里没有匹配；可以换个写法（如去掉锚点、放宽正则）再搜。"
+    return out
 
 
 # ---------- 写（只动工作区，记入 changed） ----------

@@ -25,6 +25,7 @@ COPY llm ./llm
 COPY obs ./obs
 COPY ops ./ops
 COPY sched ./sched
+COPY sec ./sec
 COPY web ./web
 
 EXPOSE 8800

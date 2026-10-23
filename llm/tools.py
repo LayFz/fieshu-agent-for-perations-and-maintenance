@@ -12,6 +12,7 @@ from obs import openobserve, beszel, uptimekuma
 from ops import ssh as ops_ssh
 from ops import k8s as ops_k8s
 from harness import workspace
+from sec import feeds
 
 
 def _fmt_ts(ts):
@@ -306,6 +307,38 @@ TOOLS += [
     }},
 ]
 
+# ---------- CVE 情报源（sec.feeds，只读，结果是外部文本 → external） ----------
+TOOLS += [
+    {"type": "function", "function": {
+        "name": "cve_kev",
+        "description": "查 CISA KEV（已确认在野利用的漏洞目录）最近新增的条目，按收录日期倒序。"
+                       "keyword 可按厂商/产品过滤（如 gitlab、kubernetes、postgres、nginx）。命中 KEV = 最高优先级。",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "最近多少天，默认 30"},
+            "keyword": {"type": "string", "description": "可选，厂商/产品关键字"},
+            "limit": {"type": "integer", "description": "最多返回条数，默认 50"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "cve_osv",
+        "description": "查某个软件包的某个版本受哪些已知漏洞影响（OSV 库，含 GitHub Advisory/Go/PyPI/npm 等），"
+                       "返回漏洞 id、CVE、严重度、修复版本、是否在 KEV。组件版本要按包生态填，例如 "
+                       "ArgoCD → ecosystem=Go, package=github.com/argoproj/argo-cd/v3；Python 包 → PyPI；Node 包 → npm。",
+        "parameters": {"type": "object", "properties": {
+            "ecosystem": {"type": "string", "description": "Go / PyPI / npm / Maven / crates.io / Debian:12 / Alpine:v3.20 …"},
+            "package": {"type": "string"},
+            "version": {"type": "string", "description": "具体版本号，不带 v 前缀（Go 模块除外按模块习惯）"},
+        }, "required": ["ecosystem", "package", "version"]},
+    }},
+    {"type": "function", "function": {
+        "name": "cve_detail",
+        "description": "查单个漏洞详情（CVE / GHSA / GO 编号）：描述、影响范围与修复版本、参考链接、EPSS 被利用概率、是否在 KEV。",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "string", "description": "如 CVE-2026-12345、GHSA-xxxx-xxxx-xxxx"},
+        }, "required": ["id"]},
+    }},
+]
+
 _BY_NAME = {t["function"]["name"]: t for t in TOOLS}
 
 # 工具元数据：只给宿主（harness 管道）看，绝不发给模型。
@@ -346,6 +379,9 @@ _META = {
     "code_test": {"risk": "exec", "timeout": 630},     # 跑仓库代码（可能被改过）= 执行任意代码
     "code_propose_mr": {"risk": "write", "timeout": 90},
     "code_close": {"risk": "local"},
+    "cve_kev": {"risk": "read", "external": True, "timeout": 60},
+    "cve_osv": {"risk": "read", "external": True, "timeout": 60},
+    "cve_detail": {"risk": "read", "external": True, "timeout": 60},
 }
 def _preview_mr(args, ctx):
     """审批卡片上给人看的改动摘要：要批的是这些改动，不是模型写的标题。"""
@@ -484,6 +520,12 @@ def execute(name, args, ctx=None):
             return out
         if name.startswith("code_"):
             return _code_tool(name, args, ctx)
+        if name == "cve_kev":
+            return feeds.kev_recent(args.get("days") or 30, args.get("keyword"), args.get("limit") or 50)
+        if name == "cve_osv":
+            return feeds.osv_query(args.get("ecosystem"), args.get("package"), args.get("version"))
+        if name == "cve_detail":
+            return feeds.detail(args.get("id"))
         if name == "list_knowledge_bases":
             return feishu_docs.list_kbs()
         if name == "list_nodes":
