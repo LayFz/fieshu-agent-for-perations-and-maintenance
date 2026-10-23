@@ -172,6 +172,11 @@ def _note_call(rec, content, tool_calls, usage, **extra):
                                    "usage": _usage_dict(usage), **extra})
 
 
+def _untrusted_input(task):
+    """任务指令本身含外部内容（巡检扫描结果、webhook 请求体）时，从第一步就按污染处理。"""
+    return task.get("source") == "patrol" or task.get("trigger") == "webhook"
+
+
 def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
         speaker_open_id: str = "", proactive: bool = False, on_step=None, on_delta=None,
         trigger: str = None):
@@ -243,11 +248,11 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
         msgs = [{"role": "system", "content": system}] + store.load_history(aid, chat_id, turns, context_key=context_key)
         msgs.append({"role": "user", "content": turn})
         state = {"version": 1, "context_key": context_key, "messages": msgs, "step": 0, "tokens": 0,
-                 "tainted": task.get("source") == "patrol",
+                 "tainted": _untrusted_input(task),
                  "pending": [], "next_tool": 0, "evidence": [], "started": time.time()}
         tasks.checkpoint(state)
     msgs = state["messages"]
-    if task.get("source") == "patrol":
+    if _untrusted_input(task):
         state["tainted"] = True
     rec.tainted = bool(state.get("tainted"))
     store.save(aid, chat_id, "user", turn, task_id=task.get("id"), context_key=context_key)
@@ -328,7 +333,7 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                 call.extra["action_key"] = f"{state['step']}:{t['id']}"
                 call.extra["prepare"] = lambda a, _n=name: authorization.prepare(_n, a, ctx)
                 call.extra["validate"] = lambda a, _n=name: authorization.validate(_n, a, ctx)
-                call.extra["sandboxed"] = name == "code_test"
+                call.extra["sandboxed"] = name in ("code_test", "sandbox_run")
                 call.extra["preview"] = (lambda a, _n=name: approval_preview(_n, a, ctx))
                 content_str = pipeline.run_tool(rec, call, app.get("policy"), executor, app=app)
                 msgs.append({"role": "tool", "tool_call_id": t["id"], "content": content_str})

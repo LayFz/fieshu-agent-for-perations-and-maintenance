@@ -3,7 +3,7 @@ import shlex
 
 KINDS = {"repos", "ssh_hosts", "k8s_clusters", "namespaces", "log_orgs", "log_streams",
          "gitlab_projects", "argocd_apps", "docs", "doc_spaces", "mcp_servers",
-         "users", "chats"}
+         "web_domains", "sandbox", "users", "chats"}
 
 
 def validate(resources):

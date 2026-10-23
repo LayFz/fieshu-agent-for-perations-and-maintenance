@@ -41,6 +41,8 @@ harness/pipeline.py（准备/冻结 → 策略/guard → 持久审批 → 执行
 | `harness/skills.py` / `gitutil.py` | Git 技能同步 / dulwich 克隆 |
 | `llm/engine.py` / `authorization.py` | 模型工具循环、上下文恢复 / 新鲜授权、目标固定、上下文指纹 |
 | `llm/tools.py` / `mcp.py` | 原生工具及元数据 / 同步远程 HTTP MCP |
+| `ops/web.py` / `ops/research.py` | 联网搜索与 SSRF 防护抓取（可选内网出境代理）/ 离线 Docker 研究沙箱 |
+| `harness/webhooks.py` | 外部系统 `POST /hooks/{id}` 触发任务：令牌哈希、去重、限流、模板渲染、污染 |
 | `feishu/` / `obs/` / `ops/` | 飞书入口、文档 / 只读监控 / SSH 与 K8s 连接 |
 | `sched/runner.py` | 到期计划原子入队并推进 next_run，避免同次定时重复入队 |
 | `web/` / `app/main.py` | 管理后台与 API / 启动迁移、worker、飞书连接、调度与 HTTP |
@@ -72,6 +74,9 @@ harness/pipeline.py（准备/冻结 → 策略/guard → 持久审批 → 执行
 - `kubectl` 只开放有限只读语法；禁止读取 Secret、覆盖服务器/身份、原始 API 路径、本地模板等。缺省 namespace 固定成 `default`，未知/集群级资源要求全局 namespace 权限。底层 Kubernetes RBAC 仍必须收紧。
 - `ssh_exec` 只允许显式登记且授权的主机名称；审批固定 host/port/username 指纹，硬黑名单保留。不要把模型判断当权限边界。
 - MCP 仅支持远程 HTTP（Streamable HTTP，兼容 SSE），不支持 stdio；应用勾选 server 之外还须授权 `mcp_servers` 资源。
+- `web_search` 要求 `web_domains:["*"]`；`web_fetch` 与沙箱下载每一跳都校验 `web_domains`。抓取不读 `HTTP(S)_PROXY`，只认后台 `web_proxy`；走代理时无法固定 IP，代理必须自己拒绝内网网段。fake-IP（198.18/15）放行仅限开发机显式开启。
+- `sandbox_run` 是 local + external：离线容器跑分析脚本，联网资源由控制面先下载；需要 `sandbox:["research"]` 与 `HARNESS_SANDBOX_IMAGE`（镜像须含 python3 等分析工具）。
+- Webhook 任务 trigger=webhook，从第一步即污染；令牌只显示一次，库里存 SHA-256。
 
 ## 代码工作区与沙箱
 

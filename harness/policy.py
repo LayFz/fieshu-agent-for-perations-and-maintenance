@@ -170,8 +170,8 @@ def _guard_untrusted(call):
         return None
     if call.risk == "local" and call.tool.startswith("code_"):
         return None
-    if call.tool == "code_test" and call.extra.get("sandboxed"):
-        return None
+    if call.tool in ("code_test", "sandbox_run") and call.extra.get("sandboxed"):
+        return None       # 无网络、无凭据的一次性容器
     if call.tool == "code_propose_mr":
         return None       # pipeline 强制审批，快照由执行器复核
     return "本任务已读取外部内容，禁止直接写入外部系统或执行生产命令；请提交独立授权的变更任务。"

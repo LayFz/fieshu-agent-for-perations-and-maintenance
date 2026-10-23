@@ -5,7 +5,7 @@ import re
 
 from core import store
 from harness import access, workspace, tasks
-from ops import k8s, ssh
+from ops import k8s, ssh, web
 from obs import openobserve
 
 
@@ -87,6 +87,25 @@ def prepare(name, args, ctx):
         access.require(app, "doc_spaces", args.get("space_id"))
     elif name == "list_knowledge_bases":
         access.require(app, "doc_spaces", "*")
+    elif name == "web_search":
+        # 搜索结果可能来自任意网站，等同于读取任意公网内容：要求显式授予全部域名
+        access.require(app, "web_domains", "*")
+    elif name == "web_fetch":
+        host = web.host_of(args.get("url") or "")
+        if not host:
+            raise PermissionError("web_fetch 需要合法的 http(s) 网址")
+        allowed = (app.get("resources") or {}).get("web_domains") or []
+        if not (isinstance(allowed, list) and web.domain_allowed(allowed, host)):
+            raise PermissionError(f"应用未获授权访问网站 {host}，请在应用资源权限 web_domains 中配置")
+    elif name == "sandbox_run":
+        access.require(app, "sandbox", "research")
+        allowed = (app.get("resources") or {}).get("web_domains") or []
+        for item in args.get("urls") or []:
+            host = web.host_of(item.get("url") or "") if isinstance(item, dict) else ""
+            if not host:
+                raise PermissionError("sandbox_run 的 urls 需要合法的 http(s) 网址")
+            if not (isinstance(allowed, list) and web.domain_allowed(allowed, host)):
+                raise PermissionError(f"应用未获授权访问网站 {host}，请在应用资源权限 web_domains 中配置")
     elif name.startswith("mcp__"):
         sid = name.split("__", 2)[1]
         access.require(app, "mcp_servers", sid)

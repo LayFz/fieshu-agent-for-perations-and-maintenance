@@ -12,15 +12,16 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from core import store
 from feishu import auth, bot
 from harness import policy, tasks, access, workflows
 from harness import skills as skills_sync
-from harness import workspace
+from harness import workspace, webhooks
 from ops import argocd as ops_argocd
 from ops import gitlab as ops_gitlab
+from ops import web as ops_web
 from sec import collector
 from llm import mcp as mcp_mod
 from llm.tools import all_tools, tool_list_for
@@ -212,6 +213,93 @@ def task_list(request: Request):
     return {"tasks": [_task_view(t) for t in tasks.list_tasks(app_id=q.get("app_id") or None,
             status=q.get("status") or None, limit=100)],
             "workflows": {k: v[0] for k, v in workflows.PROFILES.items()}, "runtime": tasks.health()}
+
+
+# ---------- Webhook 触发（harness.webhooks）：外部系统投递事件 → 生成任务 ----------
+@app.post("/hooks/{hook_id}")
+async def webhook_receive(hook_id: str, request: Request):
+    """公开入口：只认 webhook 令牌，不需要后台登录。"""
+    body = await request.body()
+    status, payload = webhooks.receive(hook_id, dict(request.headers), body)
+    return JSONResponse(payload, status_code=status)
+
+def _hook_view(h, request=None):
+    v = {k: h.get(k) for k in ("id", "name", "app_id", "chat_id", "workflow", "template", "enabled", "max_per_hour",
+                               "calls", "last_called", "last_status", "last_error", "created")}
+    v["path"] = f"/hooks/{h['id']}"
+    return v
+
+def _hook_fields(b, creating):
+    f = {}
+    if creating or "name" in b:
+        f["name"] = (b.get("name") or "").strip()
+        if not f["name"]:
+            raise HTTPException(status_code=400, detail="请填名称")
+    if creating or "app_id" in b:
+        try:
+            f["app_id"] = int(b.get("app_id"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="请选择应用")
+        if not store.get_app(f["app_id"]):
+            raise HTTPException(status_code=400, detail="应用不存在")
+    if creating or "chat_id" in b:
+        f["chat_id"] = (b.get("chat_id") or "").strip()
+        if not f["chat_id"]:
+            raise HTTPException(status_code=400, detail="请填投递会话 chat_id（结果和通知发到这里）")
+    if creating or "template" in b:
+        f["template"] = (b.get("template") or "").strip()
+        if not f["template"] or len(f["template"]) > 20000:
+            raise HTTPException(status_code=400, detail="指令模板不能为空，且不超过 20000 字")
+    if "workflow" in b:
+        f["workflow"] = b.get("workflow") or "auto"
+        if f["workflow"] != "auto" and f["workflow"] not in workflows.PROFILES:
+            raise HTTPException(status_code=400, detail="未知工作流")
+    if "enabled" in b:
+        f["enabled"] = 1 if b["enabled"] else 0
+    if "max_per_hour" in b:
+        try:
+            f["max_per_hour"] = max(1, min(int(b.get("max_per_hour") or 60), 3600))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="每小时上限需为整数")
+    return f
+
+@app.get("/api/webhooks")
+def list_webhooks(request: Request):
+    _auth(request)
+    return {"webhooks": [_hook_view(h) for h in store.list_webhooks()],
+            "chats": store.recent_chats(), "workflows": ["auto"] + list(workflows.PROFILES)}
+
+@app.post("/api/webhooks")
+async def create_webhook(request: Request):
+    _auth(request)
+    f = _hook_fields(await _body(request), True)
+    token, hook_id = webhooks.new_token(), webhooks.new_id()
+    store.create_webhook(hook_id, token_hash=webhooks.hash_token(token), **f)
+    return {"ok": True, "id": hook_id, "path": f"/hooks/{hook_id}", "token": token,
+            "note": "令牌只显示这一次，请立即保存；丢失可轮换"}
+
+@app.put("/api/webhooks/{hook_id}")
+async def edit_webhook(hook_id: str, request: Request):
+    _auth(request)
+    if not store.get_webhook(hook_id):
+        raise HTTPException(status_code=404, detail="webhook 不存在")
+    store.update_webhook(hook_id, **_hook_fields(await _body(request), False))
+    return {"ok": True}
+
+@app.post("/api/webhooks/{hook_id}/rotate")
+def rotate_webhook(hook_id: str, request: Request):
+    _auth(request)
+    if not store.get_webhook(hook_id):
+        raise HTTPException(status_code=404, detail="webhook 不存在")
+    token = webhooks.new_token()
+    store.update_webhook(hook_id, token_hash=webhooks.hash_token(token))
+    return {"ok": True, "token": token, "note": "旧令牌已立即失效；新令牌只显示这一次"}
+
+@app.delete("/api/webhooks/{hook_id}")
+def remove_webhook(hook_id: str, request: Request):
+    _auth(request)
+    store.delete_webhook(hook_id)
+    return {"ok": True}
 
 
 @app.post("/api/tasks")
@@ -491,7 +579,26 @@ def connections(request: Request):
     _auth(request)
     a, g = ops_argocd.config(), ops_gitlab.config()
     return {"argocd": {"url": a["url"], "insecure": a["insecure"], "token_set": bool(a["token"]), "token_masked": _mask(a["token"])},
-            "gitlab": {"url": g["url"], "token_set": bool(g["token"]), "token_masked": _mask(g["token"])}}
+            "gitlab": {"url": g["url"], "token_set": bool(g["token"]), "token_masked": _mask(g["token"])},
+            "web": {"provider": ops_web.config()["provider"], "searxng_url": ops_web.config()["searxng_url"],
+                    "brave_key_set": bool(ops_web.config()["brave_key"]), "tavily_key_set": bool(ops_web.config()["tavily_key"]),
+                    "proxy": _mask_proxy(store.get_setting("web_proxy") or ""),
+                    "proxy_search": store.get_setting("web_proxy_search") == "1",
+                    "proxy_fetch": store.get_setting("web_proxy_fetch") == "1",
+                    "allow_fake_ip": store.get_setting("web_allow_fake_ip") == "1"}}
+
+
+def _mask_proxy(url):
+    """代理地址可能带账号密码：回显时隐藏口令。"""
+    from urllib.parse import urlsplit
+    try:
+        p = urlsplit(url)
+    except ValueError:
+        return ""
+    if p.password:
+        return url.replace(f":{p.password}@", ":***@", 1)
+    return url
+
 
 @app.put("/api/connections")
 async def save_connections(request: Request):
@@ -512,6 +619,31 @@ async def save_connections(request: Request):
             store.set_setting(f"{kind}_token", "")
         if kind == "argocd" and "insecure" in c:
             store.set_setting("argocd_insecure", "1" if c["insecure"] else "0")
+    w = b.get("web")
+    if isinstance(w, dict):
+        if "provider" in w:
+            if w["provider"] not in ("searxng", "brave", "tavily"):
+                raise HTTPException(status_code=400, detail="搜索后端只能是 searxng / brave / tavily")
+            store.set_setting("web_search_provider", w["provider"])
+        if "searxng_url" in w:
+            u = (w.get("searxng_url") or "").strip().rstrip("/")
+            if u and not u.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail="searxng_url 需为 http(s):// 开头")
+            store.set_setting("web_searxng_url", u)
+        # 代理：回显的是打码地址，原样提交回来表示不改
+        if "proxy" in w and w.get("proxy") != _mask_proxy(store.get_setting("web_proxy") or ""):
+            u = (w.get("proxy") or "").strip().rstrip("/")
+            if u and not u.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail="代理地址需为 http(s):// 开头（HTTP CONNECT 代理）")
+            store.set_setting("web_proxy", u)
+        for key in ("proxy_search", "proxy_fetch"):
+            if key in w:
+                store.set_setting(f"web_{key}", "1" if w[key] else "0")
+        for key, setting in (("brave_key", "web_brave_key"), ("tavily_key", "web_tavily_key")):
+            if w.get(key):
+                store.set_setting(setting, w[key].strip())
+        if "allow_fake_ip" in w:
+            store.set_setting("web_allow_fake_ip", "1" if w["allow_fake_ip"] else "0")
     return {"ok": True}
 
 
@@ -553,7 +685,11 @@ async def test_connection(request: Request):
         return ops_argocd.test()
     if kind == "gitlab":
         return ops_gitlab.test()
-    raise HTTPException(status_code=400, detail="kind 只能是 argocd / gitlab")
+    if kind == "web":
+        r = ops_web.search("Kubernetes security advisory", limit=3)
+        return {"ok": not r.get("error"), "provider": r.get("provider"), "error": r.get("error"),
+                "count": r.get("count"), "sample": [x.get("title") for x in r.get("results", [])][:3]}
+    raise HTTPException(status_code=400, detail="kind 只能是 argocd / gitlab / web")
 
 
 # ---------- 情报源与漏洞台账（sec） ----------

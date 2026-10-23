@@ -182,6 +182,15 @@ expires_at + approval_digest
 
 `tainted` 可以是保守 guard，不能被描述为完整防注入方案。schema、摘要、另一个模型或自动审查也不能赋予内容权威性。代码任务需要读取不可信仓库并运行测试，因此应允许明确授权的隔离沙箱执行，同时继续禁止直接获得生产命令权限。
 
+### 6.5 联网研究、研究沙箱与 webhook 触发（已实现，本地验证）
+
+参照 dsh 的分层：**联网在沙箱外，计算在沙箱内**。
+
+- `web_search` / `web_fetch`（`ops/web.py`）：搜索后端 SearXNG / Brave / Tavily 由管理员配置；抓取只允许公网地址，直连时把连接固定到已校验 IP（保留 SNI 与证书校验），逐跳重定向重新校验地址与应用 `web_domains`，不读环境代理变量。
+- 内网出境代理（`web_proxy` + 搜索/抓取分别勾选）：用于国内机房拿境外资源。抓取走代理时 DNS 在代理远端，无法固定 IP；本地仍拦内网主机名、字面量内网 IP、本地解析到内网的域名，其余**必须由代理自身拒绝内网网段**。SearXNG 是内网地址，始终直连。
+- `sandbox_run`（`ops/research.py`）：复用 Docker 执行器，`--network=none`、只读根、非 root、无凭据；需要的网页/文件由控制面按同一套 SSRF 规则先下载（≤5 个、各 ≤20MB）。risk=local + external，taint 后仍允许（与 `code_test` 同一 sandboxed 例外）；资源需 `sandbox:["research"]`，下载域名受 `web_domains` 约束。没有 `HARNESS_SANDBOX_IMAGE` 时拒绝。
+- Webhook（`harness/webhooks.py`，`POST /hooks/{id}`）：每个 webhook 独立令牌（库内仅存 SHA-256）、请求体 ≤256KB、每小时上限、按投递方事件 ID 或请求体哈希去重；指令由管理员模板渲染，`{{payload}}` 标注为外部数据；任务 trigger=webhook，从第一步即视为污染。
+
 子 agent 权限取目标角色配置与父任务委派范围的交集；父任务不能借委派扩大权限。高权限跨域执行必须经过单独授权的 action 流程。
 
 ## 7. 综合助手需要的上下文与工作记忆

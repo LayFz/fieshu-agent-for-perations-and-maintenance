@@ -233,6 +233,8 @@ def main():
         path = request.url.path
         allowed_mutation = (path in ("/api/login", "/api/logout") or path == "/api/tasks"
                             or path.startswith("/api/local-demo/")
+                            # webhook 只会在演示库里建模拟任务，允许在演示中走通配置与投递
+                            or path.startswith(("/api/webhooks", "/hooks/"))
                             or (path.startswith("/api/tasks/") and path.endswith(("/cancel", "/resume"))))
         if request.method not in ("GET", "HEAD", "OPTIONS") and not allowed_mutation:
             return JSONResponse({"detail": "本地演示不允许修改集成配置、重启服务或启动外部操作"}, status_code=403)

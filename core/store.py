@@ -1215,6 +1215,80 @@ def vulns_needing_epss(limit=100, max_age=86400):
     return [r["cve"] for r in rows]
 
 
+# ---------- Webhook 触发（harness.webhooks） ----------
+_conn.executescript("""
+    CREATE TABLE IF NOT EXISTS webhooks(
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        app_id INTEGER NOT NULL, chat_id TEXT NOT NULL,
+        workflow TEXT NOT NULL DEFAULT 'auto',
+        template TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        max_per_hour INTEGER NOT NULL DEFAULT 60,
+        calls INTEGER NOT NULL DEFAULT 0,
+        last_called REAL, last_status TEXT, last_error TEXT,
+        created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS webhook_calls(
+        hook_id TEXT NOT NULL, ts REAL NOT NULL, status TEXT NOT NULL, task_id TEXT);
+    CREATE INDEX IF NOT EXISTS idx_webhook_calls ON webhook_calls(hook_id, ts);
+""")
+_conn.commit()
+
+_HOOK_FIELDS = ("name", "app_id", "chat_id", "workflow", "template", "token_hash", "enabled", "max_per_hour")
+
+def _hook_row(r):
+    return dict(r, enabled=bool(r["enabled"])) if r else None
+
+def list_webhooks():
+    return [_hook_row(r) for r in _conn.execute("SELECT * FROM webhooks ORDER BY created")]
+
+def get_webhook(hook_id):
+    return _hook_row(_conn.execute("SELECT * FROM webhooks WHERE id=?", (hook_id,)).fetchone())
+
+def create_webhook(hook_id, **f):
+    cols = [k for k in _HOOK_FIELDS if k in f and f[k] is not None]
+    with _lock:
+        _conn.execute(f"INSERT INTO webhooks(id,{','.join(cols)},created) VALUES(?,{','.join('?' * len(cols))},?)",
+                      [hook_id] + [int(f[k]) if k in ("enabled", "max_per_hour", "app_id") else f[k] for k in cols]
+                      + [time.time()])
+        _conn.commit()
+
+def update_webhook(hook_id, **f):
+    sets = [(k, int(f[k]) if k in ("enabled", "max_per_hour", "app_id") else f[k])
+            for k in _HOOK_FIELDS if k in f and f[k] is not None]
+    if sets:
+        with _lock:
+            _conn.execute(f"UPDATE webhooks SET {','.join(k + '=?' for k, _ in sets)} WHERE id=?",
+                          [v for _, v in sets] + [hook_id])
+            _conn.commit()
+
+def delete_webhook(hook_id):
+    with _lock:
+        _conn.execute("DELETE FROM webhook_calls WHERE hook_id=?", (hook_id,))
+        _conn.execute("DELETE FROM webhooks WHERE id=?", (hook_id,))
+        _conn.commit()
+
+def webhook_calls_since(hook_id, since):
+    return _conn.execute("SELECT COUNT(*) n FROM webhook_calls WHERE hook_id=? AND ts>=? AND status='accepted'",
+                         (hook_id, since)).fetchone()["n"]
+
+def record_webhook_call(hook_id, status, error="", task_id=None):
+    now = time.time()
+    with _lock:
+        _conn.execute("INSERT INTO webhook_calls(hook_id,ts,status,task_id) VALUES(?,?,?,?)", (hook_id, now, status, task_id))
+        _conn.execute("UPDATE webhooks SET calls=calls+1, last_called=?, last_status=?, last_error=? WHERE id=?",
+                      (now, status, error or "", hook_id))
+        _conn.execute("DELETE FROM webhook_calls WHERE ts<?", (now - 7 * 86400,))
+        _conn.commit()
+
+def recent_chats(limit=50):
+    """后台选择投递目标用：最近有消息往来的会话（含应用）。"""
+    rows = _conn.execute("SELECT app_id, chat_id, MAX(ts) last FROM msgs GROUP BY app_id, chat_id "
+                         "ORDER BY last DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------- 计数（概览用） ----------
 def counts(app_id=None):
     w, p = _app_filter(app_id)

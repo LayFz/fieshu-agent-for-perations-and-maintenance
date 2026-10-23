@@ -179,6 +179,7 @@
       <a data-page="skills" data-ic="book"><span class="t">技能</span></a>
       <a data-page="mcp" data-ic="plug"><span class="t">MCP 工具</span></a>
       <a data-page="schedules" data-ic="clock"><span class="t">定时任务</span></a>
+      <a data-page="hooks" data-ic="plug"><span class="t">Webhook 触发</span></a>
       <div class="nlabel">安全</div>
       <a data-page="vulns" data-ic="shield"><span class="t">漏洞台账</span><span class="badge" id="nav-vuln-badge" style="display:none"></span></a>
       <a data-page="intel" data-ic="radar"><span class="t">情报源</span></a>
@@ -244,7 +245,7 @@ $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
 const PAGES = { patrols: patrolsPage, tasks: tasksPage, overview, apps, providers, skills, mcp, code: codePage, schedules, memory, runs: runsPage, usage, obs, ssh, k8s, account,
-  vulns: vulnsPage, intel: intelPage, connections: connectionsPage };
+  vulns: vulnsPage, intel: intelPage, connections: connectionsPage, hooks: hooksPage };
 function go(page){
   if(!PAGES[page]) page='overview';
   let group='';
@@ -543,7 +544,7 @@ async function delIntel(id,name){ if(!confirm('删除情报源「'+name+'」？�
 /* ---------- 连接凭证 ---------- */
 async function connectionsPage(){
   const c=$('#content'); c.innerHTML='<h2>连接凭证</h2><p class="desc">加载中…</p>';
-  const {argocd:a,gitlab:g}=await api('GET','/api/connections');
+  const {argocd:a,gitlab:g,web:w}=await api('GET','/api/connections');
   c.innerHTML=`<div class="head"><div><h2>连接凭证</h2><p class="desc">给数字员工「看」的只读连接：勾上 argocd_* / gitlab_* 工具的应用可以查 ArgoCD 应用与实际运行镜像、读 GitLab 仓库。令牌只存在服务端，模型拿不到。</p></div></div>
     <div class="card"><div class="card-title">ArgoCD <span class="muted">看应用同步/健康状态与集群里实际运行的镜像版本</span></div>
       <div class="row"><div><label>地址</label><input id="cn-a-url" value="${esc(a.url)}" placeholder="https://argocd.internal.example"></div>
@@ -555,7 +556,29 @@ async function connectionsPage(){
       <div class="row"><div><label>地址</label><input id="cn-g-url" value="${esc(g.url)}" placeholder="https://gitlab.upmore.net"></div>
         <div><label>访问令牌（scope 只勾 read_api）${g.token_set?' <span class="muted">（已设置 '+esc(g.token_masked)+'，留空＝不改）</span>':''}</label><input id="cn-g-token" type="password" placeholder="glpat-…"></div></div>
       <div class="hint">要改代码并提 MR，请到「代码仓库」页单独登记仓库与写令牌；技能同步在「技能」页配置技能源。</div>
-      <div class="save-bar"><button class="btn" onclick="saveConn('gitlab')">保存</button><button class="btn ghost" onclick="testConn('gitlab')">测试连接</button><span id="cn-g-res" class="muted"></span></div></div>`;
+      <div class="save-bar"><button class="btn" onclick="saveConn('gitlab')">保存</button><button class="btn ghost" onclick="testConn('gitlab')">测试连接</button><span id="cn-g-res" class="muted"></span></div></div>
+    <div class="card"><div class="card-title">联网搜索与读网页 <span class="muted">web_search / web_fetch；应用还需在资源权限里授予 web_domains</span></div>
+      <div class="row"><div style="flex:0 0 200px"><label>搜索后端</label><select id="cn-w-prov">
+          ${[['searxng','SearXNG（自建）'],['brave','Brave Search API'],['tavily','Tavily']].map(([k,t])=>`<option value="${k}" ${w.provider===k?'selected':''}>${t}</option>`).join('')}</select></div>
+        <div><label>SearXNG 地址（须开启 formats: json）</label><input id="cn-w-sx" value="${esc(w.searxng_url)}" placeholder="http://searxng.192.168.110.75.sslip.io"></div></div>
+      <div class="row"><div><label>Brave API Key ${w.brave_key_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label><input id="cn-w-brave" type="password"></div>
+        <div><label>Tavily API Key ${w.tavily_key_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label><input id="cn-w-tav" type="password"></div></div>
+      <label>内网出境代理（可选，HTTP CONNECT 代理；用于拿到更完整的境外资源）</label>
+      <input id="cn-w-proxy" value="${esc(w.proxy)}" placeholder="http://user:pass@proxy.internal:3128">
+      <div style="display:flex;gap:18px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-w-psearch" ${w.proxy_search?'checked':''}>搜索 API 走代理（Brave / Tavily；SearXNG 是内网地址，始终直连）</label>
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-w-pfetch" ${w.proxy_fetch?'checked':''}>读网页 / 沙箱下载走代理</label></div>
+      <div class="hint">读网页走代理时由代理远端解析域名，无法把连接固定到已校验的 IP：本地仍拦内网主机名、内网 IP 与本地解析到内网的域名，其余须由代理自己拒绝内网网段（如 squid ACL 禁止 RFC1918、169.254.0.0/16）。</div>
+      <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-w-fake" ${w.allow_fake_ip?'checked':''}>允许代理 fake-IP（198.18.0.0/15）——仅开发机开 TUN 代理时使用，生产勿开</label>
+      <div class="hint">读网页只允许公网地址：内网/回环/元数据地址、内网域名、带账号密码的网址都会被拒，每一跳重定向都重新校验。网页内容视为外部文本，读过的任务不能再直接写生产或执行命令。</div>
+      <div class="save-bar"><button class="btn" onclick="saveWeb()">保存</button><button class="btn ghost" onclick="testConn('web')">测试搜索</button><span id="cn-w-res" class="muted"></span></div></div>`;
+}
+async function saveWeb(){
+  const body={provider:$('#cn-w-prov').value, searxng_url:$('#cn-w-sx').value.trim(), proxy:$('#cn-w-proxy').value.trim(),
+    proxy_search:$('#cn-w-psearch').checked, proxy_fetch:$('#cn-w-pfetch').checked, allow_fake_ip:$('#cn-w-fake').checked};
+  const b=$('#cn-w-brave').value.trim(); if(b) body.brave_key=b;
+  const t=$('#cn-w-tav').value.trim(); if(t) body.tavily_key=t;
+  try{ await api('PUT','/api/connections',{web:body}); toast('已保存'); connectionsPage(); }catch(e){ toast(e.message); }
 }
 async function saveConn(kind){
   const k=kind==='argocd'?'a':'g'; const body={url:$('#cn-'+k+'-url').value.trim()};
@@ -564,12 +587,79 @@ async function saveConn(kind){
   try{ await api('PUT','/api/connections',{[kind]:body}); toast('已保存'); connectionsPage(); }catch(e){ toast(e.message); }
 }
 async function testConn(kind){
-  const el=$('#cn-'+(kind==='argocd'?'a':'g')+'-res'); el.textContent='测试中…'; el.style.color='';
+  const el=$('#cn-'+({argocd:'a',gitlab:'g',web:'w'}[kind])+'-res'); el.textContent='测试中…'; el.style.color='';
   try{ const r=await api('POST','/api/connections/test',{kind});
     el.style.color=r.ok?'var(--ok)':'var(--err)';
-    el.textContent=r.ok?(kind==='argocd'?`✓ 连通，ArgoCD ${r.version||''}，${r.apps} 个应用`:`✓ 连通，用户 ${r.user}`):('✗ '+(r.error||'失败')); }
+    el.textContent=r.ok?({argocd:`✓ 连通，ArgoCD ${r.version||''}，${r.apps} 个应用`, gitlab:`✓ 连通，用户 ${r.user}`,
+      web:`✓ ${r.provider} 返回 ${r.count} 条：${(r.sample||[]).join(' / ').slice(0,80)}`}[kind]):('✗ '+(r.error||'失败')); }
   catch(e){ el.style.color='var(--err)'; el.textContent='✗ '+e.message; }
 }
+
+/* ---------- Webhook 触发 ---------- */
+let _hookCache=[], _hookMeta={chats:[],workflows:[]};
+async function hooksPage(){
+  const c=$('#content'); c.innerHTML='<h2>Webhook 触发</h2><p class="desc">加载中…</p>';
+  const [{webhooks,chats,workflows},{apps}]=await Promise.all([api('GET','/api/webhooks'),api('GET','/api/apps')]);
+  _hookCache=webhooks; _hookMeta={chats,workflows,apps};
+  const appName=id=>(apps.find(a=>a.id===id)||{}).name||('#'+id);
+  const base=location.origin;
+  const rows=webhooks.map(h=>{ const [st,dot]={accepted:['已建任务','g'],duplicate:['重复投递','g'],throttled:['被限流','y'],
+      rejected:['被拒','r'],error:['失败','r'],disabled:['已停用','y']}[h.last_status]||['未调用',''];
+    return `<tr><td class="clip"><div><b>${esc(h.name)}</b>${h.enabled?'':' <span class="tag off">已停用</span>'}</div>
+        <div class="muted mono" title="${esc(base+h.path)}">${esc(base+h.path)}</div></td>
+      <td>${esc(appName(h.app_id))}<div class="muted mono" style="font-size:11px">${esc(h.chat_id)}</div></td>
+      <td><span class="chip"><span class="dot ${dot}"></span>${st}</span><div class="muted" style="font-size:12px">${h.last_called?dt(h.last_called):''} · 共 ${h.calls} 次</div>
+        ${h.last_error?`<div style="color:var(--err);font-size:12px">${esc(h.last_error.slice(0,60))}</div>`:''}</td>
+      <td style="white-space:nowrap"><button class="btn ghost sm" onclick="editHook('${esc(h.id)}')">编辑</button>
+        <button class="btn ghost sm" onclick="rotateHook('${esc(h.id)}')">轮换令牌</button>
+        <button class="btn danger" onclick="delHook('${esc(h.id)}','${esc(h.name)}')">删除</button></td></tr>`;}).join('');
+  c.innerHTML=`<div class="head"><div><h2>Webhook 触发</h2><p class="desc">外部系统（CI、告警、工单、表单）POST 一个 JSON 事件，按指令模板生成任务交给数字员工处理，结果发到指定会话。同一事件重复投递只建一个任务。</p></div>
+      <button class="btn" onclick="newHook()">+ 新建 Webhook</button></div>
+    <div class="notice">请求体是外部内容：这类任务从第一步起按「已读外部内容」处理——可以查询、分析、在隔离工作区改代码并经审批提 MR，但不能直接写生产或执行生产命令。</div>
+    <div class="card">${webhooks.length?`<table><thead><tr><th>名称 / 地址</th><th style="width:22%">投递到</th><th style="width:22%">最近调用</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+      :'<div class="empty">还没有 Webhook。新建后把地址和令牌配到 GitLab / 告警平台的 Webhook 设置里。</div>'}</div>
+    <div class="card"><div class="card-title">调用方式</div>
+      <pre class="box">curl -X POST ${esc(base)}/hooks/&lt;id&gt; \\
+  -H 'X-Harness-Token: &lt;令牌&gt;' -H 'Content-Type: application/json' \\
+  -H 'Idempotency-Key: 事件唯一ID（可选，用于去重）' \\
+  -d '{"alert":"PodCrashLooping","namespace":"payments","pod":"api-7f9c"}'</pre>
+      <div class="hint">GitLab Webhook 把令牌填进 Secret token 即可（走 X-Gitlab-Token，并自动用 X-Gitlab-Event-UUID 去重）。返回 202 = 新建任务，200 = 重复投递，429 = 超出每小时上限。</div></div>`;
+}
+function _hookForm(h){
+  const {chats,workflows,apps}=_hookMeta;
+  const appOpts=apps.map(a=>`<option value="${a.id}" ${h.app_id===a.id?'selected':''}>${esc(a.name)}</option>`).join('');
+  const wfOpts=workflows.map(w=>`<option value="${w}" ${(h.workflow||'auto')===w?'selected':''}>${w==='auto'?'自动判断':w}</option>`).join('');
+  const chatList=chats.map(x=>`<option value="${esc(x.chat_id)}">应用 #${x.app_id} · 最近 ${dt(x.last)}</option>`).join('');
+  return `<h3>${h.id?'编辑 Webhook':'新建 Webhook'}</h3><p class="desc">模板里用 {{字段路径}} 取请求体里的值（如 {{object_attributes.title}}），用 {{payload}} 放入整个请求体（截断并标注为外部数据）。</p>
+    <div class="row"><div><label>名称</label><input id="wh-name" value="${esc(h.name||'')}" placeholder="如：生产告警 → 运维助手"></div>
+      <div style="flex:0 0 200px"><label>交给哪个应用</label><select id="wh-app">${appOpts}</select></div>
+      <div style="flex:0 0 160px"><label>工作流</label><select id="wh-wf">${wfOpts}</select></div></div>
+    <label>投递会话 chat_id（任务进度与结果发到这里）</label>
+    <input id="wh-chat" class="mono" list="wh-chats" value="${esc(h.chat_id||'')}" placeholder="oc_xxx"><datalist id="wh-chats">${chatList}</datalist>
+    <label>指令模板</label>
+    <textarea id="wh-tpl" style="min-height:160px">${esc(h.template||'收到告警：{{alert}}，命名空间 {{namespace}}，Pod {{pod}}。\n请排查原因、评估影响范围，给出证据和处理建议；需要变更时走 GitOps 提 MR。\n{{payload}}')}</textarea>
+    <div class="row"><div style="flex:0 0 180px"><label>每小时最多新建任务</label><input id="wh-max" type="number" min="1" value="${h.max_per_hour||60}"></div>
+      <div style="flex:0 0 160px"><label>启用</label><select id="wh-en"><option value="1" ${h.enabled!==false?'selected':''}>启用</option><option value="0" ${h.enabled===false?'selected':''}>停用</option></select></div></div>
+    <div class="save-bar"><button class="btn" onclick="saveHook('${esc(h.id||'')}')">保存</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
+}
+function newHook(){ if(!_hookMeta.apps.length){ toast('先在「应用」页建一个应用'); return; } openModal(_hookForm({})); }
+function editHook(id){ openModal(_hookForm(_hookCache.find(h=>h.id===id)||{})); }
+function _showToken(title, r){
+  openModal(`<h3>${title}</h3><p class="desc">${esc(r.note||'')}</p>
+    <label>地址</label><pre class="box">${esc(location.origin+(r.path||''))}</pre>
+    <label>令牌（只显示这一次）</label><pre class="box">${esc(r.token)}</pre>
+    <div class="save-bar"><button class="btn" onclick="navigator.clipboard&&navigator.clipboard.writeText('${esc(r.token)}');toast('已复制令牌')">复制令牌</button><button class="btn ghost" onclick="closeModal();hooksPage()">我已保存</button></div>`);
+}
+async function saveHook(id){
+  const body={name:$('#wh-name').value.trim(),app_id:Number($('#wh-app').value),workflow:$('#wh-wf').value,
+    chat_id:$('#wh-chat').value.trim(),template:$('#wh-tpl').value,max_per_hour:Number($('#wh-max').value)||60,enabled:Number($('#wh-en').value)};
+  try{ if(id){ await api('PUT','/api/webhooks/'+id,body); closeModal(); toast('已保存'); hooksPage(); }
+    else{ const r=await api('POST','/api/webhooks',body); _showToken('Webhook 已创建',r); } }catch(e){ toast(e.message); }
+}
+async function rotateHook(id){ if(!confirm('轮换后旧令牌立即失效，调用方需要更新。继续？')) return;
+  try{ const r=await api('POST','/api/webhooks/'+id+'/rotate'); r.path='/hooks/'+id; _showToken('令牌已轮换',r); }catch(e){ toast(e.message); } }
+async function delHook(id,name){ if(!confirm('删除 Webhook「'+name+'」？调用方再投递会收到 401。')) return;
+  await api('DELETE','/api/webhooks/'+id); toast('已删除'); hooksPage(); }
 
 /* ---------- 应用 ---------- */
 let _provCache=[], _toolPool=[], _skillPool=[], _mcpPool=[], _presetPool=[];
@@ -655,7 +745,7 @@ function _appForm(a){
     <div class="hint">open_id 可在「运行记录」里点开某次 run，看「触发人」。执行类操作不能由发起人自己批准。</div>
     <label>资源权限（JSON；未列出的资源默认禁止访问）</label>
     <textarea id="ap-resources" class="mono" style="min-height:150px">${esc(JSON.stringify(a.resources||{},null,2))}</textarea>
-    <div class="hint">例：{"k8s_clusters":["主集群"],"namespaces":["upmore-api"],"repos":["gitops"],"log_orgs":["default"],"log_streams":["k8s_upmore_api"]}。完整访问须显式填写 ["*"]。可选 users/chats 限制发起人和群。生产连接仍应使用最小权限账号。</div>
+    <div class="hint">例：{"k8s_clusters":["主集群"],"namespaces":["upmore-api"],"repos":["gitops"],"log_orgs":["default"],"log_streams":["k8s_upmore_api"],"web_domains":["*"],"sandbox":["research"]}。web_domains 控制联网搜索/读网页/沙箱下载的网站（web_search 需 ["*"]），sandbox:["research"] 允许离线研究沙箱。完整访问须显式填写 ["*"]。可选 users/chats 限制发起人和群。生产连接仍应使用最小权限账号。</div>
     <label>可用工具（只勾该应用该有的——能力隔离）</label>
     <div class="toolpick">${tools||'<span class="muted">工具池为空</span>'}</div>
     <label>可用技能（知识/工作方法包——只勾该应用该懂的）</label>
