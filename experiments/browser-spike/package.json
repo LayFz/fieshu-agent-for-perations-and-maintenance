@@ -1,0 +1,11 @@
+{
+  "name": "browser-spike",
+  "private": true,
+  "type": "module",
+  "description": "对比 Playwright MCP 与直连 CDP 的浏览器工具：调用次数、回传 token、耗时、成功率",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.20.2",
+    "@playwright/mcp": "0.0.83",
+    "js-tiktoken": "1.0.21"
+  }
+}
