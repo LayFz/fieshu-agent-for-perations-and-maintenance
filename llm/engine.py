@@ -269,7 +269,7 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                     executor = (lambda a, _n=name: execute(_n, a, ctx))
                 call = pipeline.ToolCall(id=t["id"], tool=name, args=args, raw_args=raw,
                                          exposed=name in exposed, trigger=rec.trigger, app_id=aid, **meta)
-                content_str = pipeline.run_tool(rec, call, app.get("policy"), executor)
+                content_str = pipeline.run_tool(rec, call, app.get("policy"), executor, app=app)
                 msgs.append({"role": "tool", "tool_call_id": t["id"], "content": content_str})
     finally:
         auth.reset_ctx(ctok)

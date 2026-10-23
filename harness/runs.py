@@ -20,7 +20,7 @@ TRIGGERS = ("chat", "proactive", "schedule", "job", "webhook", "delegate")
 STATUSES = ("running", "completed", "silent", "max-steps", "error", "aborted")
 EVENT_TYPES = (
     "run/start", "user/message", "assistant/message",
-    "tool/call", "tool/decision", "tool/result", "run/end",
+    "tool/call", "tool/decision", "approval/asked", "approval/decided", "tool/result", "run/end",
 )
 
 _RETENTION_DAYS = 90
@@ -30,12 +30,15 @@ _current = contextvars.ContextVar("harness_run", default=None)
 class Run:
     """一个进行中的 run。emit() 线程安全，seq 在 run 内单调递增。"""
 
-    def __init__(self, run_id, app_id, chat_id, trigger, depth=0):
+    def __init__(self, run_id, app_id, chat_id, trigger, depth=0, speaker_open_id="",
+                 approval_policy="never"):
         self.id = run_id
         self.app_id = app_id
         self.chat_id = chat_id
         self.trigger = trigger
         self.depth = depth
+        self.speaker_open_id = speaker_open_id or ""
+        self.approval_policy = approval_policy   # ask：可以发审批卡片；never：需要审批的一律拒
         self.total_tokens = 0
         self.started = time.time()
         self._seq = 0
@@ -62,11 +65,13 @@ def start(app_id, chat_id, trigger, speaker_open_id="", parent=None):
     if trigger not in TRIGGERS:
         raise ValueError(f"unknown trigger {trigger}")
     depth = (parent.depth + 1) if parent else 0
-    run = Run(uuid.uuid4().hex, app_id, chat_id, trigger, depth)
+    # 只有有人当场在等的群聊/单聊才发审批卡片；定时、job、webhook、旁听、委派一律 never
+    policy = "ask" if trigger == "chat" else "never"
+    run = Run(uuid.uuid4().hex, app_id, chat_id, trigger, depth, speaker_open_id, policy)
     try:
         store.create_run(run.id, app_id, chat_id, trigger, speaker_open_id,
                          parent_run_id=parent.id if parent else None, depth=depth,
-                         approval_policy="ask" if trigger == "chat" else "never")
+                         approval_policy=policy)
     except Exception as e:
         print(f"[run {run.id[:8]}] 建 run 失败:", e, flush=True)
     run._token = _current.set(run)

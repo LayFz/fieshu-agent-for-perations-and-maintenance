@@ -1,7 +1,7 @@
 # feishu-agent harness 设计与路线
 
 > 本文档是 harness 改造的依据，随实现同步更新。工程约定和坑见 [`CLAUDE.md`](../CLAUDE.md)。
-> 最近更新：2026-10-22（P0、P1 已完成）。
+> 最近更新：2026-10-22（P0、P1 已完成；P2 代码完成，待飞书联调）。
 
 ## 1. 目标
 
@@ -23,7 +23,7 @@
 |---|---|---|
 | P0 | `runs` / `events` 事件日志；后台「运行记录」页 | ✅ 已完成（d7898f0） |
 | P1 | 工具执行管道 `run_tool()`；策略预设（兼容/只读/自定义）；guard（not_exposed、proactive、ssh_blacklist、k8s_precheck）；工具元数据 | ✅ 已完成（9ffa887） |
-| P2 | 审批：飞书卡片回调、`approvals` 表、审批人、「审批」预设 | 进行中 |
+| P2 | 审批：飞书卡片回调、`approvals` 表、审批人、「审批」预设 | 🟡 代码完成、测试通过，待飞书后台订阅回调后联调 |
 | P2b | 技能从 Git 同步 | 待开始 |
 | P2c | 自动审查预设（可选） | 待开始 |
 | P3 | 代码工作区执行器 | 待开始 |
@@ -124,9 +124,11 @@ engine 里每次工具调用都走 `run_tool()`：
 
 `ops` 的 `run()` 里保留同一个 `precheck()` 兜底，防止绕过管道直接调用。
 
-## 6. 审批（P2，进行中）
+## 6. 审批（P2，代码完成）
 
 策略判为 ask 时，发一张飞书卡片，**只有「批准一次」才执行**，其余结果一律拒绝（失败即拒绝）。
+
+实现位置：`harness/approval.py`（请求、等待、决策、启动清理）、`feishu/bot.py`（`_approval_card`、`_ask_approval`、`_finalize_approval`、`_on_card_action`）、`core/store.py`（`approvals` 表、`apps.approvers`）。管道里 **guard 先于审批执行**：被 guard 拦下的调用不会发卡片打扰人；guard 只看冻结的参数、等待期间 run 被阻塞，所以与「批准后再过 guard」等价。lark-oapi 1.6.8 已确认支持：`register_p2_card_action_trigger`，长连接下回调以 EVENT 类型下发，处理函数的返回值（toast + 卡片）作为响应回给飞书。
 
 - **结果闭集**：`allowed-once`、`rejected`、`cancelled`、`unavailable`、`expired`。只有 `allowed-once` 放行，且只管这一次调用。没有应答者、卡片发送失败、超时、服务重启都不放行。
 - **按触发方式定策略**：`chat` 默认 `ask`；`schedule`、`job`、`webhook`、`proactive` 为 `never`（ask 直接当拒绝，不发卡片）；`delegate` 固定 `never`。
@@ -218,8 +220,9 @@ engine 里每次工具调用都走 `run_tool()`：
 - **双写**：`msgs` 和 `events` 都存了消息，第一版接受冗余。
 - **SQLite 写入量**：每次工具调用 4 到 5 次写入，WAL + 每线程连接下可接受，观察 `database is locked`。
 - 待决：
-  - [ ] lark-oapi 长连接是否支持 `card.action.trigger`，注册方法名是什么（P2 开工前验证）
-  - [ ] 定时任务里的 ask 是否也发卡片等人（当前设计：直接拒绝）
+  - [x] lark-oapi 长连接是否支持 `card.action.trigger`：支持（1.6.8，`register_p2_card_action_trigger`）
+  - [ ] 定时任务里的 ask 是否也发卡片等人（当前实现：直接拒绝）
+  - [ ] 审批人是否改为从群成员里选，而不是手填 open_id
   - [ ] 自动审查模型是否强制与主模型不同供应商
   - [ ] MCP server 默认算 external 是否太严（内部 server 可在后台标可信）
   - [ ] 代码工作区先用内置工具还是 dsh SDK

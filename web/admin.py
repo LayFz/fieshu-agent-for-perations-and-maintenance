@@ -347,6 +347,7 @@ def _app_view(a):
         "mcp": a.get("mcp") or [],
         "thinking": bool(a.get("thinking", True)),
         "policy": policy.normalize(a.get("policy")),
+        "approvers": a.get("approvers") or [],
         "enabled": a["enabled"],
         "running": bot.is_running(a["id"]),
     }
@@ -367,6 +368,26 @@ def _policy_from(b):
     if preset not in policy.PRESETS:
         raise HTTPException(status_code=400, detail=f"未知的策略预设：{preset}")
     return {"preset": preset}
+
+def _approvers_from(b):
+    """审批人 open_id 名单：接受数组或换行/逗号分隔的字符串；没传返回 None（不改）。"""
+    if "approvers" not in b:
+        return None
+    raw = b.get("approvers") or []
+    if isinstance(raw, str):
+        raw = re.split(r"[\s,，]+", raw)
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="审批人格式不对")
+    out = []
+    for x in raw:
+        x = str(x).strip()
+        if not x:
+            continue
+        if not re.fullmatch(r"ou_[0-9a-zA-Z]{8,64}", x):
+            raise HTTPException(status_code=400, detail=f"审批人需填飞书 open_id（ou_ 开头）：{x}")
+        if x not in out:
+            out.append(x)
+    return out
 
 @app.get("/api/apps")
 def apps(request: Request):
@@ -395,6 +416,7 @@ async def create_app(request: Request):
     if not name:
         raise HTTPException(status_code=400, detail="请填应用名称")
     pol = _policy_from(b)
+    appr = _approvers_from(b)
     aid = store.create_app(
         name, (b.get("feishu_app_id") or "").strip(), (b.get("feishu_app_secret") or "").strip(),
         b.get("ai_provider_id"), b.get("system_prompt") or "",
@@ -405,6 +427,8 @@ async def create_app(request: Request):
         store.update_app(aid, thinking=1 if b["thinking"] else 0)
     if pol is not None:
         store.update_app(aid, policy=pol)
+    if appr is not None:
+        store.update_app(aid, approvers=appr)
     return {"ok": True, "id": aid, "note": "新应用的飞书长连接需重启服务后建立"}
 
 @app.put("/api/apps/{aid}")
@@ -422,6 +446,9 @@ async def edit_app(aid: int, request: Request):
     pol = _policy_from(b)
     if pol is not None:
         fields["policy"] = pol
+    appr = _approvers_from(b)
+    if appr is not None:
+        fields["approvers"] = appr
     store.update_app(aid, **fields)
     auth.reset(aid)   # 该应用飞书凭证若变更，取数立即用新值；长连接仍需重启
     return {"ok": True, "note": "人设/工具/AI 即时生效；飞书凭证或启用状态变更需重启服务重连"}

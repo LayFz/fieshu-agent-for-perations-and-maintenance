@@ -103,6 +103,7 @@ _ensure_col("apps", "skills", "TEXT DEFAULT '[]'")
 _ensure_col("apps", "mcp", "TEXT DEFAULT '[]'")     # 应用勾选的 MCP server id 名单
 _ensure_col("apps", "thinking", "INTEGER DEFAULT 1")  # 是否开启模型「思考(reasoning)」模式，默认开
 _ensure_col("apps", "policy", "TEXT DEFAULT '{}'")    # 工具调用策略（harness.policy），空=默认「兼容」预设
+_ensure_col("apps", "approvers", "TEXT DEFAULT '[]'")  # 审批人 open_id 名单（harness.approval），空=谁都批不了
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_msgs_app ON msgs(app_id, chat_id, id)")
 _conn.commit()
 
@@ -128,6 +129,18 @@ _conn.executescript("""
         payload TEXT,
         ts REAL);
     CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+    CREATE TABLE IF NOT EXISTS approvals(
+        id TEXT PRIMARY KEY,
+        kind TEXT DEFAULT 'tool',
+        run_id TEXT, call_id TEXT,
+        app_id INTEGER, chat_id TEXT,
+        tool TEXT, risk TEXT,
+        args TEXT, reason TEXT,
+        status TEXT,
+        requester_open_id TEXT, decider_open_id TEXT,
+        message_id TEXT,
+        created REAL, decided REAL);
+    CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 """)
 _conn.commit()
 
@@ -211,6 +224,10 @@ def _app_row(r):
         d["policy"] = json.loads(d.get("policy") or "{}")
     except Exception:
         d["policy"] = {}
+    try:
+        d["approvers"] = json.loads(d.get("approvers") or "[]")
+    except Exception:
+        d["approvers"] = []
     d["enabled"] = bool(d.get("enabled"))
     d["thinking"] = bool(d.get("thinking", 1))
     return d
@@ -255,6 +272,8 @@ def update_app(aid, **f):
         sets.append("mcp=?"); vals.append(json.dumps(f["mcp"], ensure_ascii=False))
     if "policy" in f and f["policy"] is not None:
         sets.append("policy=?"); vals.append(json.dumps(f["policy"], ensure_ascii=False))
+    if "approvers" in f and f["approvers"] is not None:
+        sets.append("approvers=?"); vals.append(json.dumps(f["approvers"], ensure_ascii=False))
     if f.get("feishu_app_secret"):              # 仅非空才更新 secret
         sets.append("feishu_app_secret=?"); vals.append(f["feishu_app_secret"])
     if not sets:
@@ -692,6 +711,52 @@ def purge_runs(before_ts):
         cur = _conn.execute("DELETE FROM runs WHERE started<?", (before_ts,))
         _conn.commit()
         return cur.rowcount
+
+
+# ---------- 审批（harness.approval） ----------
+def _approval_row(r):
+    d = dict(r)
+    try:
+        d["args"] = json.loads(d.get("args") or "{}")
+    except Exception:
+        pass
+    return d
+
+def create_approval(approval_id, kind, run_id, call_id, app_id, chat_id, tool, risk, args, reason,
+                    requester_open_id=""):
+    with _lock:
+        _conn.execute("INSERT INTO approvals(id,kind,run_id,call_id,app_id,chat_id,tool,risk,args,reason,"
+                      "status,requester_open_id,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (approval_id, kind, run_id, call_id, app_id, chat_id, tool, risk,
+                       json.dumps(args, ensure_ascii=False, default=str), reason, "pending",
+                       requester_open_id or "", time.time()))
+        _conn.commit()
+
+def get_approval(approval_id):
+    r = _conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+    return _approval_row(r) if r else None
+
+def set_approval_message(approval_id, message_id):
+    with _lock:
+        _conn.execute("UPDATE approvals SET message_id=? WHERE id=?", (message_id, approval_id))
+        _conn.commit()
+
+def decide_approval(approval_id, status, decider_open_id=""):
+    """原子地把 pending 改成终态；已被别人处理过返回 False（多人同时点/连点只生效一次）。"""
+    with _lock:
+        cur = _conn.execute("UPDATE approvals SET status=?, decider_open_id=?, decided=? "
+                            "WHERE id=? AND status='pending'",
+                            (status, decider_open_id or "", time.time(), approval_id))
+        _conn.commit()
+        return cur.rowcount == 1
+
+def cancel_pending_approvals():
+    """启动时调用：遗留的 pending 一律 cancelled（等它的线程已随进程消失）。返回被取消的行。"""
+    with _lock:
+        rows = _conn.execute("SELECT * FROM approvals WHERE status='pending'").fetchall()
+        _conn.execute("UPDATE approvals SET status='cancelled', decided=? WHERE status='pending'", (time.time(),))
+        _conn.commit()
+    return [_approval_row(r) for r in rows]
 
 
 # ---------- 计数（概览用） ----------

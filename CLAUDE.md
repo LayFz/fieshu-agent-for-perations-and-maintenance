@@ -53,7 +53,8 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 - `schedules` — 定时任务（app_id/chat_id/title/instruction/kind/spec/next_run_ts）
 - `msgs` / `notes` / `token_usage` — 对话记忆 / 长期笔记 / 用量，**都带 app_id 按应用隔离**
 - `runs` / `events` — 运行记录：一次 `engine.run` 是一个 run（trigger=chat/proactive/schedule/…、状态、token），每次模型回复与工具调用按 `seq` 只追加写进 `events`（类型见 `harness.runs.EVENT_TYPES`）。`tool/call` 先于执行写入；启动时遗留的 `running` 标 `aborted`；调度线程清理 90 天前的记录。后台「运行记录」页只读回放。`msgs` 仍负责对话记忆，两者并存
-- `apps.policy` — 工具调用策略 JSON：`{"preset":"compat"|"readonly"}` 或 `{"preset":"custom","rules":[...]}`，空=兼容（见下「工具执行管道」）
+- `apps.policy` — 工具调用策略 JSON：`{"preset":"compat"|"readonly"|"approval"}` 或 `{"preset":"custom","rules":[...]}`，空=兼容（见下「工具执行管道」）
+- `apps.approvers` — 审批人 open_id 名单；`approvals` — 每次审批一行（pending → allowed-once/rejected/expired/cancelled/unavailable，审批人、卡片 message_id）
 - `kv` — 引导配置 + 全局设置（OpenObserve/Beszel/UptimeKuma 连接 `oo_*`/`bz_*`/`uk_*`；SSH 受管主机+凭证 `ssh_hosts`、硬黑名单 `ssh_blacklist`）；`admin` — 管理员
   - OpenObserve 按 **org** 隔离数据：`oo_org/oo_user/oo_pass` 是主 org，`oo_sources`（JSON 数组）存其余 org 各自的 service account；`query_logs`/`list_log_streams` 用可选 `org` 参数切换。每个 org 要用它自己建的 service account，主 org 的账号访问不了别的 org
 
@@ -65,7 +66,9 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 - **监控集成是只读原生工具**(非 MCP)：`query_logs`/`server_stats`/`service_status`，连接信息走后台「可观测」页存 kv。这些是内置在 `llm/tools.py` 里的固定工具。
 - **MCP 工具是「外挂」工具**：后台「MCP 工具」页注册远程 HTTP MCP server（endpoint URL + 鉴权头），应用按 server 整体勾选 → 运行时 `llm/mcp.py` 连上它、把它 `tools/list` 出来的工具转成 OpenAI schema 挂进工具循环，名字统一 `mcp__{server_id}__{tool}` 便于路由与防撞名。**只支持远程 HTTP（Streamable HTTP，兼容 SSE 响应），不支持 stdio 本地进程。** 隔离照旧靠「勾了才有」。
 - **工具执行管道（harness/pipeline.py）**：engine 里每次工具调用（原生 + MCP）都走 `run_tool()`，固定五段：**记录**（写 `tool/call`，参数从此冻结）→ **策略**（`policy.decide` 按应用规则表给 allow/deny/ask，第一条命中生效，都不命中=拒）→ **guard**（只拒不放，策略的 allow 推翻不了）→ **执行**（独立线程 + 统一超时，`copy_context` 透传 contextvar；异常归一为 `{"error"}`）→ **后处理**（写 `tool/decision`、`tool/result`）。被拒不会让对话失败，模型拿到写明原因的错误结果。审批上线（P2）前 ask 按拒绝。
-  - 预设：**兼容**（默认，全部放行只叠加 guard，等于改造前行为）、**只读**（只放行 risk=read）。
+  - 预设：**兼容**（默认，全部放行只叠加 guard，等于改造前行为）、**只读**（只放行 risk=read）、**审批**（read 放行，write/exec 走审批）。
+  - **审批（harness/approval.py）**：ask 且 guard 已放过 → 落 `approvals`(pending) → 在群里发卡片 → 工具线程在 `threading.Event` 上等（默认 10 分钟）→ 飞书回调线程 `decide()` 校验审批人、原子 pending→终态、唤醒。只有 `allowed-once` 执行；没配审批人、发卡失败、超时、重启遗留都不放行。只有 `trigger=chat` 的 run 会发卡（`approval_policy=ask`），定时/旁听/job/webhook/委派一律 `never`。exec 类不能由发起人自批。启动时遗留 pending → cancelled 并改卡片。
+  - **飞书后台必须配**：开发者后台「事件与回调 → 回调配置」选**长连接**并订阅 `card.action.trigger`（卡片回传交互），改完**发版**；否则点按钮没反应、审批全部超时。
   - 现有 guard：`not_exposed`（模型说出本应用没勾的工具名——以前会被照样执行）、`proactive`（旁听时拒 write/exec）、`ssh_blacklist`、`k8s_precheck`（只读集群 + 黑名单）。后两个由 `ops/ssh.py`、`ops/k8s.py` 导入时 `policy.register_guard()` 注册；`run()` 内仍调同一个 `precheck()` 兜底，防绕过管道直接调用。guard 自身抛异常按拒绝。
 - **SSH 运维是高风险原生工具**：`ops/ssh.py`（paramiko）提供 `ssh_exec`/`list_ssh_hosts`，让数字员工在受管服务器上跑真实命令（如网掉了 `sudo wg-quick up wg0`）。受管主机+凭证存 kv（`ssh_hosts`/`ssh_blacklist`），后台「SSH 运维」页配。三层闸门：**① 模型判断为主**（工具说明里写死了「危险/不可逆就拒绝」，再叠加应用系统提示词+网络拓扑技能）；**② 硬黑名单兜底**（`ops.ssh._DEFAULT_BLACKLIST`，只挡 rm -rf /、mkfs、dd 到裸盘等不可逆命令，连接前就拦，不挡正常运维）；**③ 隔离**（应用勾了才有）。**铁律：绝不给「主动旁听」类应用勾 `ssh_exec`**——那等于让没人点名时也能自己 root 执行。
 

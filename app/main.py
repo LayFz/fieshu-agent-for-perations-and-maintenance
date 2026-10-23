@@ -62,7 +62,9 @@ def main():
     from harness import runs
     runs.abort_stale()            # 上次进程遗留的 running → aborted
 
-    from feishu import bot
+    from feishu import bot        # 导入即注册审批应答者（发/改审批卡片）
+    from harness import approval
+    approval.cancel_stale()        # 上次遗留的待审批 → cancelled，卡片改「已失效」
     started = bot.start_all()
     if started == 0:
         print("⚠ 暂无可启动的应用（需在后台建应用、填飞书凭证、绑 AI、并启用）", flush=True)

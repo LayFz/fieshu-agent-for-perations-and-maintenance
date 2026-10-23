@@ -27,6 +27,12 @@ PRESETS = {
         "description": "只放行只读工具；写入（改文档、记笔记、建定时任务）和执行（ssh、变更类 kubectl）一律拒绝。",
         "rules": [{"risk": "read", "decision": "allow"}, {"decision": "deny"}],
     },
+    "approval": {
+        "name": "审批",
+        "description": "只读工具直接放行；写入和执行先在群里发审批卡片，审批人点「批准一次」才执行。"
+                       "定时任务、旁听等没人在线的场景一律拒绝。需要在下方配置审批人。",
+        "rules": [{"risk": "read", "decision": "allow"}, {"decision": "ask"}],
+    },
 }
 
 

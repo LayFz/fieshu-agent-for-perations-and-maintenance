@@ -15,6 +15,7 @@ from lark_oapi.api.im.v1 import (CreateMessageRequest, CreateMessageRequestBody,
 
 from core import store
 from feishu import members
+from harness import approval
 from llm.engine import run as llm_run
 
 # lark 的 ws 客户端用了一个【模块级全局事件循环】，所有 Client.start() 共用它，
@@ -176,6 +177,91 @@ def _update_card(app, message_id, text, rich=False):
         print(f"[app {app['id']}] 更新卡片失败:", resp.code, resp.msg, flush=True)
         return False
     return True
+
+
+# ---------- 审批卡片（harness.approval 的应答者） ----------
+_APPROVAL_STATUS = {
+    "pending": ("⏳ 等待审批", "orange"), "allowed-once": ("✅ 已批准", "green"),
+    "rejected": ("⛔ 已拒绝", "red"), "expired": ("⌛ 已超时（未执行）", "grey"),
+    "cancelled": ("🚫 已失效（服务重启，未执行）", "grey"), "unavailable": ("🚫 审批不可用（未执行）", "grey"),
+}
+
+
+def _approval_card(app, row, status="pending", decider_name=""):
+    """审批卡片。row 至少含 id/chat_id/tool/args/risk/reason/requester_open_id。"""
+    title, color = _APPROVAL_STATUS.get(status, (status, "grey"))
+    args = row.get("args") or {}
+    args_txt = json.dumps(args, ensure_ascii=False, indent=2) if isinstance(args, dict) else str(args)
+    if len(args_txt) > 1500:
+        args_txt = args_txt[:1500] + "\n…（已截断，完整参数见后台运行记录）"
+    who = members.name_of(app, row.get("chat_id"), row.get("requester_open_id")) if row.get("requester_open_id") else "（未知）"
+    lines = [f"**{app.get('name')}** 想执行一个需要审批的操作",
+             f"**工具**：`{row.get('tool')}`（{ {'write': '写入', 'exec': '执行'}.get(row.get('risk'), row.get('risk')) }类）",
+             f"**发起人**：{who}",
+             f"**原因**：{row.get('reason') or ''}"]
+    elements = [{"tag": "markdown", "content": "\n".join(lines)},
+                {"tag": "markdown", "content": f"**参数**\n```json\n{args_txt}\n```"}]
+    if status == "pending":
+        value = {"kind": "approval", "approval_id": row["id"]}
+        elements.append({"tag": "action", "actions": [
+            {"tag": "button", "text": {"tag": "plain_text", "content": "批准一次"}, "type": "primary",
+             "value": dict(value, choice="approve")},
+            {"tag": "button", "text": {"tag": "plain_text", "content": "拒绝"}, "type": "danger",
+             "value": dict(value, choice="reject")},
+        ]})
+        elements.append({"tag": "note", "elements": [{"tag": "plain_text",
+                         "content": "只有审批人名单里的人能点；只对这一次调用生效。"}]})
+    else:
+        tail = f"{title}" + (f" · 审批人 {decider_name}" if decider_name else "")
+        elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": tail}]})
+    return {"config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {"template": color, "title": {"tag": "plain_text", "content": f"{title} · {row.get('tool')}"}},
+            "elements": elements}
+
+
+def _ask_approval(req):
+    """harness.approval 调：在群里发审批卡片，返回 message_id。"""
+    app = req["app"]
+    row = {"id": req["approval_id"], "chat_id": req["chat_id"], "tool": req["tool"], "args": req["args"],
+           "risk": req["risk"], "reason": req["reason"], "requester_open_id": req["requester_open_id"]}
+    resp = _create_card(app, req["chat_id"], _approval_card(app, row))
+    if not resp.success():
+        print(f"[app {app['id']}] 发审批卡片失败:", resp.code, resp.msg, flush=True)
+        return None
+    return getattr(resp.data, "message_id", None)
+
+
+def _finalize_approval(row):
+    """harness.approval 调：超时 / 重启失效时把卡片改成终态。"""
+    app = store.get_app(row["app_id"])
+    if app and row.get("message_id"):
+        _patch_card(app, row["message_id"], _approval_card(app, row, row["status"]))
+
+
+def _on_card_action(app_id, data):
+    """卡片按钮回调（长连接，飞书要求 3 秒内回应）。返回 toast + 更新后的卡片。"""
+    from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+    try:
+        ev = data.event
+        value = (ev.action.value or {}) if ev and ev.action else {}
+        operator = getattr(ev.operator, "open_id", "") if ev and ev.operator else ""
+        if value.get("kind") != "approval":
+            return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "这个按钮已失效"}})
+        ok, msg, row = approval.decide(value.get("approval_id"), value.get("choice") == "approve", operator)
+        print(f"[app {app_id}] 审批 {str(value.get('approval_id'))[:8]} by {operator[-6:]} "
+              f"{value.get('choice')} -> {msg}", flush=True)
+        body = {"toast": {"type": "success" if ok else "error", "content": msg}}
+        if ok and row:
+            app = store.get_app(row["app_id"]) or {"name": "", "id": app_id}
+            decider = members.name_of(app, row.get("chat_id"), operator)
+            body["card"] = {"type": "raw", "data": _approval_card(app, row, row["status"], decider)}
+        return P2CardActionTriggerResponse(body)
+    except Exception as e:
+        print(f"[app {app_id}] 处理卡片回调出错:", e, flush=True)
+        return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "处理失败，请重试"}})
+
+
+approval.register_answerer(_ask_approval, _finalize_approval)
 
 
 def _extract_text(message):
@@ -373,6 +459,7 @@ def _serve(app):
     # 事件循环由上面的 _ThreadLoopProxy 按线程惰性创建（lark start() 首次访问 loop 时）
     handler = (lark.EventDispatcherHandler.builder("", "")
                .register_p2_im_message_receive_v1(lambda data, _id=app_id: _on_message(_id, data))
+               .register_p2_card_action_trigger(lambda data, _id=app_id: _on_card_action(_id, data))
                .build())
     _running[app_id] = True
     print(f"[app {app_id}] {app['name']} 长连接监听中", flush=True)

@@ -7,7 +7,8 @@
   5. 后处理 写 tool/result，返回给模型的字符串
 
 被拒绝不会让对话失败：给模型一个错误结果，写明被谁、为什么拦下，让它换路或如实告诉用户。
-ask 在审批上线（P2）前按拒绝处理（失败即拒绝）。
+ask：guard 先跑（别让人去批一个反正会被 guard 拦下的操作），过了再走 harness.approval 问人，
+只有「批准一次」才执行；guard 只看冻结的参数，等待期间 run 被阻塞，所以先跑与后跑结果一致。
 """
 import contextvars
 import copy
@@ -63,8 +64,9 @@ def _denied_result(by, name, reason):
     return {"error": f"调用被{who}拒绝，没有执行。原因：{reason}", "denied_by": f"{by}:{name}"}
 
 
-def run_tool(rec, call, app_policy, executor):
-    """执行一次工具调用，返回给模型的结果字符串。executor(args) -> 任意可 JSON 化的结果。"""
+def run_tool(rec, call, app_policy, executor, app=None):
+    """执行一次工具调用，返回给模型的结果字符串。executor(args) -> 任意可 JSON 化的结果。
+    app：审批要用（审批人名单、发卡片的飞书凭证）；不传时需要审批的调用按拒绝。"""
     # 1. 记录（先于执行）
     payload = {"args": call.args, "risk": call.risk}
     if call.raw_args is not None:
@@ -76,13 +78,13 @@ def run_tool(rec, call, app_policy, executor):
 
     # 2. 策略
     decision, rule_no, preset = policy.decide(app_policy, call.tool, call.risk)
+    preset_name = policy.PRESETS.get(preset, {}).get("name", "自定义" if preset == policy.CUSTOM else preset)
+    where = f"策略「{preset_name}」" + (f"第 {rule_no} 条规则" if rule_no else "没有规则放行，")
     verdict = {"decision": decision, "by": "policy", "preset": preset, "rule": rule_no}
     if decision == "deny":
-        verdict["reason"] = (f"预设「{policy.PRESETS.get(preset, {}).get('name', preset)}」"
-                             + (f"第 {rule_no} 条规则" if rule_no else "没有规则放行") + f"拒绝 {call.risk} 类工具")
+        verdict["reason"] = f"{where}拒绝 {call.risk} 类工具"
     elif decision == "ask":
-        verdict.update(decision="deny", asked=True,
-                       reason="这个调用按策略需要人工审批，但审批功能还没上线，已按拒绝处理。")
+        verdict["reason"] = f"{where}要求 {call.risk} 类工具先经人工审批"
 
     # 3. guard（策略已拒绝的也跑一遍，审计里能看到所有命中的拦截原因；只取第一个）
     hit = policy.check_guards(call)
@@ -90,6 +92,18 @@ def run_tool(rec, call, app_policy, executor):
         verdict = {"decision": "deny", "by": "guard", "guard": hit[0], "reason": hit[1],
                    "policy_decision": decision, "preset": preset, "rule": rule_no}
     rec.emit("tool/decision", verdict, call_id=call.id, tool=call.tool)
+
+    # 3b. 审批（guard 已放过、策略要求 ask）
+    if verdict["decision"] == "ask":
+        if app is None:
+            outcome, note = "unavailable", "缺少应用上下文，无法发起审批，已拒绝。"
+        else:
+            from . import approval      # 延迟导入：approval 依赖 store，避免与 policy 互相牵连
+            outcome, note = approval.request(rec, call, app, verdict["reason"])
+        if outcome == "allowed-once":
+            verdict = dict(verdict, decision="allow", approved=True)
+        else:
+            verdict = dict(verdict, decision="deny", reason=f"{verdict['reason']}；{note}", outcome=outcome)
 
     # 4. 执行
     t0 = time.time()

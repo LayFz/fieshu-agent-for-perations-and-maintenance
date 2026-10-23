@@ -210,7 +210,7 @@ async function overview(){
 /* ---------- 应用 ---------- */
 let _provCache=[], _toolPool=[], _skillPool=[], _mcpPool=[], _presetPool=[];
 const presetName = p => { const k=(p&&p.preset)||'compat'; if(k==='custom') return '自定义';
-  return (_presetPool.find(x=>x.key===k)||{}).name || ({compat:'兼容',readonly:'只读'})[k] || k; };
+  return (_presetPool.find(x=>x.key===k)||{}).name || ({compat:'兼容',readonly:'只读',approval:'审批'})[k] || k; };
 async function apps(){
   const c=$('#content'); c.innerHTML='<h2>应用</h2><p class="desc">加载中…</p>';
   const [{apps},{providers},{tools,policy_presets},sk,mc] = await Promise.all([
@@ -227,6 +227,7 @@ async function apps(){
           <span class="chip">工具 ${a.tools.length}</span>
           <span class="chip">技能 ${a.skills.length}</span>
           <span class="chip">策略 ${esc(presetName(a.policy))}</span>
+          ${(a.approvers||[]).length?`<span class="chip">审批人 ${a.approvers.length}</span>`:''}
         </div>
         <div class="meta mono">App ID: ${esc(a.feishu_app_id||'(未配)')}</div>
         <div class="acts">
@@ -283,8 +284,11 @@ function _appForm(a){
     </div>
     <div id="ap-pol-custom" style="display:${pol.preset==='custom'?'block':'none'}">
       <textarea id="ap-pol-rules" class="mono" style="min-height:120px">${esc(polRules)}</textarea>
-      <div class="hint">自上而下第一条命中的规则生效，都不命中则拒绝。字段：tool（工具名/数组/"*"）、risk（read/write/exec）、decision（allow/deny/ask；审批上线前 ask 按拒绝处理）。</div>
+      <div class="hint">自上而下第一条命中的规则生效，都不命中则拒绝。字段：tool（工具名/数组/"*"）、risk（read/write/exec）、decision（allow/deny/ask，ask＝发审批卡片）。</div>
     </div>
+    <label>审批人（飞书 open_id，一行一个；策略里有 ask 时由他们在群里点「批准一次」。留空＝谁都批不了，需要审批的操作一律拒绝）</label>
+    <textarea id="ap-approvers" class="mono" style="min-height:60px" placeholder="ou_xxxxxxxx">${esc((a.approvers||[]).join('\n'))}</textarea>
+    <div class="hint">open_id 可在「运行记录」里点开某次 run，看「触发人」。执行类操作不能由发起人自己批准。</div>
     <label>可用工具（只勾该应用该有的——能力隔离）</label>
     <div class="toolpick">${tools||'<span class="muted">工具池为空</span>'}</div>
     <label>可用技能（知识/工作方法包——只勾该应用该懂的）</label>
@@ -321,6 +325,7 @@ async function saveApp(id){
     try{ body.policy={preset:'custom', rules:JSON.parse($('#ap-pol-rules').value)}; }
     catch(e){ toast('自定义规则不是合法 JSON'); return; }
   } else body.policy={preset:pv};
+  body.approvers=$('#ap-approvers').value.split(/[\s,，]+/).map(s=>s.trim()).filter(Boolean);
   try{
     if(id) await api('PUT','/api/apps/'+id,body); else await api('POST','/api/apps',body);
     closeModal(); toast('已保存'); apps();
@@ -620,7 +625,14 @@ function evBody(e){
       return `<span class="etype asst">模型${p.fallback?'（轮数用尽兜底）':''}</span><span class="muted">${calls?'调用工具：'+calls:'给出答复'}${u}</span>`
         +(p.content?`<div class="txt">${esc(p.content)}</div>`:'')+raw; }
     case 'tool/call': return `<span class="etype tool">调用</span><b class="mono">${esc(e.tool)}</b>${p.parse_error?' <span style="color:var(--err)">参数解析失败</span>':''}<pre>${esc(JSON.stringify(p.args??p.raw_args,null,2))}</pre>`;
+    case 'approval/asked': return `<span class="etype" style="background:#fff7e6;color:#ad6800">待审批</span>已在群里发审批卡片，等待审批人（${(p.approvers||[]).length} 人）处理，最长 ${Math.round((p.timeout_s||0)/60)} 分钟`;
+    case 'approval/decided': {
+      const t={'allowed-once':['已批准','ok'],rejected:['被拒绝','err'],expired:['超时','err'],cancelled:['已取消','err'],unavailable:['不可用','err']}[p.outcome]||[p.outcome,'err'];
+      return `<span class="etype" style="background:#fff7e6;color:#ad6800">审批</span><span style="color:var(--${t[1]})">${t[0]}</span>`
+        +(p.decider_open_id?`<span class="muted"> · 审批人 <span class="mono">${esc(p.decider_open_id)}</span></span>`:'')
+        +(p.note?`<div class="txt muted">${esc(p.note)}</div>`:''); }
     case 'tool/decision': {
+      if(p.decision==='ask') return `<span class="etype" style="background:#fff7e6;color:#ad6800">需审批</span><span class="muted">${esc(p.reason||'')}</span>`;
       if(p.decision==='allow') return `<span class="etype">放行</span><span class="muted">策略「${esc(presetName({preset:p.preset}))}」${p.rule?'第 '+p.rule+' 条规则':''}允许</span>`;
       const by = p.by==='guard' ? '安全检查 '+esc(p.guard) : '策略「'+esc(presetName({preset:p.preset}))+'」';
       return `<span class="etype" style="background:#fff1f0;color:var(--err)">拒绝</span><b>${by}</b><div class="txt" style="color:var(--err)">${esc(p.reason)}</div>`; }
