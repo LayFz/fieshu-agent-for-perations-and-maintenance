@@ -333,7 +333,7 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                 call.extra["action_key"] = f"{state['step']}:{t['id']}"
                 call.extra["prepare"] = lambda a, _n=name: authorization.prepare(_n, a, ctx)
                 call.extra["validate"] = lambda a, _n=name: authorization.validate(_n, a, ctx)
-                call.extra["sandboxed"] = name in ("code_test", "sandbox_run")
+                call.extra["sandboxed"] = name in ("code_test", "sandbox_run") or name.startswith("box_")
                 call.extra["preview"] = (lambda a, _n=name: approval_preview(_n, a, ctx))
                 content_str = pipeline.run_tool(rec, call, app.get("policy"), executor, app=app)
                 msgs.append({"role": "tool", "tool_call_id": t["id"], "content": content_str})

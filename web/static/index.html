@@ -572,8 +572,40 @@ async function connectionsPage(){
       <div class="hint">读网页走代理时由代理远端解析域名，无法把连接固定到已校验的 IP：本地仍拦内网主机名、内网 IP 与本地解析到内网的域名，其余须由代理自己拒绝内网网段（如 squid ACL 禁止 RFC1918、169.254.0.0/16）。</div>
       <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-w-fake" ${w.allow_fake_ip?'checked':''}>允许代理 fake-IP（198.18.0.0/15）——仅开发机开 TUN 代理时使用，生产勿开</label>
       <div class="hint">读网页只允许公网地址：内网/回环/元数据地址、内网域名、带账号密码的网址都会被拒，每一跳重定向都重新校验。网页内容视为外部文本，读过的任务不能再直接写生产或执行命令。</div>
-      <div class="save-bar"><button class="btn" onclick="saveWeb()">保存</button><button class="btn ghost" onclick="testConn('web')">测试搜索</button><span id="cn-w-res" class="muted"></span></div></div>`;
+      <div class="save-bar"><button class="btn" onclick="saveWeb()">保存</button><button class="btn ghost" onclick="testConn('web')">测试搜索</button><span id="cn-w-res" class="muted"></span></div></div>
+    <div class="card" id="cn-box"></div>`;
+  renderBox();
 }
+async function renderBox(){
+  const el=$('#cn-box'); if(!el) return;
+  let d; try{ d=await api('GET','/api/box'); }catch(e){ el.innerHTML='<div class="muted">工作机信息加载失败：'+esc(e.message)+'</div>'; return; }
+  const rows=d.runners.map(r=>`<tr><td><b>${esc(r.name)}</b></td>
+      <td><span class="chip"><span class="dot ${r.online?'g':'r'}"></span>${r.online?'在线':'离线'}</span></td>
+      <td class="muted">${r.last_seen?dt(r.last_seen):'从未连接'}</td>
+      <td class="muted">${esc((r.info&&r.info.version)||'')}</td>
+      <td style="white-space:nowrap"><button class="btn ghost sm" onclick="newRunner('${esc(r.name)}')">轮换令牌</button>
+        <button class="btn danger" onclick="delRunner('${esc(r.name)}')">移除</button></td></tr>`).join('');
+  el.innerHTML=`<div class="card-title">工作机 <span class="muted">box_shell / box_files / box_browser / box_desktop；应用还需在资源权限里授予 box</span></div>
+    ${d.runners.length?`<table><thead><tr><th>名称</th><th>状态</th><th>最近心跳</th><th>版本</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+      :'<div class="empty" style="padding:16px">还没有工作机。新建后把令牌配给工作机上的 runner（环境变量 HARNESS_RUNNER_TOKEN）。</div>'}
+    <div class="row" style="margin-top:10px"><div style="flex:0 0 220px"><label>新工作机名称</label><input id="bx-name" placeholder="default"></div>
+      <div><label>工作机画面地址（noVNC，遇到人机验证时发给用户）</label><input id="bx-vnc" value="${esc(d.novnc_url)}" placeholder="https://box.internal/vnc.html"></div></div>
+    <div class="hint">runner 主动连接本服务拉取操作，工作机不需要开放入站端口。工作机上不要放任何公司凭据，也不要让它访问内网。</div>
+    <div class="save-bar"><button class="btn" onclick="newRunner()">新建 / 轮换</button><button class="btn ghost" onclick="saveBoxVnc()">保存画面地址</button></div>`;
+}
+async function newRunner(name){
+  name=name||$('#bx-name').value.trim()||'default';
+  if(!confirm('为工作机「'+name+'」生成令牌？同名已存在时旧令牌立即失效。')) return;
+  try{ const r=await api('POST','/api/box/runners',{name});
+    openModal(`<h3>工作机令牌</h3><p class="desc">${esc(r.note)}</p><label>名称</label><pre class="box">${esc(r.name)}</pre>
+      <label>令牌（只显示这一次）</label><pre class="box">${esc(r.token)}</pre>
+      <div class="hint">工作机上设置 HARNESS_URL=本服务地址、HARNESS_RUNNER_TOKEN=上面的令牌，启动 runner。</div>
+      <div class="save-bar"><button class="btn ghost" onclick="closeModal();renderBox()">我已保存</button></div>`);
+  }catch(e){ toast(e.message); }
+}
+async function delRunner(name){ if(!confirm('移除工作机「'+name+'」？它的令牌立即失效，进行中的操作会失败。')) return;
+  await api('DELETE','/api/box/runners/'+encodeURIComponent(name)); toast('已移除'); renderBox(); }
+async function saveBoxVnc(){ try{ await api('PUT','/api/box/settings',{novnc_url:$('#bx-vnc').value.trim()}); toast('已保存'); }catch(e){ toast(e.message); } }
 async function saveWeb(){
   const body={provider:$('#cn-w-prov').value, searxng_url:$('#cn-w-sx').value.trim(), proxy:$('#cn-w-proxy').value.trim(),
     proxy_search:$('#cn-w-psearch').checked, proxy_fetch:$('#cn-w-pfetch').checked, allow_fake_ip:$('#cn-w-fake').checked};
@@ -746,7 +778,7 @@ function _appForm(a){
     <div class="hint">open_id 可在「运行记录」里点开某次 run，看「触发人」。执行类操作不能由发起人自己批准。</div>
     <label>资源权限（JSON；未列出的资源默认禁止访问）</label>
     <textarea id="ap-resources" class="mono" style="min-height:150px">${esc(JSON.stringify(a.resources||{},null,2))}</textarea>
-    <div class="hint">例：{"k8s_clusters":["主集群"],"namespaces":["upmore-api"],"repos":["gitops"],"log_orgs":["default"],"log_streams":["k8s_upmore_api"],"web_domains":["*"],"sandbox":["research"]}。web_domains 控制联网搜索/读网页/沙箱下载的网站（web_search 需 ["*"]），sandbox:["research"] 允许离线研究沙箱。完整访问须显式填写 ["*"]。可选 users/chats 限制发起人和群。生产连接仍应使用最小权限账号。</div>
+    <div class="hint">例：{"k8s_clusters":["主集群"],"namespaces":["upmore-api"],"repos":["gitops"],"log_orgs":["default"],"log_streams":["k8s_upmore_api"],"web_domains":["*"],"sandbox":["research"],"box":["default"]}。web_domains 控制联网搜索/读网页/沙箱下载的网站（web_search 需 ["*"]），sandbox:["research"] 允许离线研究沙箱，box:["default"] 允许使用名为 default 的工作机。完整访问须显式填写 ["*"]。可选 users/chats 限制发起人和群。生产连接仍应使用最小权限账号。</div>
     <label>可用工具（只勾该应用该有的——能力隔离）</label>
     <div class="toolpick">${tools||'<span class="muted">工具池为空</span>'}</div>
     <label>可用技能（知识/工作方法包——只勾该应用该懂的）</label>

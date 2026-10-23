@@ -97,6 +97,10 @@ def prepare(name, args, ctx):
         allowed = (app.get("resources") or {}).get("web_domains") or []
         if not (isinstance(allowed, list) and web.domain_allowed(allowed, host)):
             raise PermissionError(f"应用未获授权访问网站 {host}，请在应用资源权限 web_domains 中配置")
+    elif name.startswith("box_"):
+        # 工作机按名称授权；固定名称后审批/恢复都指向同一台
+        args["box"] = args.get("box") or "default"
+        access.require(app, "box", args["box"])
     elif name == "sandbox_run":
         access.require(app, "sandbox", "research")
         allowed = (app.get("resources") or {}).get("web_domains") or []

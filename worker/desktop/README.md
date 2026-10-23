@@ -1,6 +1,6 @@
 # 工作机桌面原型
 
-把一台带桌面的机器以结构化工具暴露给 agent：命令行、文件、有头真实浏览器、桌面图形程序，并能用 noVNC 实时观看和接管。设计背景见 [worker-agent-design](../../docs/worker-agent-design.md)。**本目录只是本机验证用的原型**，还没有接入 harness 的任务协议。
+把一台带桌面的机器以结构化工具暴露给 agent：命令行、文件、有头真实浏览器、桌面图形程序，并能用 noVNC 实时观看和接管。设计背景见 [worker-agent-design](../../docs/worker-agent-design.md)。**本目录是本机验证用的原型**；已能经拉取协议接入 harness（见下文「接入 harness」），尚未部署到独立工作机。
 
 ## 组成
 
@@ -49,9 +49,23 @@ RUNNER_URL=http://127.0.0.1:18790 RUNNER_TOKEN=<同上> python worker/desktop/ve
 4. **容器里的 Chromium 关闭了自身沙箱**：Docker 默认 seccomp 不允许非特权用户命名空间，Playwright 以 `--no-sandbox` 启动 Chromium，网页漏洞会直接落到容器里。正式工作机要么给容器配允许 userns 的 seccomp 配置让 Chromium 沙箱生效，要么用 gVisor，且容器本身仍是边界（无凭据、不能进内网）。
 5. 浏览器顶部有「受自动化软件控制」提示条：这是 Playwright 自带 Chromium 的正常现象，不影响使用；我们不做隐藏自动化特征的处理。
 
+## 接入 harness
+
+```text
+agent 工具 box_shell / box_files / box_browser / box_desktop
+   → harness.box.call() 入队（core/boxstore.py：box_ops 表）并等待
+   → 工作机 runner 长轮询 POST /runner/v1/claim（runner 令牌，最长 25s）领取
+   → 本地执行 → POST /runner/v1/ops/{id} 回传 → 唤醒等待者
+```
+
+- 后台「连接凭证 → 工作机」新建 runner 得到令牌（只显示一次）；工作机设置 `HARNESS_URL`、`HARNESS_RUNNER_TOKEN` 后启动即可，**不需要入站端口**。
+- 应用需要资源权限 `"box": ["default"]` 并勾选 `box_*` 工具；工具为 local + external，审批预设下直接放行，读过外部内容后仍可用（工作机就是隔离边界）。
+- 工作机离线时工具立即报错；任务取消会放弃等待；只接受领取该操作的 runner 回传结果。
+- `e2e_harness.py`：临时 harness + 容器经队列跑 11 个操作（克隆、读文件、GitHub 搜索输入点击、cve.org 正文与接口、桌面启动程序、无障碍树定位输入保存），本机实测全部成功，共 21.5s，队列往返开销约 20ms。
+
 ## 下一步
 
-1. runner 改为主动连控制面拉任务（设计稿 §4），harness 增加 `box_shell / box_browser / box_desktop` 工具。
+1. ~~runner 改为主动连控制面拉任务，harness 增加 box 工具~~（已完成，见上）。
 2. 接一个真实模型，用同样的任务看实际步数和成功率（需要使用模型额度，单独确认）。
 3. 人机验证 → 飞书卡片 → noVNC 接管 → 继续任务的完整链路。
 4. 正式工作机：独立机器、Chromium 沙箱或 gVisor、出境代理白名单、noVNC 加鉴权经后台反代。

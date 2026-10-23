@@ -19,6 +19,8 @@ from feishu import auth, bot
 from harness import policy, tasks, access, workflows
 from harness import skills as skills_sync
 from harness import workspace, webhooks
+from harness import box as box_ops
+from core import boxstore
 from ops import argocd as ops_argocd
 from ops import gitlab as ops_gitlab
 from ops import web as ops_web
@@ -225,6 +227,83 @@ async def webhook_receive(hook_id: str, request: Request):
     body = await request.body()
     status, payload = webhooks.receive(hook_id, dict(request.headers), body)
     return JSONResponse(payload, status_code=status)
+
+# ---------- 工作机 runner 接口（只认 runner 令牌，不需要后台登录） ----------
+_RUNNER_POLL = 25
+
+
+def _runner(request):
+    auth = request.headers.get("authorization", "")
+    name = boxstore.authenticate(auth[7:].strip() if auth.lower().startswith("bearer ") else "")
+    if not name:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return name
+
+
+@app.post("/runner/v1/claim")
+def runner_claim(request: Request, body: dict = None):
+    """长轮询：有操作立即返回，没有就最多等 25s 后 204。顺带记录心跳与 runner 能力。"""
+    name = _runner(request)
+    boxstore.touch(name, (body or {}).get("info") if isinstance(body, dict) else None)
+    deadline = time.monotonic() + _RUNNER_POLL
+    while True:
+        op = boxstore.claim(name)
+        if op:
+            return op
+        left = deadline - time.monotonic()
+        if left <= 0:
+            boxstore.touch(name)
+            return Response(status_code=204)
+        box_ops.wait(min(left, 1.0))
+
+
+@app.post("/runner/v1/ops/{op_id}")
+async def runner_result(op_id: str, request: Request):
+    name = _runner(request)
+    body = await _body(request)
+    ok = boxstore.complete(op_id, name, bool(body.get("ok")), body.get("result") if isinstance(body.get("result"), dict)
+                           else {"error": "runner 返回格式不正确"})
+    box_ops.notify()
+    if not ok:
+        raise HTTPException(status_code=409, detail="操作不存在、已超时或不属于该 runner")
+    return {"ok": True}
+
+
+@app.get("/api/box")
+def box_status(request: Request):
+    _auth(request)
+    return {"runners": boxstore.list_runners(), "novnc_url": store.get_setting("box_novnc_url") or ""}
+
+
+@app.post("/api/box/runners")
+async def box_create(request: Request):
+    _auth(request)
+    b = await _body(request)
+    name = (b.get("name") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
+        raise HTTPException(status_code=400, detail="名称只能用字母、数字、- 和 _（最多 40 个）")
+    token = boxstore.create_runner(name)
+    return {"name": name, "token": token, "note": "令牌只显示这一次；同名再次创建会轮换令牌。"}
+
+
+@app.delete("/api/box/runners/{name}")
+def box_delete(name: str, request: Request):
+    _auth(request)
+    boxstore.delete_runner(name)
+    box_ops.notify()
+    return {"ok": True}
+
+
+@app.put("/api/box/settings")
+async def box_settings(request: Request):
+    _auth(request)
+    b = await _body(request)
+    url = (b.get("novnc_url") or "").strip()
+    if url and not url.startswith(("https://", "http://")):
+        raise HTTPException(status_code=400, detail="地址需为 http(s):// 开头")
+    store.set_setting("box_novnc_url", url)
+    return {"ok": True}
+
 
 def _hook_view(h, request=None):
     v = {k: h.get(k) for k in ("id", "name", "app_id", "chat_id", "workflow", "template", "enabled", "max_per_hour",

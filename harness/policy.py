@@ -170,7 +170,7 @@ def _guard_untrusted(call):
         return None
     if call.risk == "local" and call.tool.startswith("code_"):
         return None
-    if call.tool in ("code_test", "sandbox_run") and call.extra.get("sandboxed"):
+    if (call.tool in ("code_test", "sandbox_run") or call.tool.startswith("box_")) and call.extra.get("sandboxed"):
         return None       # 无网络、无凭据的一次性容器
     if call.tool == "code_propose_mr":
         return None       # pipeline 强制审批，快照由执行器复核

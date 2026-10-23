@@ -43,6 +43,8 @@ harness/pipeline.py（准备/冻结 → 策略/guard → 持久审批 → 执行
 | `llm/tools.py` / `mcp.py` | 原生工具及元数据 / 同步远程 HTTP MCP |
 | `ops/web.py` / `ops/research.py` | 联网搜索与 SSRF 防护抓取（可选内网出境代理）/ 离线 Docker 研究沙箱 |
 | `harness/webhooks.py` | 外部系统 `POST /hooks/{id}` 触发任务：令牌哈希、去重、限流、模板渲染、污染 |
+| `core/boxstore.py` / `harness/box.py` | 工作机操作队列与 runner 登记 / 工具侧入队并等待结果；runner 经 `/runner/v1/*` 长轮询领取 |
+| `worker/desktop/` | 工作机原型镜像：runner（shell/files/有头浏览器/桌面 AT-SPI）、noVNC、主动连 harness 的拉取循环 |
 | `feishu/` / `obs/` / `ops/` | 飞书入口、文档 / 只读监控 / SSH 与 K8s 连接 |
 | `sched/runner.py` | 到期计划原子入队并推进 next_run，避免同次定时重复入队 |
 | `web/` / `app/main.py` | 管理后台与 API / 启动迁移、worker、飞书连接、调度与 HTTP |
@@ -77,6 +79,8 @@ harness/pipeline.py（准备/冻结 → 策略/guard → 持久审批 → 执行
 - `web_search` 要求 `web_domains:["*"]`；`web_fetch` 与沙箱下载每一跳都校验 `web_domains`。抓取不读 `HTTP(S)_PROXY`，只认后台 `web_proxy`；走代理时无法固定 IP，代理必须自己拒绝内网网段。fake-IP（198.18/15）放行仅限开发机显式开启。
 - `sandbox_run` 是 local + external：离线容器跑分析脚本，联网资源由控制面先下载；需要 `sandbox:["research"]` 与 `HARNESS_SANDBOX_IMAGE`（镜像须含 python3 等分析工具）。
 - Webhook 任务 trigger=webhook，从第一步即污染；令牌只显示一次，库里存 SHA-256。
+- `box_*` 工具（local + external）在工作机上执行：需要 `box:["<名称>"]` 资源；runner 令牌只存 SHA-256，只能调 `/runner/v1/*`；结果只接受领取它的 runner 回传。工作机上不放公司凭据、不能进内网——这是 box 工具不需审批的前提，部署时必须保证。
+- `index.html` 每次请求现读磁盘，后端只在启动时加载：改了后端要重启服务；`/api/me` 的 `stale` 会让前端提示。
 
 ## 代码工作区与沙箱
 

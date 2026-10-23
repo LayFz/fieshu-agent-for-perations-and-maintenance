@@ -349,3 +349,77 @@ async def desktop_launch(body: dict):
     await asyncio.create_subprocess_exec("bash", "-lc", f"nohup {cmd} >/tmp/launch.log 2>&1 &", cwd=str(WORK))
     await asyncio.sleep(float(body.get("wait") or 2))
     return {"launched": cmd}
+
+
+# ---------- 主动连 harness 拉操作（正式工作机只用这条路，不开入站端口） ----------
+HARNESS_URL = os.environ.get("HARNESS_URL", "").rstrip("/")
+HARNESS_TOKEN = os.environ.get("HARNESS_RUNNER_TOKEN", "")
+
+
+def _post(path, payload, timeout):
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(HARNESS_URL + path, data=json.dumps(payload).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {HARNESS_TOKEN}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read()
+            return r.status, (json.loads(body) if body else None)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+
+async def _dispatch(op, a):
+    if op == "shell":
+        return await shell(a)
+    if op == "files.read":
+        return await read_file(a.get("path") or ".", int(a.get("start") or 1), int(a.get("end") or 400))
+    if op == "files.write":
+        return await write_file(a)
+    if op == "browser.open":
+        return await browser_open(a)
+    if op == "browser.act":
+        return await browser_act(a)
+    if op == "browser.network":
+        return await browser_network(a)
+    if op == "desktop.tree":
+        return await desktop_tree(a.get("app_name") or "", int(a.get("depth") or 25))
+    if op == "desktop.act":
+        return await desktop_act(a)
+    if op == "desktop.launch":
+        return await desktop_launch(a)
+    raise HTTPException(400, f"未知操作 {op}")
+
+
+async def _pull_loop():
+    info = {"ops": ["shell", "files", "browser", "desktop"], "version": "desktop-proto-1"}
+    backoff = 1
+    while True:
+        try:
+            status, op = await asyncio.to_thread(_post, "/runner/v1/claim", {"info": info}, 40)
+            if status == 204:
+                backoff = 1
+                continue
+            if status != 200 or not op:
+                raise RuntimeError(f"claim HTTP {status}")
+            backoff = 1
+            try:
+                result = await asyncio.wait_for(_dispatch(op["op"], op.get("args") or {}), op.get("timeout") or 120)
+                ok = True
+            except HTTPException as e:
+                result, ok = {"error": str(e.detail)}, False
+            except asyncio.TimeoutError:
+                result, ok = {"error": "工作机执行超时"}, False
+            except Exception as e:
+                result, ok = {"error": f"{type(e).__name__}: {str(e)[:300]}"}, False
+            await asyncio.to_thread(_post, f"/runner/v1/ops/{op['id']}", {"ok": ok, "result": result}, 30)
+        except Exception as e:
+            print(f"[runner] 连接 harness 失败：{e}；{backoff}s 后重试", flush=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
+@app.on_event("startup")
+async def _start_pull():
+    if HARNESS_URL and HARNESS_TOKEN:
+        asyncio.create_task(_pull_loop())
