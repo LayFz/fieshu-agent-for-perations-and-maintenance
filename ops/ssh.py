@@ -16,6 +16,7 @@ import re
 import paramiko
 
 from core import store
+from harness import policy
 
 # 硬兜底黑名单：只列「不可逆/毁灭级」正则。正常运维命令（重启服务、起网卡、看日志）不在此列——那交给模型判断。
 _DEFAULT_BLACKLIST = [
@@ -83,6 +84,15 @@ def _blocked(command):
     return None
 
 
+def precheck(command):
+    """执行前闸门：硬黑名单。返回拒绝理由或 None。run() 兜底调一遍，harness 的 guard 也调它。"""
+    bad = _blocked(str(command or "").strip())
+    if bad:
+        return (f"命令被安全黑名单拦截（这是不可逆/毁灭级操作，已拒绝执行）。"
+                f"若确属必要，请人工在服务器上操作，别让机器人来。pattern={bad}")
+    return None
+
+
 def list_hosts():
     """列出受管主机（不含密码）。connect=实际连接地址；aliases=用户可用来指代它的别名/其它地址。"""
     out = []
@@ -108,10 +118,9 @@ def run(target, command, timeout=30):
                          f"「SSH 运维」页配过的主机才能连）。当前可用：{avail or '（一台都还没配）'}。"
                          f"若这台机确实该管，请去后台添加它、或把「{target}」加进对应主机的别名后再试。",
                 "hint_for_user": "去后台「SSH 运维」页添加该主机或补充其别名"}
-    bad = _blocked(command)
-    if bad:
-        return {"error": f"命令被安全黑名单拦截（这是不可逆/毁灭级操作，已拒绝执行）。"
-                         f"若确属必要，请人工在服务器上操作，别让机器人来。pattern={bad}"}
+    reason = precheck(command)       # 管道里的 guard 已先拦过一次，这里是兜底
+    if reason:
+        return {"error": reason}
     try:
         timeout = max(1, min(int(timeout or 30), 300))
     except Exception:
@@ -152,3 +161,11 @@ def run(target, command, timeout=30):
         return {"error": f"在 {h.get('name')} 执行失败：{e}"}
     finally:
         cli.close()
+
+
+def _guard(call):
+    if call.tool == "ssh_exec":
+        return precheck(call.args.get("command"))
+
+
+policy.register_guard("ssh_blacklist", _guard)

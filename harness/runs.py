@@ -20,7 +20,7 @@ TRIGGERS = ("chat", "proactive", "schedule", "job", "webhook", "delegate")
 STATUSES = ("running", "completed", "silent", "max-steps", "error", "aborted")
 EVENT_TYPES = (
     "run/start", "user/message", "assistant/message",
-    "tool/call", "tool/result", "run/end",
+    "tool/call", "tool/decision", "tool/result", "run/end",
 )
 
 _RETENTION_DAYS = 90

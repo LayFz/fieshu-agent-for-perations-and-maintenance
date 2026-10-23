@@ -3,18 +3,18 @@
 每条消息按 app 取：它绑定的 AI 供应商(模型) + 勾选的工具子集 + 人设。
 记忆/用量按 app 隔离；飞书取数用该 app 的凭证（contextvar）。
 每次调用都是一个 run（harness.runs），模型回复与工具调用逐条写进事件日志供审计。
+工具调用一律走 harness.pipeline.run_tool()：记录 → 策略 → guard → 执行 → 后处理。
 """
 import hashlib
 import json
-import time
 
 from openai import OpenAI
 
 from core import store
 from feishu import auth
-from harness import runs
+from harness import pipeline, policy, runs
 from . import mcp as mcp_mod
-from .tools import tools_for, execute, SKILL_TOOL
+from .tools import tools_for, execute, meta_for, MCP_META, SKILL_TOOL
 
 _MAX_TOOL_LOOPS = 40
 
@@ -145,9 +145,6 @@ def _tool_label(name, args_json):
     return name
 
 
-_RESULT_PREVIEW = 4000      # 事件里保留的工具结果预览长度（完整结果外存留待 P3）
-
-
 def _usage_dict(u):
     if not u:
         return None
@@ -202,6 +199,7 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
         tools_schema = tools_schema + [SKILL_TOOL]
     mcp_schema, mcp_routes = mcp_mod.tools_for_app(app)  # 应用勾选的 MCP server 暴露的工具
     tools_schema = tools_schema + mcp_schema
+    exposed = {t["function"]["name"] for t in tools_schema}   # 模型说出清单外的工具名会被 guard 拦下
     turns = int(app.get("history_turns") or 12)
 
     system = _system(app, skills)
@@ -220,6 +218,7 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                            "tools": [t["function"]["name"] for t in tools_schema],
                            "skills": [s["name"] for s in skills],
                            "history_msgs": len(msgs) - 2, "proactive": bool(proactive),
+                           "policy": policy.normalize(app.get("policy")),
                            "system_sha": hashlib.sha256(system.encode()).hexdigest()[:12]})
     rec.emit("user/message", {"content": turn})
 
@@ -254,26 +253,23 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                 except Exception:
                     pass
             for t in tool_calls:
+                name = t["name"]
+                raw = None
                 try:
                     args = json.loads(t["args"] or "{}")
-                    call_payload = {"args": args}
+                    if not isinstance(args, dict):
+                        raise ValueError("参数不是对象")
                 except Exception:
-                    args = {}
-                    call_payload = {"args": {}, "raw_args": t["args"], "parse_error": True}
-                rec.emit("tool/call", call_payload, call_id=t["id"], tool=t["name"])   # 先落库再执行
-                t0 = time.time()
-                if t["name"] in mcp_routes:             # MCP 工具走 MCP 客户端
-                    result = mcp_mod.call(mcp_routes[t["name"]], args)
+                    args, raw = {}, t["args"]
+                if name in mcp_routes:                  # MCP 工具走 MCP 客户端
+                    meta = dict(MCP_META)
+                    executor = (lambda a, _r=mcp_routes[name]: mcp_mod.call(_r, a))
                 else:
-                    result = execute(t["name"], args, ctx)
-                content_str = json.dumps(result, ensure_ascii=False)
-                rec.emit("tool/result", {
-                    "status": "error" if isinstance(result, dict) and "error" in result else "ok",
-                    "duration_ms": int((time.time() - t0) * 1000),
-                    "chars": len(content_str),
-                    "result": content_str[:_RESULT_PREVIEW],
-                    "truncated": len(content_str) > _RESULT_PREVIEW,
-                }, call_id=t["id"], tool=t["name"])
+                    meta = meta_for(name, args)
+                    executor = (lambda a, _n=name: execute(_n, a, ctx))
+                call = pipeline.ToolCall(id=t["id"], tool=name, args=args, raw_args=raw,
+                                         exposed=name in exposed, trigger=rec.trigger, app_id=aid, **meta)
+                content_str = pipeline.run_tool(rec, call, app.get("policy"), executor)
                 msgs.append({"role": "tool", "tool_call_id": t["id"], "content": content_str})
     finally:
         auth.reset_ctx(ctok)

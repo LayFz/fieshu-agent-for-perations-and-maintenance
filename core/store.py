@@ -102,6 +102,7 @@ _ensure_col("token_usage", "app_id", "INTEGER")
 _ensure_col("apps", "skills", "TEXT DEFAULT '[]'")
 _ensure_col("apps", "mcp", "TEXT DEFAULT '[]'")     # 应用勾选的 MCP server id 名单
 _ensure_col("apps", "thinking", "INTEGER DEFAULT 1")  # 是否开启模型「思考(reasoning)」模式，默认开
+_ensure_col("apps", "policy", "TEXT DEFAULT '{}'")    # 工具调用策略（harness.policy），空=默认「兼容」预设
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_msgs_app ON msgs(app_id, chat_id, id)")
 _conn.commit()
 
@@ -206,6 +207,10 @@ def _app_row(r):
             d[col] = json.loads(d.get(col) or "[]")
         except Exception:
             d[col] = []
+    try:
+        d["policy"] = json.loads(d.get("policy") or "{}")
+    except Exception:
+        d["policy"] = {}
     d["enabled"] = bool(d.get("enabled"))
     d["thinking"] = bool(d.get("thinking", 1))
     return d
@@ -248,6 +253,8 @@ def update_app(aid, **f):
         sets.append("skills=?"); vals.append(json.dumps(f["skills"], ensure_ascii=False))
     if "mcp" in f and f["mcp"] is not None:
         sets.append("mcp=?"); vals.append(json.dumps(f["mcp"], ensure_ascii=False))
+    if "policy" in f and f["policy"] is not None:
+        sets.append("policy=?"); vals.append(json.dumps(f["policy"], ensure_ascii=False))
     if f.get("feishu_app_secret"):              # 仅非空才更新 secret
         sets.append("feishu_app_secret=?"); vals.append(f["feishu_app_secret"])
     if not sets:

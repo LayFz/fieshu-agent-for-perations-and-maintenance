@@ -212,6 +212,48 @@ TOOLS = [
 
 _BY_NAME = {t["function"]["name"]: t for t in TOOLS}
 
+# 工具元数据：只给宿主（harness 管道）看，绝不发给模型。
+#   risk     read / write / exec，或按参数判断的函数（kubectl 看动词）
+#   external 结果是否含外部不可信文本（污染标记 P4 用；当前内置工具都是内部数据）
+#   timeout  管道统一超时（秒）；ssh/kubectl 自身上限 300s，这里留余量
+# 加新工具必须在这里登记；漏登记的按 exec（最高风险）处理。
+_META = {
+    "list_knowledge_bases": {"risk": "read"},
+    "list_nodes": {"risk": "read"},
+    "read_doc": {"risk": "read"},
+    "rewrite_doc": {"risk": "write"},
+    "create_node": {"risk": "write"},
+    "remember": {"risk": "write"},
+    "list_log_streams": {"risk": "read"},
+    "query_logs": {"risk": "read"},
+    "server_stats": {"risk": "read"},
+    "docker_containers": {"risk": "read"},
+    "list_chat_members": {"risk": "read"},
+    "service_status": {"risk": "read"},
+    "list_ssh_hosts": {"risk": "read"},
+    "ssh_exec": {"risk": "exec", "timeout": 330},
+    "list_k8s_clusters": {"risk": "read"},
+    "kubectl": {"risk": lambda a: ops_k8s.risk_of(a.get("command")), "timeout": 330},
+    "schedule_task": {"risk": "write"},
+    "list_schedules": {"risk": "read"},
+    "cancel_schedule": {"risk": "write"},
+    "read_skill": {"risk": "read"},
+}
+_UNKNOWN_META = {"risk": "exec", "external": False, "timeout": 120}
+# MCP 工具来自外部 server，能力未知：按 write 处理，结果视为外部内容
+MCP_META = {"risk": "write", "external": True, "timeout": 120}
+
+
+def meta_for(name, args):
+    """某次调用的元数据：{"risk", "external", "timeout"}。"""
+    m = dict(_UNKNOWN_META, **_META.get(name, {}))
+    if callable(m["risk"]):
+        try:
+            m["risk"] = m["risk"](args or {})
+        except Exception:
+            m["risk"] = "exec"
+    return m
+
 # 技能工具：仅当应用勾了技能时由 engine 自动挂上（不在工具池里给用户单独勾）
 SKILL_TOOL = {"type": "function", "function": {
     "name": "read_skill",

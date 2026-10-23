@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse
 
 from core import store
 from feishu import auth, bot
+from harness import policy
 from llm import mcp as mcp_mod
 from llm.tools import all_tools, tool_list_for
 
@@ -171,7 +172,7 @@ def remove_provider(pid: int, request: Request):
 @app.get("/api/tools/pool")
 def tools_pool(request: Request):
     _auth(request)
-    return {"tools": all_tools()}
+    return {"tools": all_tools(), "policy_presets": policy.presets_public()}
 
 
 # ---------- MCP server（全局注册表；应用按 server 整体勾选后其工具进工具循环） ----------
@@ -345,9 +346,27 @@ def _app_view(a):
         "skills": a.get("skills") or [],
         "mcp": a.get("mcp") or [],
         "thinking": bool(a.get("thinking", True)),
+        "policy": policy.normalize(a.get("policy")),
         "enabled": a["enabled"],
         "running": bot.is_running(a["id"]),
     }
+
+def _policy_from(b):
+    """从请求体取工具调用策略并校验；没传返回 None（不改）。"""
+    if "policy" not in b:
+        return None
+    p = b.get("policy") or {}
+    if not isinstance(p, dict):
+        raise HTTPException(status_code=400, detail="策略格式不对")
+    preset = p.get("preset") or policy.DEFAULT_PRESET
+    if preset == policy.CUSTOM:
+        try:
+            return {"preset": policy.CUSTOM, "rules": policy.validate_rules(p.get("rules"))}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"自定义规则有误：{e}")
+    if preset not in policy.PRESETS:
+        raise HTTPException(status_code=400, detail=f"未知的策略预设：{preset}")
+    return {"preset": preset}
 
 @app.get("/api/apps")
 def apps(request: Request):
@@ -375,6 +394,7 @@ async def create_app(request: Request):
     name = (b.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="请填应用名称")
+    pol = _policy_from(b)
     aid = store.create_app(
         name, (b.get("feishu_app_id") or "").strip(), (b.get("feishu_app_secret") or "").strip(),
         b.get("ai_provider_id"), b.get("system_prompt") or "",
@@ -383,6 +403,8 @@ async def create_app(request: Request):
         mcp=b.get("mcp") or [])
     if "thinking" in b:
         store.update_app(aid, thinking=1 if b["thinking"] else 0)
+    if pol is not None:
+        store.update_app(aid, policy=pol)
     return {"ok": True, "id": aid, "note": "新应用的飞书长连接需重启服务后建立"}
 
 @app.put("/api/apps/{aid}")
@@ -397,6 +419,9 @@ async def edit_app(aid: int, request: Request):
         fields["thinking"] = 1 if fields["thinking"] else 0
     if b.get("feishu_app_secret"):
         fields["feishu_app_secret"] = b["feishu_app_secret"].strip()
+    pol = _policy_from(b)
+    if pol is not None:
+        fields["policy"] = pol
     store.update_app(aid, **fields)
     auth.reset(aid)   # 该应用飞书凭证若变更，取数立即用新值；长连接仍需重启
     return {"ok": True, "note": "人设/工具/AI 即时生效；飞书凭证或启用状态变更需重启服务重连"}

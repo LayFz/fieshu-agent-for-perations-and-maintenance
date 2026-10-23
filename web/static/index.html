@@ -208,13 +208,15 @@ async function overview(){
 }
 
 /* ---------- 应用 ---------- */
-let _provCache=[], _toolPool=[], _skillPool=[], _mcpPool=[];
+let _provCache=[], _toolPool=[], _skillPool=[], _mcpPool=[], _presetPool=[];
+const presetName = p => { const k=(p&&p.preset)||'compat'; if(k==='custom') return '自定义';
+  return (_presetPool.find(x=>x.key===k)||{}).name || ({compat:'兼容',readonly:'只读'})[k] || k; };
 async function apps(){
   const c=$('#content'); c.innerHTML='<h2>应用</h2><p class="desc">加载中…</p>';
-  const [{apps},{providers},{tools},sk,mc] = await Promise.all([
+  const [{apps},{providers},{tools,policy_presets},sk,mc] = await Promise.all([
     api('GET','/api/apps'), api('GET','/api/providers'), api('GET','/api/tools/pool'),
     api('GET','/api/skills'), api('GET','/api/mcp')]);
-  _provCache=providers; _toolPool=tools; _skillPool=sk.skills; _mcpPool=mc.servers;
+  _provCache=providers; _toolPool=tools; _skillPool=sk.skills; _mcpPool=mc.servers; _presetPool=policy_presets||[];
   const provName=id=>{ const p=providers.find(x=>x.id===id); return p?p.name:'未绑定'; };
   const list = apps.length ? `<div class="cards">${apps.map(a=>`
       <div class="appcard">
@@ -224,6 +226,7 @@ async function apps(){
           <span class="tag">${esc(provName(a.ai_provider_id))}</span>
           <span class="chip">工具 ${a.tools.length}</span>
           <span class="chip">技能 ${a.skills.length}</span>
+          <span class="chip">策略 ${esc(presetName(a.policy))}</span>
         </div>
         <div class="meta mono">App ID: ${esc(a.feishu_app_id||'(未配)')}</div>
         <div class="acts">
@@ -251,6 +254,10 @@ function _appForm(a){
   const mcp = _mcpPool.map(s=>`<label><input type="checkbox" class="mc" value="${s.id}" ${(a.mcp||[]).includes(s.id)?'checked':''}>
       <span><span class="tn">${esc(s.name)}${s.enabled?'':'（已停用）'}</span><br><span class="td">${esc(s.url||'')}</span></span></label>`).join('');
   const sset=a.feishu_secret_set;
+  const pol=a.policy||{preset:'compat'};
+  const polOpts=_presetPool.map(p=>`<option value="${p.key}" ${pol.preset===p.key?'selected':''}>${esc(p.name)}</option>`).join('')
+    +`<option value="custom" ${pol.preset==='custom'?'selected':''}>自定义规则</option>`;
+  const polRules=JSON.stringify(pol.preset==='custom'?pol.rules:((_presetPool.find(p=>p.key===pol.preset)||_presetPool[0]||{}).rules||[]),null,2);
   return `<h3>${a.id?'编辑应用':'新建应用'}</h3>
     <p class="desc">数字员工的身份、大脑与能力。</p>
     <div class="row">
@@ -269,6 +276,15 @@ function _appForm(a){
       <div style="flex:0 0 160px"><label>思考模式(reasoning)</label><select id="ap-think"><option value="1" ${a.thinking!==false?'selected':''}>开启(默认)</option><option value="0" ${a.thinking===false?'selected':''}>关闭</option></select></div>
       <div><label>启用</label><select id="ap-enabled"><option value="1" ${a.enabled!==false?'selected':''}>启用</option><option value="0" ${a.enabled===false?'selected':''}>停用</option></select></div>
     </div>
+    <label>工具调用策略（决定勾选的工具里哪些能直接执行；黑名单、只读集群、旁听拦截等安全检查始终生效）</label>
+    <div class="row">
+      <div style="flex:0 0 200px"><select id="ap-pol" onchange="onPolChange()">${polOpts}</select></div>
+      <div class="hint" id="ap-pol-desc" style="margin-top:8px"></div>
+    </div>
+    <div id="ap-pol-custom" style="display:${pol.preset==='custom'?'block':'none'}">
+      <textarea id="ap-pol-rules" class="mono" style="min-height:120px">${esc(polRules)}</textarea>
+      <div class="hint">自上而下第一条命中的规则生效，都不命中则拒绝。字段：tool（工具名/数组/"*"）、risk（read/write/exec）、decision（allow/deny/ask；审批上线前 ask 按拒绝处理）。</div>
+    </div>
     <label>可用工具（只勾该应用该有的——能力隔离）</label>
     <div class="toolpick">${tools||'<span class="muted">工具池为空</span>'}</div>
     <label>可用技能（知识/工作方法包——只勾该应用该懂的）</label>
@@ -278,8 +294,13 @@ function _appForm(a){
     <div class="save-bar"><button class="btn" onclick="saveApp(${a.id||0})">保存</button>
       <button class="btn ghost" onclick="closeModal()">取消</button></div>`;
 }
-function newApp(){ openModal(_appForm({})); }
-async function editApp(id){ const a=await api('GET','/api/apps/'+id); openModal(_appForm(a)); }
+function onPolChange(){
+  const v=$('#ap-pol').value, p=_presetPool.find(x=>x.key===v);
+  $('#ap-pol-custom').style.display = v==='custom'?'block':'none';
+  $('#ap-pol-desc').textContent = v==='custom' ? '按下面的 JSON 规则判断。' : (p?p.description:'');
+}
+function newApp(){ openModal(_appForm({})); onPolChange(); }
+async function editApp(id){ const a=await api('GET','/api/apps/'+id); openModal(_appForm(a)); onPolChange(); }
 async function saveApp(id){
   const body={
     name:$('#ap-name').value.trim(),
@@ -295,6 +316,11 @@ async function saveApp(id){
   };
   const sec=$('#ap-fsec').value.trim(); if(sec) body.feishu_app_secret=sec;
   if(!body.name){ toast('请填应用名称'); return; }
+  const pv=$('#ap-pol').value;
+  if(pv==='custom'){
+    try{ body.policy={preset:'custom', rules:JSON.parse($('#ap-pol-rules').value)}; }
+    catch(e){ toast('自定义规则不是合法 JSON'); return; }
+  } else body.policy={preset:pv};
   try{
     if(id) await api('PUT','/api/apps/'+id,body); else await api('POST','/api/apps',body);
     closeModal(); toast('已保存'); apps();
@@ -586,7 +612,7 @@ async function renderRuns(){
 function evBody(e){
   const p=e.payload||{}; const raw=`<details><summary>原始数据</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`;
   switch(e.type){
-    case 'run/start': return `<span class="etype">开始</span>模型 ${esc(p.model)}（${esc(p.provider||'')}）· 工具 ${(p.tools||[]).length} 个 · 带入历史 ${p.history_msgs??0} 条${p.proactive?' · 旁听模式':''}${raw}`;
+    case 'run/start': return `<span class="etype">开始</span>模型 ${esc(p.model)}（${esc(p.provider||'')}）· 工具 ${(p.tools||[]).length} 个 · 带入历史 ${p.history_msgs??0} 条${p.policy?' · 策略「'+esc(presetName(p.policy))+'」':''}${p.proactive?' · 旁听模式':''}${raw}`;
     case 'user/message': return `<span class="etype">输入</span><div class="txt">${esc(p.content)}</div>`;
     case 'assistant/message': {
       const calls=(p.tool_calls||[]).map(t=>esc(t.name)).join('、');
@@ -594,8 +620,13 @@ function evBody(e){
       return `<span class="etype asst">模型${p.fallback?'（轮数用尽兜底）':''}</span><span class="muted">${calls?'调用工具：'+calls:'给出答复'}${u}</span>`
         +(p.content?`<div class="txt">${esc(p.content)}</div>`:'')+raw; }
     case 'tool/call': return `<span class="etype tool">调用</span><b class="mono">${esc(e.tool)}</b>${p.parse_error?' <span style="color:var(--err)">参数解析失败</span>':''}<pre>${esc(JSON.stringify(p.args??p.raw_args,null,2))}</pre>`;
+    case 'tool/decision': {
+      if(p.decision==='allow') return `<span class="etype">放行</span><span class="muted">策略「${esc(presetName({preset:p.preset}))}」${p.rule?'第 '+p.rule+' 条规则':''}允许</span>`;
+      const by = p.by==='guard' ? '安全检查 '+esc(p.guard) : '策略「'+esc(presetName({preset:p.preset}))+'」';
+      return `<span class="etype" style="background:#fff1f0;color:var(--err)">拒绝</span><b>${by}</b><div class="txt" style="color:var(--err)">${esc(p.reason)}</div>`; }
     case 'tool/result': return `<span class="etype tool">结果</span><b class="mono">${esc(e.tool)}</b> `
-        +`<span style="color:var(--${p.status==='error'?'err':'ok'})">${p.status==='error'?'出错':'成功'}</span>`
+        +(p.status==='denied'?'<span style="color:var(--err)">未执行（被拒绝）</span>'
+          :`<span style="color:var(--${p.status==='error'?'err':'ok'})">${p.status==='error'?'出错':'成功'}</span>`)
         +`<span class="muted"> · ${durTxt(p.duration_ms)} · ${fmt(p.chars)} 字${p.truncated?'（下面只显示前 4000 字）':''}</span>`
         +`<details><summary>结果内容</summary><pre>${esc(p.result)}</pre></details>`;
     case 'run/end': return `<span class="etype">结束</span>${runStatusChip(p.status)} <span class="muted">${durTxt(p.duration_ms)} · ${fmt(p.total_tokens)} token</span>`
