@@ -105,6 +105,31 @@ _ensure_col("apps", "thinking", "INTEGER DEFAULT 1")  # 是否开启模型「思
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_msgs_app ON msgs(app_id, chat_id, id)")
 _conn.commit()
 
+# 运行记录（harness）：一次 engine.run = 一个 run；它经历的每一步作为事件只追加写入 events
+_conn.executescript("""
+    CREATE TABLE IF NOT EXISTS runs(
+        id TEXT PRIMARY KEY,
+        app_id INTEGER, chat_id TEXT,
+        trigger TEXT,
+        speaker_open_id TEXT,
+        parent_run_id TEXT, depth INTEGER DEFAULT 0,
+        tainted INTEGER DEFAULT 0,
+        approval_policy TEXT,
+        status TEXT,
+        started REAL, ended REAL,
+        total_tokens INTEGER DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started);
+    CREATE INDEX IF NOT EXISTS idx_runs_app ON runs(app_id, started);
+    CREATE TABLE IF NOT EXISTS events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT, seq INTEGER,
+        type TEXT, call_id TEXT, tool TEXT,
+        payload TEXT,
+        ts REAL);
+    CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+""")
+_conn.commit()
+
 
 # ---------- 运行时设置(kv：引导 + 全局，如 OpenObserve 连接) ----------
 def get_setting(k, default=None):
@@ -584,6 +609,82 @@ def usage_recent(n=50, app_id=None):
     rows = _conn.execute("SELECT app_id,chat_id,model,prompt_tokens,completion_tokens,total_tokens,ts"
                          f" FROM token_usage WHERE 1=1{w} ORDER BY id DESC LIMIT ?", (*p, n)).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- 运行记录（run + 事件日志，按应用可筛） ----------
+def create_run(run_id, app_id, chat_id, trigger, speaker_open_id="", parent_run_id=None,
+               depth=0, approval_policy=None):
+    with _lock:
+        _conn.execute("INSERT INTO runs(id,app_id,chat_id,trigger,speaker_open_id,parent_run_id,depth,"
+                      "approval_policy,status,started) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (run_id, app_id, chat_id, trigger, speaker_open_id or "", parent_run_id,
+                       int(depth or 0), approval_policy, "running", time.time()))
+        _conn.commit()
+
+def end_run(run_id, status, total_tokens=0):
+    with _lock:
+        _conn.execute("UPDATE runs SET status=?, ended=?, total_tokens=? WHERE id=?",
+                      (status, time.time(), int(total_tokens or 0), run_id))
+        _conn.commit()
+
+def append_event(run_id, seq, etype, payload=None, call_id=None, tool=None):
+    with _lock:
+        _conn.execute("INSERT INTO events(run_id,seq,type,call_id,tool,payload,ts) VALUES(?,?,?,?,?,?,?)",
+                      (run_id, seq, etype, call_id, tool,
+                       json.dumps(payload if payload is not None else {}, ensure_ascii=False, default=str),
+                       time.time()))
+        _conn.commit()
+
+def _run_row(r):
+    return dict(r)
+
+def list_runs(app_id=None, trigger=None, status=None, before=None, limit=50):
+    where, args = [], []
+    if app_id is not None:
+        where.append("r.app_id=?"); args.append(app_id)
+    if trigger:
+        where.append("r.trigger=?"); args.append(trigger)
+    if status:
+        where.append("r.status=?"); args.append(status)
+    if before:
+        where.append("r.started<?"); args.append(float(before))
+    sql = ("SELECT r.*, (SELECT COUNT(*) FROM events e WHERE e.run_id=r.id AND e.type='tool/call') AS tool_calls "
+           "FROM runs r" + (" WHERE " + " AND ".join(where) if where else "") +
+           " ORDER BY r.started DESC LIMIT ?")
+    args.append(max(1, min(int(limit or 50), 200)))
+    return [_run_row(r) for r in _conn.execute(sql, args).fetchall()]
+
+def get_run(run_id):
+    r = _conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    return _run_row(r) if r else None
+
+def run_events(run_id):
+    rows = _conn.execute("SELECT seq,type,call_id,tool,payload,ts FROM events WHERE run_id=? ORDER BY seq",
+                         (run_id,)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["payload"] = json.loads(d["payload"] or "{}")
+        except Exception:
+            pass
+        out.append(d)
+    return out
+
+def abort_running_runs():
+    """启动时调用：上次进程留下的 running 一律标 aborted（进程已死，不可能还在跑）。"""
+    with _lock:
+        cur = _conn.execute("UPDATE runs SET status='aborted', ended=? WHERE status='running'", (time.time(),))
+        _conn.commit()
+        return cur.rowcount
+
+def purge_runs(before_ts):
+    """删除早于 before_ts 开始的 run 及其事件。"""
+    with _lock:
+        _conn.execute("DELETE FROM events WHERE run_id IN (SELECT id FROM runs WHERE started<?)", (before_ts,))
+        cur = _conn.execute("DELETE FROM runs WHERE started<?", (before_ts,))
+        _conn.commit()
+        return cur.rowcount
 
 
 # ---------- 计数（概览用） ----------

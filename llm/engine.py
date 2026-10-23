@@ -2,13 +2,17 @@
 
 每条消息按 app 取：它绑定的 AI 供应商(模型) + 勾选的工具子集 + 人设。
 记忆/用量按 app 隔离；飞书取数用该 app 的凭证（contextvar）。
+每次调用都是一个 run（harness.runs），模型回复与工具调用逐条写进事件日志供审计。
 """
+import hashlib
 import json
+import time
 
 from openai import OpenAI
 
 from core import store
 from feishu import auth
+from harness import runs
 from . import mcp as mcp_mod
 from .tools import tools_for, execute, SKILL_TOOL
 
@@ -141,15 +145,54 @@ def _tool_label(name, args_json):
     return name
 
 
+_RESULT_PREVIEW = 4000      # 事件里保留的工具结果预览长度（完整结果外存留待 P3）
+
+
+def _usage_dict(u):
+    if not u:
+        return None
+    return {"prompt": getattr(u, "prompt_tokens", 0) or 0,
+            "completion": getattr(u, "completion_tokens", 0) or 0,
+            "total": getattr(u, "total_tokens", 0) or 0}
+
+
+def _note_call(rec, content, tool_calls, usage, **extra):
+    """一次模型调用落事件 + 累计 run 的 token。"""
+    rec.add_tokens(getattr(usage, "total_tokens", 0) if usage else 0)
+    rec.emit("assistant/message", {"content": content or "",
+                                   "tool_calls": [{"id": t["id"], "name": t["name"], "args": t["args"]}
+                                                  for t in tool_calls],
+                                   "usage": _usage_dict(usage), **extra})
+
+
 def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
-        speaker_open_id: str = "", proactive: bool = False, on_step=None, on_delta=None):
+        speaker_open_id: str = "", proactive: bool = False, on_step=None, on_delta=None,
+        trigger: str = None):
     """app 为 store.get_app() 返回的字典（含 tools 列表、ai_provider_id 等）。
     speaker/speaker_open_id：群里这条消息的发言人姓名与 open_id（用于身份识别与 @）。
-    proactive=True：主动模式，模型可回 __SILENT__ 选择不说话，此时返回 None（不发消息）。"""
+    proactive=True：主动模式，模型可回 __SILENT__ 选择不说话，此时返回 None（不发消息）。
+    trigger：写进 runs.trigger 的触发方式；不传则按 proactive 取 chat / proactive。"""
+    trigger = trigger or ("proactive" if proactive else "chat")
+    rec = runs.start(app["id"], chat_id, trigger, speaker_open_id)
+    status, reason = "error", ""
+    try:
+        answer, status = _run(rec, app, chat_id, user_text, speaker, speaker_open_id,
+                              proactive, on_step, on_delta)
+        return answer
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        runs.end(rec, status, reason)
+
+
+def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_step, on_delta):
+    """run() 的本体。返回 (answer, status)，status 见 harness.runs.STATUSES。"""
     aid = app["id"]
     prov = store.get_provider(app["ai_provider_id"]) if app.get("ai_provider_id") else None
     if not prov or not prov.get("api_key"):
-        return "（这个应用还没绑定可用的 AI —— 请到后台「应用」里给它绑定一个已配好 API Key 的 AI 供应商。）"
+        return ("（这个应用还没绑定可用的 AI —— 请到后台「应用」里给它绑定一个已配好 API Key 的 AI 供应商。）",
+                "error")
 
     client = OpenAI(base_url=prov.get("base_url") or "https://api.openai.com/v1", api_key=prov["api_key"])
     model = prov.get("model") or "gpt-4o-mini"
@@ -173,6 +216,12 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
     msgs += store.load_history(aid, chat_id, turns)
     msgs.append({"role": "user", "content": turn})
     store.save(aid, chat_id, "user", turn)
+    rec.emit("run/start", {"provider": prov.get("name"), "model": model,
+                           "tools": [t["function"]["name"] for t in tools_schema],
+                           "skills": [s["name"] for s in skills],
+                           "history_msgs": len(msgs) - 2, "proactive": bool(proactive),
+                           "system_sha": hashlib.sha256(system.encode()).hexdigest()[:12]})
+    rec.emit("user/message", {"content": turn})
 
     ctx = {"app_id": aid, "chat_id": chat_id,
            "skills": {s["name"]: s.get("content") or "" for s in skills}}
@@ -184,13 +233,14 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
         for _ in range(_MAX_TOOL_LOOPS):
             content, tool_calls, usage = _call(client, model, msgs, tools_schema, extra_body, deliver)
             _record(aid, chat_id, model, usage)
+            _note_call(rec, content, tool_calls, usage)
             if not tool_calls:
                 answer = (content or "").strip()
                 if proactive and (not answer or "__SILENT__" in answer):
-                    return None                      # 主动模式判定不该说话：不发、不存 assistant
+                    return None, "silent"            # 主动模式判定不该说话：不发、不存 assistant
                 answer = answer or "(无输出)"
                 store.save(aid, chat_id, "assistant", answer)
-                return answer
+                return answer, "completed"
             msgs.append({
                 "role": "assistant",
                 "content": content or "",
@@ -206,19 +256,30 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
             for t in tool_calls:
                 try:
                     args = json.loads(t["args"] or "{}")
+                    call_payload = {"args": args}
                 except Exception:
                     args = {}
+                    call_payload = {"args": {}, "raw_args": t["args"], "parse_error": True}
+                rec.emit("tool/call", call_payload, call_id=t["id"], tool=t["name"])   # 先落库再执行
+                t0 = time.time()
                 if t["name"] in mcp_routes:             # MCP 工具走 MCP 客户端
                     result = mcp_mod.call(mcp_routes[t["name"]], args)
                 else:
                     result = execute(t["name"], args, ctx)
-                msgs.append({"role": "tool", "tool_call_id": t["id"],
-                             "content": json.dumps(result, ensure_ascii=False)})
+                content_str = json.dumps(result, ensure_ascii=False)
+                rec.emit("tool/result", {
+                    "status": "error" if isinstance(result, dict) and "error" in result else "ok",
+                    "duration_ms": int((time.time() - t0) * 1000),
+                    "chars": len(content_str),
+                    "result": content_str[:_RESULT_PREVIEW],
+                    "truncated": len(content_str) > _RESULT_PREVIEW,
+                }, call_id=t["id"], tool=t["name"])
+                msgs.append({"role": "tool", "tool_call_id": t["id"], "content": content_str})
     finally:
         auth.reset_ctx(ctok)
 
     if proactive:
-        return None                                  # 主动模式下查不动就别硬插话
+        return None, "max-steps"                     # 主动模式下查不动就别硬插话
     # 轮数用尽：不直接放弃，强制「不带工具」再问一次（同样流式），用已查到的信息给出当前最佳结论（优雅降级）
     try:
         content, _tc, usage = _call(client, model, msgs + [
@@ -227,8 +288,9 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
                         "能得出的结论；若还不完整，就说清已确认了什么、还差什么，给用户一个有用的阶段性答复。"}],
             None, extra_body, deliver)
         _record(aid, chat_id, model, usage)
+        _note_call(rec, content, [], usage, fallback=True)
         answer = (content or "").strip() or "（暂未得出明确结论，请把问题说得更具体点再试）"
     except Exception:
         answer = "（这次排查比较复杂、暂未收敛；把问题缩小一点范围再试试）"
     store.save(aid, chat_id, "assistant", answer)
-    return answer
+    return answer, "max-steps"

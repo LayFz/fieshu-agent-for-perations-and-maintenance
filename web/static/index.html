@@ -73,6 +73,17 @@
   .bubble{ padding:8px 12px; border-radius:8px; margin:6px 0; max-width:80%; white-space:pre-wrap; word-break:break-word; }
   .bubble.user{ background:#e8f0ff; } .bubble.assistant{ background:#f2f3f5; }
   .bubble .who{ font-size:11px; color:var(--sub); margin-bottom:2px; }
+  .ev{ display:flex; gap:12px; padding:10px 0; border-bottom:1px solid var(--line); }
+  .ev:last-child{ border-bottom:0; }
+  .ev .t{ flex:0 0 64px; color:var(--sub); font-size:12px; font-variant-numeric:tabular-nums; padding-top:2px; }
+  .ev .b{ flex:1; min-width:0; }
+  .ev .txt{ white-space:pre-wrap; word-break:break-word; margin-top:4px; }
+  .ev pre{ background:#f7f8fa; border-radius:6px; padding:8px 10px; margin:6px 0 0; white-space:pre-wrap;
+    word-break:break-all; font-size:12px; max-height:360px; overflow:auto; }
+  .ev details summary{ cursor:pointer; color:var(--sub); font-size:12px; margin-top:4px; }
+  .etype{ font-family:ui-monospace,Menlo,monospace; font-size:12px; padding:1px 8px; border-radius:10px;
+    background:#f2f3f5; color:var(--sub); margin-right:8px; }
+  .etype.tool{ background:#fff7e6; color:#ad6800; } .etype.asst{ background:#f0f5ff; color:var(--pri); }
   .toolpick{ display:grid; gap:8px; grid-template-columns:1fr 1fr; }
   .toolpick label{ display:flex; gap:8px; align-items:flex-start; margin:0; padding:8px 10px; border:1px solid var(--line);
         border-radius:8px; cursor:pointer; color:var(--ink); font-size:13px; }
@@ -116,6 +127,7 @@
       <a data-page="mcp">MCP 工具</a>
       <a data-page="schedules">定时任务</a>
       <a data-page="memory">记忆系统</a>
+      <a data-page="runs">运行记录</a>
       <a data-page="usage">Token 用量</a>
       <a data-page="obs">可观测(日志)</a>
       <a data-page="ssh">SSH 运维</a>
@@ -161,7 +173,7 @@ function enterApp(username){ $('#login').style.display='none'; $('#app').style.d
 $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
-const PAGES = { overview, apps, providers, skills, mcp, schedules, memory, usage, obs, ssh, k8s, account };
+const PAGES = { overview, apps, providers, skills, mcp, schedules, memory, runs: runsPage, usage, obs, ssh, k8s, account };
 function go(page){ document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on', a.dataset.page===page)); PAGES[page](); }
 document.querySelectorAll('nav a').forEach(a=> a.onclick=()=>go(a.dataset.page));
 
@@ -528,6 +540,78 @@ async function viewChat(appId,chatId){
   b.innerHTML=`<div style="margin-bottom:10px"><button class="btn ghost sm" onclick="renderChats()">← 返回</button>
     <span class="mono muted" style="margin-left:10px">${esc(chatId)}</span></div>
     ${messages.map(m=>`<div class="bubble ${m.role}"><div class="who">${m.role} · ${dt(m.ts)}</div>${esc(m.content)}</div>`).join('')||'<div class="empty">空</div>'}`;
+}
+
+/* ---------- 运行记录 ---------- */
+const TRIGGER_NAMES={chat:'群聊',proactive:'旁听',schedule:'定时任务',job:'后台任务',webhook:'webhook',delegate:'委派'};
+const RUN_STATUS={running:['运行中','y'],completed:['完成','g'],silent:['旁听未发言',''],'max-steps':['轮数用尽','y'],error:['出错','r'],aborted:['中断','r']};
+const _RUN_LIMIT=50;
+let _runTrigger='', _runStatus='', _runBefore=null;
+const durTxt = ms => ms==null?'':(ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s');
+const appName = id => { const a=(_appsForFilter||[]).find(x=>String(x.id)===String(id)); return a?a.name:('#'+id); };
+function runStatusChip(s){ const [t,c]=RUN_STATUS[s]||[s,'']; return `<span class="chip" style="padding:2px 10px"><span class="dot ${c}"></span>${esc(t)}</span>`; }
+async function runsPage(before){
+  _runBefore = before||null;
+  const c=$('#content'); const filter=await appFilterHtml('runsPage()');
+  const sel=(v,opts,on)=>`<select style="width:130px" onchange="${on}">`+opts.map(([k,t])=>`<option value="${k}" ${v===k?'selected':''}>${esc(t)}</option>`).join('')+'</select>';
+  c.innerHTML=`<div class="head"><div><h2>运行记录</h2><p class="desc">数字员工每干一次活就是一个 run：模型回复、工具调用和结果按时间线回放，保留 90 天。</p></div>
+      <span style="margin-left:auto;display:flex;gap:8px">
+        ${sel(_runTrigger,[['','全部触发']].concat(Object.entries(TRIGGER_NAMES)),"_runTrigger=this.value;runsPage()")}
+        ${sel(_runStatus,[['','全部状态']].concat(Object.entries(RUN_STATUS).map(([k,v])=>[k,v[0]])),"_runStatus=this.value;runsPage()")}
+        ${filter}</span></div>
+    <div id="run-body" class="card">加载中…</div>`;
+  renderRuns();
+}
+async function renderRuns(){
+  const p=new URLSearchParams();
+  if(_appFilter!=='all') p.set('app_id',_appFilter);
+  if(_runTrigger) p.set('trigger',_runTrigger);
+  if(_runStatus) p.set('status',_runStatus);
+  if(_runBefore) p.set('before',_runBefore);
+  p.set('limit',_RUN_LIMIT);
+  const {runs}=await api('GET','/api/runs?'+p.toString()); const b=$('#run-body');
+  if(!runs.length){ b.innerHTML='<div class="empty">'+(_runBefore?'没有更早的记录了。':'还没有运行记录。群里 @ 一下数字员工就会出现。')+'</div>'
+    +(_runBefore?'<div style="text-align:center"><button class="btn ghost sm" onclick="runsPage()">← 回到最新</button></div>':''); return; }
+  const more = runs.length===_RUN_LIMIT ? `<button class="btn ghost sm" onclick="runsPage(${runs[runs.length-1].started})">更早 →</button>` : '';
+  b.innerHTML=`<table><thead><tr><th style="width:160px">开始</th><th>应用</th><th>触发</th><th>状态</th>
+      <th class="num">工具调用</th><th class="num">Token</th><th class="num">耗时</th><th style="width:70px"></th></tr></thead><tbody>
+    ${runs.map(r=>`<tr><td class="muted">${dt(r.started)}</td><td>${esc(appName(r.app_id))}</td>
+      <td>${esc(TRIGGER_NAMES[r.trigger]||r.trigger)}</td><td>${runStatusChip(r.status)}</td>
+      <td class="num">${fmt(r.tool_calls)}</td><td class="num">${fmt(r.total_tokens)}</td>
+      <td class="num">${r.ended?durTxt(Math.round((r.ended-r.started)*1000)):''}</td>
+      <td><button class="btn ghost sm" style="white-space:nowrap" onclick='viewRun(${JSON.stringify(r.id)})'>查看</button></td></tr>`).join('')}</tbody></table>
+    <div style="display:flex;justify-content:space-between;margin-top:12px">
+      <span>${_runBefore?'<button class="btn ghost sm" onclick="runsPage()">← 回到最新</button>':''}</span><span>${more}</span></div>`;
+}
+function evBody(e){
+  const p=e.payload||{}; const raw=`<details><summary>原始数据</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`;
+  switch(e.type){
+    case 'run/start': return `<span class="etype">开始</span>模型 ${esc(p.model)}（${esc(p.provider||'')}）· 工具 ${(p.tools||[]).length} 个 · 带入历史 ${p.history_msgs??0} 条${p.proactive?' · 旁听模式':''}${raw}`;
+    case 'user/message': return `<span class="etype">输入</span><div class="txt">${esc(p.content)}</div>`;
+    case 'assistant/message': {
+      const calls=(p.tool_calls||[]).map(t=>esc(t.name)).join('、');
+      const u=p.usage?` · ${fmt(p.usage.total)} token`:'';
+      return `<span class="etype asst">模型${p.fallback?'（轮数用尽兜底）':''}</span><span class="muted">${calls?'调用工具：'+calls:'给出答复'}${u}</span>`
+        +(p.content?`<div class="txt">${esc(p.content)}</div>`:'')+raw; }
+    case 'tool/call': return `<span class="etype tool">调用</span><b class="mono">${esc(e.tool)}</b>${p.parse_error?' <span style="color:var(--err)">参数解析失败</span>':''}<pre>${esc(JSON.stringify(p.args??p.raw_args,null,2))}</pre>`;
+    case 'tool/result': return `<span class="etype tool">结果</span><b class="mono">${esc(e.tool)}</b> `
+        +`<span style="color:var(--${p.status==='error'?'err':'ok'})">${p.status==='error'?'出错':'成功'}</span>`
+        +`<span class="muted"> · ${durTxt(p.duration_ms)} · ${fmt(p.chars)} 字${p.truncated?'（下面只显示前 4000 字）':''}</span>`
+        +`<details><summary>结果内容</summary><pre>${esc(p.result)}</pre></details>`;
+    case 'run/end': return `<span class="etype">结束</span>${runStatusChip(p.status)} <span class="muted">${durTxt(p.duration_ms)} · ${fmt(p.total_tokens)} token</span>`
+        +(p.reason?`<div class="txt" style="color:var(--err)">${esc(p.reason)}</div>`:'');
+    default: return `<span class="etype">${esc(e.type)}</span>${raw}`;
+  }
+}
+async function viewRun(id){
+  const {run,events}=await api('GET','/api/runs/'+encodeURIComponent(id)); const b=$('#run-body');
+  b.innerHTML=`<div style="margin-bottom:12px"><button class="btn ghost sm" onclick="renderRuns()">← 返回</button></div>
+    <div class="meta" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+      <b>${esc(appName(run.app_id))}</b> ${runStatusChip(run.status)}
+      <span class="chip">${esc(TRIGGER_NAMES[run.trigger]||run.trigger)}</span>
+      <span class="muted">${dt(run.started)} · ${run.ended?durTxt(Math.round((run.ended-run.started)*1000)):'进行中'} · ${fmt(run.total_tokens)} token</span></div>
+    <div class="muted mono" style="margin-bottom:10px">run ${esc(run.id)} · chat ${esc(run.chat_id||'')}${run.speaker_open_id?' · 触发人 '+esc(run.speaker_open_id):''}</div>
+    ${events.map(e=>`<div class="ev"><div class="t">+${((e.ts-run.started)).toFixed(1)}s</div><div class="b">${evBody(e)}</div></div>`).join('')||'<div class="empty">没有事件</div>'}`;
 }
 
 /* ---------- Token 用量 ---------- */

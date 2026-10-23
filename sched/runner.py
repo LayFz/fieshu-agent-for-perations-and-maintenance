@@ -8,8 +8,10 @@ import time
 import traceback
 
 from core import store
+from harness import runs
 
 _started = False
+_PURGE_EVERY = 6 * 3600     # 运行记录（runs/events）过期清理间隔
 
 
 def _fire(sc):
@@ -19,7 +21,7 @@ def _fire(sc):
     if not app or not app["enabled"]:
         return
     try:
-        ans = llm_run(app, sc["chat_id"], sc["instruction"])
+        ans = llm_run(app, sc["chat_id"], sc["instruction"], trigger="schedule")
         bot.post(app, sc["chat_id"], ans)
         print(f"[定时任务 {sc['id']}] {sc.get('title')!r} 已执行并回群", flush=True)
     except Exception as e:
@@ -28,12 +30,18 @@ def _fire(sc):
 
 
 def _loop():
+    last_purge = 0.0
     while True:
         try:
             now = time.time()
             for sc in store.due_schedules(now):
                 store.mark_schedule_ran(sc["id"], now)   # 先标记下次时间，避免本轮重复触发
                 threading.Thread(target=_fire, args=(sc,), daemon=True).start()
+            if now - last_purge >= _PURGE_EVERY:          # 顺手清理过期运行记录
+                last_purge = now
+                n = runs.purge_old()
+                if n:
+                    print(f"[调度] 已清理 {n} 条过期运行记录", flush=True)
         except Exception:
             traceback.print_exc()
         time.sleep(30)

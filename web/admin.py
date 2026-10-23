@@ -649,6 +649,24 @@ def chat_detail(request: Request):
     return {"messages": store.chat_messages(int(aid), chat_id)}
 
 
+# ---------- 运行记录（run + 事件时间线，只读） ----------
+@app.get("/api/runs")
+def runs_list(request: Request):
+    _auth(request)
+    q = request.query_params
+    return {"runs": store.list_runs(_app_id(request), trigger=q.get("trigger") or None,
+                                    status=q.get("status") or None, before=q.get("before") or None,
+                                    limit=q.get("limit") or 50)}
+
+@app.get("/api/runs/{rid}")
+def run_detail(rid: str, request: Request):
+    _auth(request)
+    r = store.get_run(rid)
+    if not r:
+        raise HTTPException(status_code=404, detail="没有这个 run")
+    return {"run": r, "events": store.run_events(rid)}
+
+
 # ---------- token 用量（按应用过滤） ----------
 @app.get("/api/usage")
 def usage(request: Request):

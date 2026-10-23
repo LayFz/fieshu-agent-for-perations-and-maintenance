@@ -59,6 +59,9 @@ def _bootstrap():
 def main():
     _bootstrap()
 
+    from harness import runs
+    runs.abort_stale()            # 上次进程遗留的 running → aborted
+
     from feishu import bot
     started = bot.start_all()
     if started == 0:

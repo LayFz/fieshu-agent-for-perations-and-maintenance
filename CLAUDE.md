@@ -28,12 +28,13 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 ```
 
 ### 包分层（依赖单向）
-`core` ← `feishu` / `obs` / `sched` ← `llm` ← `web` ← `app`
-加新能力就平级再开个包（如 obs/、sched/ 就是这么加的）。
+`core` ← `harness` ← `feishu` / `obs` / `sched` ← `llm` ← `web` ← `app`
+加新能力就平级再开个包（如 obs/、sched/ 就是这么加的）。`harness` 只依赖 `core`；需要上层能力时由上层反向注册进来，不要让 harness import 上层。
 
 | 包 | 职责 |
 |---|---|
 | `core/` | `config.py` 冷启动引导配置；`store.py` 数据层(全部 SQLite) |
+| `harness/` | agent 内核：`runs.py` run 生命周期 + 事件日志（后续：工具管道、审批、外存、jobs） |
 | `feishu/` | `bot.py` 多应用长连接；`auth.py` 按应用 tenant_token；`docs.py`/`md2feishu.py` 文档读写 |
 | `obs/` | 只读监控集成：`openobserve`(日志)、`beszel`(服务器负载)、`uptimekuma`(服务状态) |
 | `sched/` | `runner.py` 定时任务调度线程 |
@@ -49,6 +50,7 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 - `skills` — 技能库（name/description/content），知识/工作方法包，应用按需勾选
 - `schedules` — 定时任务（app_id/chat_id/title/instruction/kind/spec/next_run_ts）
 - `msgs` / `notes` / `token_usage` — 对话记忆 / 长期笔记 / 用量，**都带 app_id 按应用隔离**
+- `runs` / `events` — 运行记录：一次 `engine.run` 是一个 run（trigger=chat/proactive/schedule/…、状态、token），每次模型回复与工具调用按 `seq` 只追加写进 `events`（类型见 `harness.runs.EVENT_TYPES`）。`tool/call` 先于执行写入；启动时遗留的 `running` 标 `aborted`；调度线程清理 90 天前的记录。后台「运行记录」页只读回放。`msgs` 仍负责对话记忆，两者并存
 - `kv` — 引导配置 + 全局设置（OpenObserve/Beszel/UptimeKuma 连接 `oo_*`/`bz_*`/`uk_*`；SSH 受管主机+凭证 `ssh_hosts`、硬黑名单 `ssh_blacklist`）；`admin` — 管理员
   - OpenObserve 按 **org** 隔离数据：`oo_org/oo_user/oo_pass` 是主 org，`oo_sources`（JSON 数组）存其余 org 各自的 service account；`query_logs`/`list_log_streams` 用可选 `org` 参数切换。每个 org 要用它自己建的 service account，主 org 的账号访问不了别的 org
 
