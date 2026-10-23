@@ -65,8 +65,15 @@ def request(rec, call, app, reason, timeout=None):
             store.decide_approval(aid, "unavailable")
             return _finish(rec, store.get_approval(aid), "unavailable", "没有注册审批应答者"), \
                 "审批通道不可用，已拒绝。"
+        preview = None
+        fn = (getattr(call, "extra", None) or {}).get("preview")
+        if callable(fn):
+            try:
+                preview = fn()
+            except Exception as e:
+                preview = f"（预览生成失败：{e}）"
         req = {"approval_id": aid, "app": app, "chat_id": rec.chat_id, "tool": call.tool,
-               "args": call.args, "risk": call.risk, "reason": reason,
+               "args": call.args, "risk": call.risk, "reason": reason, "preview": preview,
                "requester_open_id": requester, "approvers": approvers, "timeout_s": timeout}
         try:
             mid = _ask(req)

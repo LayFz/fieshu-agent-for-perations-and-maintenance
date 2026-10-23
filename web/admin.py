@@ -18,6 +18,7 @@ from core import store
 from feishu import auth, bot
 from harness import policy
 from harness import skills as skills_sync
+from harness import workspace
 from llm import mcp as mcp_mod
 from llm.tools import all_tools, tool_list_for
 
@@ -298,6 +299,80 @@ def remove_skill(sid: int, request: Request):
     _manual_skill_or_400(sid)
     store.delete_skill(sid)
     return {"ok": True}
+
+
+# ---------- 代码仓库与工作区（harness.workspace） ----------
+def _repo_view(r):
+    v = {k: r.get(k) for k in ("id", "name", "url", "branch", "username", "test_cmd", "enabled")}
+    v.update(token_set=bool(r.get("token")), token_masked=_mask(r.get("token")),
+             write_token_set=bool(r.get("write_token")), write_token_masked=_mask(r.get("write_token")))
+    return v
+
+def _repo_fields(b, creating):
+    f = {}
+    if creating or "name" in b:
+        f["name"] = (b.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", f["name"] or ""):
+            raise HTTPException(status_code=400, detail="仓库名只能用字母、数字、. _ -（模型按这个名字打开仓库）")
+    if creating or "url" in b:
+        f["url"] = (b.get("url") or "").strip()
+        if not (f["url"].startswith(("https://", "http://")) or os.path.isabs(f["url"])):
+            raise HTTPException(status_code=400, detail="仓库地址需为 https:// 开头")
+    for k in ("branch", "username", "test_cmd"):
+        if k in b:
+            f[k] = (b.get(k) or "").strip()
+    for k in ("token", "write_token"):
+        if b.get(k):
+            f[k] = b[k].strip()
+    if "enabled" in b:
+        f["enabled"] = 1 if b["enabled"] else 0
+    return f
+
+@app.get("/api/code-repos")
+def code_repos(request: Request):
+    _auth(request)
+    names = {r["id"]: r["name"] for r in store.list_code_repos()}
+    apps_ = {a["id"]: a["name"] for a in store.list_apps()}
+    wss = [{"id": w["id"], "repo": names.get(w["repo_id"], "#%s" % w["repo_id"]), "app": apps_.get(w["app_id"]),
+            "chat_id": w["chat_id"], "base_branch": w["base_branch"], "base_commit": (w["base_commit"] or "")[:12],
+            "changed": len(w["changed"]), "mr_url": w.get("mr_url"), "created": w["created"], "last_used": w["last_used"]}
+           for w in store.list_workspaces(status="open")]
+    return {"repos": [_repo_view(r) for r in store.list_code_repos()], "workspaces": wss,
+            "ttl_hours": workspace.TTL_HOURS}
+
+@app.post("/api/code-repos")
+async def create_code_repo(request: Request):
+    _auth(request)
+    f = _repo_fields(await _body(request), creating=True)
+    if store.get_code_repo_by_name(f["name"]):
+        raise HTTPException(status_code=400, detail="仓库名已存在")
+    return {"ok": True, "id": store.create_code_repo(**f)}
+
+@app.put("/api/code-repos/{rid}")
+async def edit_code_repo(rid: int, request: Request):
+    _auth(request)
+    if not store.get_code_repo(rid):
+        raise HTTPException(status_code=404, detail="仓库不存在")
+    f = _repo_fields(await _body(request), creating=False)
+    other = store.get_code_repo_by_name(f.get("name") or "")
+    if other and other["id"] != rid:
+        raise HTTPException(status_code=400, detail="仓库名已存在")
+    store.update_code_repo(rid, **f)
+    return {"ok": True}
+
+@app.delete("/api/code-repos/{rid}")
+def remove_code_repo(rid: int, request: Request):
+    _auth(request)
+    for w in store.list_workspaces(status="open"):
+        if w["repo_id"] == rid:
+            workspace.close_workspace(w["id"])
+    store.delete_code_repo(rid)
+    return {"ok": True}
+
+@app.delete("/api/workspaces/{ws_id}")
+def remove_workspace(ws_id: str, request: Request):
+    _auth(request)
+    return {"ok": workspace.close_workspace(ws_id)}
 
 
 # ---------- 技能源（从 Git 同步技能，harness.skills） ----------

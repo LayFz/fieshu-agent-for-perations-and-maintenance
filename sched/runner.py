@@ -8,7 +8,7 @@ import time
 import traceback
 
 from core import store
-from harness import runs, skills
+from harness import runs, skills, workspace
 
 _started = False
 _PURGE_EVERY = 6 * 3600     # 运行记录（runs/events）过期清理间隔
@@ -32,6 +32,7 @@ def _fire(sc):
 def _loop():
     last_purge = 0.0
     last_skill_check = 0.0
+    last_ws_cleanup = 0.0
     while True:
         try:
             now = time.time()
@@ -46,6 +47,11 @@ def _loop():
                 n = runs.purge_old()
                 if n:
                     print(f"[调度] 已清理 {n} 条过期运行记录", flush=True)
+            if now - last_ws_cleanup >= 600:              # 闲置超过 TTL 的代码工作区删目录
+                last_ws_cleanup = now
+                n = workspace.cleanup_stale(now)
+                if n:
+                    print(f"[调度] 已清理 {n} 个闲置代码工作区", flush=True)
         except Exception:
             traceback.print_exc()
         time.sleep(30)

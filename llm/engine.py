@@ -14,7 +14,7 @@ from core import store
 from feishu import auth
 from harness import pipeline, policy, runs
 from . import mcp as mcp_mod
-from .tools import tools_for, execute, meta_for, MCP_META, SKILL_TOOL
+from .tools import tools_for, execute, meta_for, approval_preview, MCP_META, SKILL_TOOL
 
 _MAX_TOOL_LOOPS = 40
 
@@ -136,7 +136,14 @@ def _tool_label(name, args_json):
     if name == "query_logs":
         return "查日志 " + (a.get("stream") or "") + (f"（{a.get('where')}）" if a.get("where") else "")
     if name == "read_skill":
-        return "读技能 " + (a.get("name") or "")
+        return "读技能 " + (a.get("name") or "") + (f" / {a['file']}" if a.get("file") else "")
+    if name.startswith("code_"):
+        verb = {"code_repos": "列仓库", "code_open": "打开仓库", "code_list": "列目录", "code_read": "读",
+                "code_search": "搜索", "code_edit": "改", "code_write": "写", "code_delete": "删",
+                "code_diff": "看 diff", "code_test": "跑测试", "code_propose_mr": "提 MR",
+                "code_close": "关闭工作区"}.get(name, name)
+        obj = a.get("repo") or a.get("path") or a.get("pattern") or a.get("title") or ""
+        return f"{verb} {obj}".strip()
     if name in ("server_stats", "docker_containers", "service_status", "list_log_streams",
                 "list_ssh_hosts", "list_k8s_clusters"):
         return {"server_stats": "查服务器负载", "docker_containers": "查容器",
@@ -270,6 +277,8 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                     executor = (lambda a, _n=name: execute(_n, a, ctx))
                 call = pipeline.ToolCall(id=t["id"], tool=name, args=args, raw_args=raw,
                                          exposed=name in exposed, trigger=rec.trigger, app_id=aid, **meta)
+                # 需要审批时才算的卡片预览（如提 MR 的 diff），让审批人看到真正要批的内容
+                call.extra["preview"] = (lambda _n=name, _a=args: approval_preview(_n, _a, ctx))
                 content_str = pipeline.run_tool(rec, call, app.get("policy"), executor, app=app)
                 msgs.append({"role": "tool", "tool_call_id": t["id"], "content": content_str})
     finally:

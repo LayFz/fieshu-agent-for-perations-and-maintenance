@@ -36,7 +36,7 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 | 包 | 职责 |
 |---|---|
 | `core/` | `config.py` 冷启动引导配置；`store.py` 数据层(全部 SQLite) |
-| `harness/` | agent 内核：`runs.py` run 生命周期 + 事件日志；`pipeline.py` 工具执行管道 `run_tool()`；`policy.py` 策略预设/规则 + guard 注册表；`approval.py` 审批；`skills.py` 技能从 Git 同步（后续：代码工作区、外存、jobs） |
+| `harness/` | agent 内核：`runs.py` run 生命周期 + 事件日志；`pipeline.py` 工具执行管道 `run_tool()`；`policy.py` 策略预设/规则 + guard 注册表；`approval.py` 审批；`skills.py` 技能从 Git 同步；`workspace.py` 代码工作区；`gitutil.py` dulwich 克隆（后续：外存、jobs） |
 | `feishu/` | `bot.py` 多应用长连接；`auth.py` 按应用 tenant_token；`docs.py`/`md2feishu.py` 文档读写 |
 | `obs/` | 只读监控集成：`openobserve`(日志)、`beszel`(服务器负载)、`uptimekuma`(服务状态) |
 | `sched/` | `runner.py` 定时任务调度线程 |
@@ -62,6 +62,7 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 
 - **应用 = 数字员工 = 席位**。四层隔离：身份(独立飞书应用) + AI(各绑各的) + 工具(勾选子集) + 技能(勾选子集)。防越权靠这套，不靠代码自觉。
 - **技能可以从 Git 同步（harness/skills.py）**：后台「技能」页登记技能源（公司 GitLab skill marketplace 索引仓或单个能力仓 + 只读 Deploy Token + ssh→https 改写规则 + 可选 plugin 名单），调度线程按间隔用 dulwich 拉取，写进 `skills`（`source_id` 非空）。Git 来源技能后台只读，改动走能力仓 MR；附属文件存 `skills.files`，`read_skill(name, file=…)` 读取。令牌只发同一主机；路径穿越、符号链接一律拒。
+- **代码工作区（harness/workspace.py）**：后台「代码仓库」页登记可改的仓库（读令牌、写令牌、测试命令）；应用勾 `code_*` 工具后，模型在 `data/workspaces/<id>/repo` 一次性工作区里读改文件、`code_test` 跑配置好的测试、`code_propose_mr` 由系统用写令牌调 GitLab「创建提交」+「建 MR」API（不 git push，令牌不进工作区）。风险等级多了 `local`（只改工作区）；`code_test`=exec、提 MR=write，配「审批」预设时这两步发卡，卡上带 diff（工具元数据 `preview`）。**跑测试=执行被改过的代码，目前没有容器隔离，别给不受信的应用勾 `code_test`。**
 - **工具(tool) vs 技能(skill)**：工具是「能做的动作」(查日志/发文档)；技能是「该懂的知识/方法」(如「公司架构」)。技能用**渐进披露**：系统提示词只注入名称+简介，模型需要详情时调 `read_skill(name)` 拉全文，且只能读本应用勾选的技能。
 - **定时任务**：到点用对应应用的 AI+工具+技能跑 instruction，结果发回原群(REST，不依赖长连接)。两种创建途径同一张表：对话创建(给应用勾 `schedule_task` 工具) + 后台「定时任务」页。
 - **监控集成是只读原生工具**(非 MCP)：`query_logs`/`server_stats`/`service_status`，连接信息走后台「可观测」页存 kv。这些是内置在 `llm/tools.py` 里的固定工具。

@@ -3,7 +3,7 @@
 规则表（apps.policy 列，JSON）：
   {"preset": "compat"}                       用预设
   {"preset": "custom", "rules": [...]}       自定义规则，自上而下第一条命中的生效
-单条规则：{"tool": "kubectl" | ["a","b"] | "*", "risk": "read" | ["write","exec"], "decision": "allow|deny|ask"}
+单条规则：{"tool": "kubectl" | ["a","b"] | "*", "risk": "read" | ["local","write","exec"], "decision": "allow|deny|ask"}
   tool / risk 省略即匹配全部；一条都没命中按 deny（失败即拒绝）。
 
 guard：只能拒绝或弃权，没有 allow，任何策略都推翻不了它的拒绝。
@@ -12,7 +12,11 @@ guard：只能拒绝或弃权，没有 allow，任何策略都推翻不了它的
 import json
 
 DECISIONS = ("allow", "deny", "ask")
-RISKS = ("read", "write", "exec")
+RISKS = ("read", "local", "write", "exec")
+# read  只读，不改任何东西
+# local 只改本次代码工作区（一次性目录），对外无影响；对外的出口只有 write 类的「提 MR」
+# write 改外部状态（文档、笔记、定时任务、提 MR）
+# exec  在机器/集群上执行命令，或跑仓库里可能被改过的代码
 DEFAULT_PRESET = "compat"
 CUSTOM = "custom"
 
@@ -24,14 +28,14 @@ PRESETS = {
     },
     "readonly": {
         "name": "只读",
-        "description": "只放行只读工具；写入（改文档、记笔记、建定时任务）和执行（ssh、变更类 kubectl）一律拒绝。",
+        "description": "只放行只读工具；改代码、写入（改文档、记笔记、建定时任务、提 MR）和执行（ssh、变更类 kubectl、跑测试）一律拒绝。",
         "rules": [{"risk": "read", "decision": "allow"}, {"decision": "deny"}],
     },
     "approval": {
         "name": "审批",
-        "description": "只读工具直接放行；写入和执行先在群里发审批卡片，审批人点「批准一次」才执行。"
-                       "定时任务、旁听等没人在线的场景一律拒绝。需要在下方配置审批人。",
-        "rules": [{"risk": "read", "decision": "allow"}, {"decision": "ask"}],
+        "description": "只读工具和代码工作区内的改动直接放行；写入（含提 MR）和执行（含跑测试）先在群里发审批卡片，"
+                       "审批人点「批准一次」才执行。定时任务、旁听等没人在线的场景一律拒绝。需要在下方配置审批人。",
+        "rules": [{"risk": ["read", "local"], "decision": "allow"}, {"decision": "ask"}],
     },
 }
 
@@ -140,8 +144,8 @@ def _guard_not_exposed(call):
 
 
 def _guard_proactive(call):
-    if call.trigger == "proactive" and call.risk in ("write", "exec"):
-        return ("当前是旁听模式（没人点名你），旁听时只允许只读操作，不能写入或执行。"
+    if call.trigger == "proactive" and call.risk != "read":
+        return ("当前是旁听模式（没人点名你），旁听时只允许只读操作，不能改代码、写入或执行。"
                 "如果确实需要处理，请在回复里说明，等有人点名你再做。")
 
 

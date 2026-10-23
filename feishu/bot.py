@@ -199,8 +199,11 @@ def _approval_card(app, row, status="pending", decider_name=""):
              f"**工具**：`{row.get('tool')}`（{ {'write': '写入', 'exec': '执行'}.get(row.get('risk'), row.get('risk')) }类）",
              f"**发起人**：{who}",
              f"**原因**：{row.get('reason') or ''}"]
-    elements = [{"tag": "markdown", "content": "\n".join(lines)},
-                {"tag": "markdown", "content": f"**参数**\n```json\n{args_txt}\n```"}]
+    elements = [{"tag": "markdown", "content": "\n".join(lines)}]
+    if row.get("preview"):                      # 工具给的审批预览（如提 MR 的 diff）——审批人真正要看的内容
+        pv = str(row["preview"])
+        elements.append({"tag": "markdown", "content": pv[:3500] + ("\n…（已截断）" if len(pv) > 3500 else "")})
+    elements.append({"tag": "markdown", "content": f"**参数**\n```json\n{args_txt}\n```"})
     if status == "pending":
         value = {"kind": "approval", "approval_id": row["id"]}
         elements.append({"tag": "action", "actions": [
@@ -223,7 +226,8 @@ def _ask_approval(req):
     """harness.approval 调：在群里发审批卡片，返回 message_id。"""
     app = req["app"]
     row = {"id": req["approval_id"], "chat_id": req["chat_id"], "tool": req["tool"], "args": req["args"],
-           "risk": req["risk"], "reason": req["reason"], "requester_open_id": req["requester_open_id"]}
+           "risk": req["risk"], "reason": req["reason"], "requester_open_id": req["requester_open_id"],
+           "preview": req.get("preview")}
     resp = _create_card(app, req["chat_id"], _approval_card(app, row))
     if not resp.success():
         print(f"[app {app['id']}] 发审批卡片失败:", resp.code, resp.msg, flush=True)

@@ -11,6 +11,7 @@ from feishu import docs as feishu_docs
 from obs import openobserve, beszel, uptimekuma
 from ops import ssh as ops_ssh
 from ops import k8s as ops_k8s
+from harness import workspace
 
 
 def _fmt_ts(ts):
@@ -210,6 +211,101 @@ TOOLS = [
     }},
 ]
 
+# ---------- 代码工作区（harness.workspace）：在一次性工作区里改代码 → 跑测试 → 出 diff → 提 MR ----------
+_WS_PARAM = {"workspace": {"type": "string", "description": "可选，工作区 id（code_open 返回）；不传用本群最近打开的那个"}}
+TOOLS += [
+    {"type": "function", "function": {
+        "name": "code_repos",
+        "description": "列出可以改代码的仓库（名称、默认分支、能不能跑测试、能不能提 MR）。要改代码前先调它。无参数。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "code_open",
+        "description": "把一个仓库克隆到新的一次性工作区，返回工作区 id 和顶层目录。之后的读写都只作用于这个工作区，"
+                       "不会影响远端仓库；改完用 code_diff 看改动、code_test 跑测试、code_propose_mr 提 MR 给人评审。",
+        "parameters": {"type": "object", "properties": {
+            "repo": {"type": "string", "description": "仓库名（见 code_repos）"},
+            "branch": {"type": "string", "description": "可选，基于哪个分支，默认仓库的默认分支"},
+        }, "required": ["repo"]},
+    }},
+    {"type": "function", "function": {
+        "name": "code_list",
+        "description": "列工作区里的目录（跳过 .git、node_modules 等）。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM, **{
+            "path": {"type": "string", "description": "目录相对路径，默认仓库根"},
+            "depth": {"type": "integer", "description": "展开层数 1-4，默认 1"},
+        })},
+    }},
+    {"type": "function", "function": {
+        "name": "code_read",
+        "description": "读工作区里的文件，返回带行号的内容（一次最多 2000 行）。改文件前先读，确认原文。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM, **{
+            "path": {"type": "string"},
+            "start": {"type": "integer", "description": "起始行，默认 1"},
+            "end": {"type": "integer", "description": "结束行（含）"},
+        }), "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "code_search",
+        "description": "在工作区里按正则搜索代码，返回「路径:行号: 内容」（最多 200 条）。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM, **{
+            "pattern": {"type": "string", "description": "Python 正则"},
+            "glob": {"type": "string", "description": "可选，文件过滤，如 *.py、src/**/*.ts"},
+        }), "required": ["pattern"]},
+    }},
+    {"type": "function", "function": {
+        "name": "code_edit",
+        "description": "在工作区文件里做精确替换：old 必须与原文逐字一致（含缩进、换行），且默认只能出现一次。"
+                       "小改动优先用它，而不是整文件重写。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM, **{
+            "path": {"type": "string"},
+            "old": {"type": "string", "description": "要被替换的原文"},
+            "new": {"type": "string", "description": "替换成的新内容"},
+            "replace_all": {"type": "boolean", "description": "old 出现多次时全部替换，默认 false"},
+        }), "required": ["path", "old", "new"]},
+    }},
+    {"type": "function", "function": {
+        "name": "code_write",
+        "description": "在工作区里新建文件或整文件覆盖（最大 1MB）。改已有文件的一小部分请用 code_edit。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM, **{
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        }), "required": ["path", "content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "code_delete",
+        "description": "删除工作区里的一个文件。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM, **{
+            "path": {"type": "string"},
+        }), "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "code_diff",
+        "description": "看工作区相对原始提交的改动（统一 diff + 每个文件增删行数）。提 MR 前先看一遍。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM)},
+    }},
+    {"type": "function", "function": {
+        "name": "code_test",
+        "description": "在工作区里运行该仓库在后台配置好的测试命令，返回是否通过与输出末尾。命令不能自定义。"
+                       "注意：这会执行仓库里的代码（包括你改过的部分）。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM)},
+    }},
+    {"type": "function", "function": {
+        "name": "code_propose_mr",
+        "description": "把工作区里的改动提交到新分支并创建 Merge Request，返回 MR 链接，交给人评审合并（不会直接合并）。"
+                       "提交前请确认 code_diff 的改动正确、code_test 已通过（若可跑）。一个工作区只能提一次。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM, **{
+            "title": {"type": "string", "description": "MR 标题，一句话说清改了什么"},
+            "description": {"type": "string", "description": "MR 描述：为什么改、改了什么、怎么验证的"},
+        }), "required": ["title"]},
+    }},
+    {"type": "function", "function": {
+        "name": "code_close",
+        "description": "关闭并删除工作区（改动会丢弃；已提的 MR 不受影响）。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM)},
+    }},
+]
+
 _BY_NAME = {t["function"]["name"]: t for t in TOOLS}
 
 # 工具元数据：只给宿主（harness 管道）看，绝不发给模型。
@@ -238,21 +334,64 @@ _META = {
     "list_schedules": {"risk": "read"},
     "cancel_schedule": {"risk": "write"},
     "read_skill": {"risk": "read"},
+    "code_repos": {"risk": "read"},
+    "code_open": {"risk": "local", "timeout": 330},
+    "code_list": {"risk": "read"},
+    "code_read": {"risk": "read"},
+    "code_search": {"risk": "read"},
+    "code_edit": {"risk": "local"},
+    "code_write": {"risk": "local"},
+    "code_delete": {"risk": "local"},
+    "code_diff": {"risk": "read"},
+    "code_test": {"risk": "exec", "timeout": 630},     # 跑仓库代码（可能被改过）= 执行任意代码
+    "code_propose_mr": {"risk": "write", "timeout": 90},
+    "code_close": {"risk": "local"},
 }
+def _preview_mr(args, ctx):
+    """审批卡片上给人看的改动摘要：要批的是这些改动，不是模型写的标题。"""
+    ws = workspace.get_workspace(args.get("workspace"), ctx.get("app_id"), ctx.get("chat_id"))
+    d = workspace.diff(ws, max_chars=2500)
+    files = "\n".join(f"- {f['status']} `{f['path']}` (+{f['added']} -{f['removed']})" for f in d["files"])
+    return f"**改动 {len(d['files'])} 个文件**（基于 {d['base_commit']}）\n{files}\n```diff\n{d['diff']}\n```" \
+           + ("\n（diff 已截断，完整内容见 MR）" if d["truncated"] else "")
+
+
+def _preview_test(args, ctx):
+    ws = workspace.get_workspace(args.get("workspace"), ctx.get("app_id"), ctx.get("chat_id"))
+    repo = store.get_code_repo(ws["repo_id"]) or {}
+    n = len(ws.get("changed") or {})
+    return f"将在工作区运行：`{repo.get('test_cmd') or '（未配置）'}`\n会执行仓库代码，其中 {n} 个文件被数字员工改过。"
+
+
+_META["code_propose_mr"]["preview"] = _preview_mr
+_META["code_test"]["preview"] = _preview_test
+
 _UNKNOWN_META = {"risk": "exec", "external": False, "timeout": 120}
 # MCP 工具来自外部 server，能力未知：按 write 处理，结果视为外部内容
 MCP_META = {"risk": "write", "external": True, "timeout": 120}
 
 
 def meta_for(name, args):
-    """某次调用的元数据：{"risk", "external", "timeout"}。"""
+    """某次调用的元数据：{"risk", "external", "timeout"}（不含 preview）。"""
     m = dict(_UNKNOWN_META, **_META.get(name, {}))
+    m.pop("preview", None)
     if callable(m["risk"]):
         try:
             m["risk"] = m["risk"](args or {})
         except Exception:
             m["risk"] = "exec"
     return m
+
+
+def approval_preview(name, args, ctx):
+    """需要审批时显示在卡片上的预览（如提 MR 的 diff）；没有或算不出来返回 None。"""
+    fn = _META.get(name, {}).get("preview")
+    if not fn:
+        return None
+    try:
+        return fn(args or {}, ctx or {})
+    except Exception as e:
+        return f"（预览生成失败：{e}）"
 
 # 技能工具：仅当应用勾了技能时由 engine 自动挂上（不在工具池里给用户单独勾）
 SKILL_TOOL = {"type": "function", "function": {
@@ -283,6 +422,42 @@ def tool_list_for(names):
     return [{"name": t["function"]["name"], "description": t["function"]["description"]} for t in tools_for(names)]
 
 
+def _code_tool(name, args, ctx):
+    """代码工作区工具。工作区按 应用+群 归属，越权访问别的应用的工作区会被拒。"""
+    app_id, chat_id = ctx.get("app_id"), ctx.get("chat_id")
+    try:
+        if name == "code_repos":
+            return {"repos": workspace.list_repos()}
+        if name == "code_open":
+            return workspace.open_workspace(app_id, chat_id, args.get("repo"), args.get("branch"))
+        ws = workspace.get_workspace(args.get("workspace"), app_id, chat_id)
+        if name == "code_list":
+            return workspace.list_dir(ws, args.get("path") or ".", args.get("depth") or 1)
+        if name == "code_read":
+            return workspace.read_file(ws, args.get("path"), args.get("start") or 1, args.get("end"))
+        if name == "code_search":
+            return workspace.search(ws, args.get("pattern") or "", args.get("glob"))
+        if name == "code_edit":
+            return workspace.edit_file(ws, args.get("path"), args.get("old"), args.get("new"),
+                                       bool(args.get("replace_all")))
+        if name == "code_write":
+            return workspace.write_file(ws, args.get("path"), args.get("content"))
+        if name == "code_delete":
+            return workspace.delete_file(ws, args.get("path"))
+        if name == "code_diff":
+            return workspace.diff(ws)
+        if name == "code_test":
+            return workspace.run_tests(ws)
+        if name == "code_propose_mr":
+            return workspace.propose_mr(ws, args.get("title"), args.get("description") or "")
+        if name == "code_close":
+            workspace.close_workspace(ws["id"])
+            return {"ok": True, "closed": ws["id"]}
+        return {"error": f"unknown tool {name}"}
+    except workspace.WorkspaceError as e:
+        return {"error": str(e)}
+
+
 def execute(name, args, ctx=None):
     ctx = ctx or {}
     app_id = ctx.get("app_id")
@@ -307,6 +482,8 @@ def execute(name, args, ctx=None):
             if files:
                 out["files"] = sorted(files)
             return out
+        if name.startswith("code_"):
+            return _code_tool(name, args, ctx)
         if name == "list_knowledge_bases":
             return feishu_docs.list_kbs()
         if name == "list_nodes":

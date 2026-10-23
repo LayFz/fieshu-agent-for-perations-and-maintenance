@@ -14,7 +14,6 @@
   - 某个能力仓拉取失败：它的技能保留上一版；只有拉取成功且确认技能已不存在才删除
   - 同名冲突（和手工技能或别的来源撞名）跳过并记录，不覆盖
 """
-import io
 import json
 import os
 import shutil
@@ -27,6 +26,7 @@ from urllib.parse import urlparse
 import yaml
 
 from core import store
+from . import gitutil
 
 _TEXT_EXT = {".md", ".markdown", ".txt", ".yaml", ".yml", ".json", ".sh", ".py", ".toml", ".ini", ".conf", ".sql"}
 _MAX_FILE = 100 * 1024           # 单个附属文件上限
@@ -64,29 +64,14 @@ def _inside(base, path):
 
 
 def _clone(url, branch, dest, username="", token=""):
-    """浅克隆到 dest，返回 HEAD 提交号。本地路径（测试/开发用）走完整克隆。"""
-    from dulwich import porcelain
-    kw = {"errstream": io.BytesIO(), "checkout": True}
-    remote = url.startswith(("http://", "https://"))
-    if remote:
-        kw["depth"] = 1
-        if token:
-            kw.update(username=username or "deploy-token", password=token)
-    elif url.startswith("ssh://") or url.startswith("git@"):
-        raise SyncError(f"不支持 ssh 地址（镜像里没有 ssh 客户端）：{url}。请在技能源里配置改写规则把它转成 https。")
-    if branch:
-        kw["branch"] = branch
+    """浅克隆到 dest，返回 HEAD 提交号（实现在 gitutil，这里把错误转成 SyncError）。"""
     try:
-        repo = porcelain.clone(url, str(dest), **kw)
-    except Exception as e:
+        return gitutil.clone(url, branch, dest, username, token)
+    except gitutil.GitError as e:
         msg = str(e)
-        if token:
-            msg = msg.replace(token, "***")
-        raise SyncError(f"克隆 {url} 失败：{type(e).__name__}: {msg[:300]}")
-    try:
-        return repo.head().decode()
-    finally:
-        repo.close()
+        if "不支持 ssh" in msg:
+            msg = msg.replace("请改用 https 地址。", "请在技能源里配置改写规则把它转成 https。")
+        raise SyncError(msg)
 
 
 # ---------- 解析 ----------

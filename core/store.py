@@ -160,6 +160,24 @@ _conn.executescript("""
         interval_min INTEGER DEFAULT 60,
         last_sync REAL, last_status TEXT, last_error TEXT, last_report TEXT,
         ts REAL);
+    CREATE TABLE IF NOT EXISTS code_repos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        url TEXT, branch TEXT,
+        username TEXT, token TEXT,
+        write_token TEXT,
+        test_cmd TEXT,
+        enabled INTEGER DEFAULT 1,
+        ts REAL);
+    CREATE TABLE IF NOT EXISTS workspaces(
+        id TEXT PRIMARY KEY,
+        app_id INTEGER, chat_id TEXT, repo_id INTEGER,
+        path TEXT, base_branch TEXT, base_commit TEXT,
+        changed TEXT DEFAULT '{}',
+        mr_url TEXT, mr_branch TEXT,
+        status TEXT DEFAULT 'open',
+        created REAL, last_used REAL);
+    CREATE INDEX IF NOT EXISTS idx_ws_app ON workspaces(app_id, chat_id, status);
 """)
 _conn.commit()
 
@@ -880,6 +898,98 @@ def cancel_pending_approvals():
         _conn.execute("UPDATE approvals SET status='cancelled', decided=? WHERE status='pending'", (time.time(),))
         _conn.commit()
     return [_approval_row(r) for r in rows]
+
+
+# ---------- 代码仓库与工作区（harness.workspace） ----------
+_REPO_FIELDS = ("name", "url", "branch", "username", "token", "write_token", "test_cmd", "enabled")
+
+def list_code_repos():
+    return [dict(r, enabled=bool(r["enabled"]))
+            for r in _conn.execute("SELECT * FROM code_repos ORDER BY id").fetchall()]
+
+def get_code_repo(rid):
+    r = _conn.execute("SELECT * FROM code_repos WHERE id=?", (rid,)).fetchone()
+    return dict(r, enabled=bool(r["enabled"])) if r else None
+
+def get_code_repo_by_name(name):
+    r = _conn.execute("SELECT * FROM code_repos WHERE name=?", (name,)).fetchone()
+    return dict(r, enabled=bool(r["enabled"])) if r else None
+
+def create_code_repo(**f):
+    cols = [k for k in _REPO_FIELDS if k in f and f[k] is not None]
+    with _lock:
+        cur = _conn.execute(f"INSERT INTO code_repos({','.join(cols + ['ts'])}) "
+                            f"VALUES({','.join('?' * (len(cols) + 1))})",
+                            [int(f[k]) if k == "enabled" else f[k] for k in cols] + [time.time()])
+        _conn.commit()
+        return cur.lastrowid
+
+def update_code_repo(rid, **f):
+    sets, vals = [], []
+    for k in _REPO_FIELDS:
+        if k not in f or f[k] is None:
+            continue
+        if k in ("token", "write_token") and not f[k]:     # 仅非空才更新凭证，避免掩码覆盖真值
+            continue
+        sets.append(f"{k}=?"); vals.append(int(f[k]) if k == "enabled" else f[k])
+    if not sets:
+        return
+    vals.append(rid)
+    with _lock:
+        _conn.execute(f"UPDATE code_repos SET {','.join(sets)} WHERE id=?", vals)
+        _conn.commit()
+
+def delete_code_repo(rid):
+    with _lock:
+        _conn.execute("DELETE FROM code_repos WHERE id=?", (rid,))
+        _conn.commit()
+
+def _ws_row(r):
+    d = dict(r)
+    try:
+        d["changed"] = json.loads(d.get("changed") or "{}")
+    except Exception:
+        d["changed"] = {}
+    return d
+
+def create_workspace(ws_id, app_id, chat_id, repo_id, path, base_branch, base_commit):
+    now = time.time()
+    with _lock:
+        _conn.execute("INSERT INTO workspaces(id,app_id,chat_id,repo_id,path,base_branch,base_commit,status,"
+                      "created,last_used) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (ws_id, app_id, chat_id, repo_id, path, base_branch, base_commit, "open", now, now))
+        _conn.commit()
+
+def get_workspace(ws_id):
+    r = _conn.execute("SELECT * FROM workspaces WHERE id=?", (ws_id,)).fetchone()
+    return _ws_row(r) if r else None
+
+def latest_workspace(app_id, chat_id):
+    r = _conn.execute("SELECT * FROM workspaces WHERE app_id=? AND chat_id=? AND status='open' "
+                      "ORDER BY last_used DESC LIMIT 1", (app_id, chat_id)).fetchone()
+    return _ws_row(r) if r else None
+
+def list_workspaces(status=None, app_id=None):
+    where, args = [], []
+    if status:
+        where.append("status=?"); args.append(status)
+    if app_id is not None:
+        where.append("app_id=?"); args.append(app_id)
+    sql = "SELECT * FROM workspaces" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY last_used DESC"
+    return [_ws_row(r) for r in _conn.execute(sql, args).fetchall()]
+
+def update_workspace(ws_id, **f):
+    sets, vals = [], []
+    for k in ("changed", "mr_url", "mr_branch", "status", "last_used"):
+        if k in f:
+            sets.append(f"{k}=?")
+            vals.append(json.dumps(f[k], ensure_ascii=False) if k == "changed" else f[k])
+    if not sets:
+        return
+    vals.append(ws_id)
+    with _lock:
+        _conn.execute(f"UPDATE workspaces SET {','.join(sets)} WHERE id=?", vals)
+        _conn.commit()
 
 
 # ---------- 计数（概览用） ----------
