@@ -28,6 +28,9 @@ from llm.tools import all_tools, tool_list_for
 
 app = FastAPI(title="数字员工平台 管理后台", docs_url=None, redoc_url=None)
 _WEB = Path(__file__).resolve().parent / "static"
+# index.html 每次请求现读磁盘，后端代码却只在进程启动时加载：记下启动时的页面指纹，
+# 代码更新但服务没重启时让前端提示，避免新页面调旧接口导致整页空白。
+_UI_AT_START = hashlib.sha256((_WEB / "index.html").read_bytes()).hexdigest()
 _COOKIE = "fa_sid"
 _TTL = 7 * 24 * 3600
 
@@ -359,7 +362,9 @@ def logout(response: Response):
 
 @app.get("/api/me")
 def me(request: Request):
-    return {"username": _auth(request)}
+    user = _auth(request)
+    current = hashlib.sha256((_WEB / "index.html").read_bytes()).hexdigest()
+    return {"username": user, "stale": current != _UI_AT_START}
 
 @app.post("/api/password")
 async def change_password(request: Request):

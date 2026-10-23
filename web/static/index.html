@@ -240,7 +240,8 @@ async function doLogin(){
   catch(e){ $('#lg-err').textContent=e.message; }
 }
 async function doLogout(){ try{ await api('POST','/api/logout'); }catch(e){} showLogin(); }
-function enterApp(username){ $('#login').style.display='none'; $('#app').style.display='block'; $('#who').textContent=username; go(location.hash.slice(1)||'overview'); refreshNavBadge(); }
+function enterApp(username){ $('#login').style.display='none'; $('#app').style.display='block'; $('#who').textContent=username; go(location.hash.slice(1)||'overview'); refreshNavBadge();
+  api('GET','/api/me').then(m=>{ if(m.stale) showStale(); }).catch(()=>{}); }
 $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
@@ -544,7 +545,7 @@ async function delIntel(id,name){ if(!confirm('删除情报源「'+name+'」？�
 /* ---------- 连接凭证 ---------- */
 async function connectionsPage(){
   const c=$('#content'); c.innerHTML='<h2>连接凭证</h2><p class="desc">加载中…</p>';
-  const {argocd:a,gitlab:g,web:w}=await api('GET','/api/connections');
+  const {argocd:a={},gitlab:g={},web:w={}}=await api('GET','/api/connections');
   c.innerHTML=`<div class="head"><div><h2>连接凭证</h2><p class="desc">给数字员工「看」的只读连接：勾上 argocd_* / gitlab_* 工具的应用可以查 ArgoCD 应用与实际运行镜像、读 GitLab 仓库。令牌只存在服务端，模型拿不到。</p></div></div>
     <div class="card"><div class="card-title">ArgoCD <span class="muted">看应用同步/健康状态与集群里实际运行的镜像版本</span></div>
       <div class="row"><div><label>地址</label><input id="cn-a-url" value="${esc(a.url)}" placeholder="https://argocd.internal.example"></div>
@@ -1562,6 +1563,12 @@ async function changePw(){
 
 /* ---------- 启动 ---------- */
 (async function(){ try{ const me=await api('GET','/api/me'); enterApp(me.username); }catch(e){ showLogin(); } })();
+function showStale(){
+  const d=document.createElement('div'); d.className='notice';
+  d.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:50;box-shadow:0 4px 16px rgba(0,0,0,.12)';
+  d.textContent='后台代码已更新，但服务还没重启：部分页面可能无法加载。请重启服务（概览页「重启服务」或 launchd/容器重启）后刷新。';
+  document.body.appendChild(d);
+}
 </script>
 </body>
 </html>
