@@ -6,6 +6,8 @@
 
 harness（.51 常驻）继续做**控制面**：接任务、定计划、管权限和审批、持有全部凭据、负责提 MR。新增一台**工作机**，上面常驻一个 runner，按任务起一次性容器，在容器里跑现成的编码 agent（首选 Claude Agent SDK，dsh 作为第二个适配器）。工作机能力和本地一样（shell、git、装依赖、跑测试、浏览器），但**没有任何公司凭据，不能进内网，也不能直接产生对外副作用**；它唯一的产出是「补丁 + 证据」，由控制面核对后经审批提 MR。
 
+**已定：工作机是一台独立机器，不进 k3s/VKE，不做集群节点。** agent 会执行仓库脚本、第三方依赖和自己写的代码，属于不可信代码；容器与宿主共用内核，内核或运行时漏洞、配置失误都可能逃逸。放在生产集群里，逃逸后能接触同节点 pod 的密钥、节点身份和内网；放在独立机器上，逃逸只拿到一台没有凭据、出不了内网的机器。
+
 ## 1. 目标与非目标
 
 目标：
@@ -62,9 +64,10 @@ harness（.51 常驻）继续做**控制面**：接任务、定计划、管权�
 | 项 | 配置 |
 |---|---|
 | 规格 | 8 核 / 16GB / 200GB SSD 起步；并发 job 数 = 2（每个 job 3 核 6GB 上限） |
-| 系统 | Ubuntu 24.04 LTS，独立 VM（不与 .51 的业务容器同机，避免共享 Docker daemon） |
+| 位置 | 独立机器或独立 VM：不是 k3s/VKE 节点，不与 .51、.44（Harbor/GitLab/监控中枢）同机，不加入 NetBird；宿主若是虚拟化平台，与业务 VM 分开网段 |
+| 系统 | Ubuntu 24.04 LTS；内核自动安装安全更新（unattended-upgrades + 每周重建时重启） |
 | 运行用户 | `runner` 普通用户；容器用 rootless Docker 或 Podman；runner 不在 docker 组之外拿 root |
-| job 容器 | 非 root、`--cap-drop=ALL`、`no-new-privileges`、CPU/内存/PID/磁盘配额；**不挂 Docker socket**；工作目录是 job 专属卷，结束即删 |
+| job 容器 | 非 root、`--cap-drop=ALL`、`no-new-privileges`、seccomp 默认配置、CPU/内存/PID/磁盘配额；**不挂 Docker socket、不挂宿主目录**；工作目录是 job 专属卷，结束即删；处理外部来源代码（PoC、陌生仓库）的 job 使用 gVisor（`runsc`）运行时 |
 | 镜像 | `worker-base`（git、curl、jq、ripgrep、python3.12、node22、编码 agent CLI、Chromium + Playwright）+ 按语言的工具链镜像（go、java/maven、rust）；镜像在控制面登记 digest，runner 只运行登记过的 digest |
 | 依赖缓存 | 每个工具链一个只读共享缓存（pip/npm/go mod/maven），加内网制品库或代理镜像；缓存只能由 runner 的预热任务写 |
 | 出网 | 只允许经出境代理；代理按域名白名单（PyPI、npm、Go proxy、Maven Central、GitHub、各语言文档站、NVD/OSV/GHSA）；代理拒绝 RFC1918、169.254/16、100.64/10 |
@@ -216,6 +219,31 @@ queued → claimed → running → succeeded / failed / cancelled
 | GitOps 静态校验 | 控制面 | GitOps 仓库的门槛（现有） |
 | GitLab CI | GitLab | 最终判定；不通过则触发 6.2 或转人工 |
 
+### 6.4 与现有 CI/CD 的衔接（Harbor + ArgoCD）
+
+现有发布链路（见 k8s-ops 手册）：push main → 集群内 buildkitd 构建、tag 为 8 位 sha 推 Harbor → Image Updater 每 2 分钟回写 gitops 仓 → ArgoCD 同步（内网应用自动；云上 4 个应用手动 Sync）。CI 只有推 Harbor 的权限。agent 不进入这条链路，只在入口提 MR、在出口做核对：
+
+```text
+Harbor 镜像扫描 ─┐
+KEV/OSV/GHSA ────┼─→ 漏洞台账（镜像 → ArgoCD 应用 → 集群/命名空间 → 源码仓）
+                 │
+                 ▼
+     修复类型判断（受信代码 + 模型计划）
+       ├─ 依赖/基础镜像 → 源码仓 MR（工作机编码 agent）
+       └─ 清单/chart/配置 → gitops 仓 MR（控制面 code_* + GitOps 静态校验）
+                 ▼
+     审批 → MR → 人合并 → CI 构建推 Harbor → Image Updater → ArgoCD
+                 ▼
+     复核（确定性）：Harbor 对新镜像的扫描不再含该 CVE
+                   且 ArgoCD 显示目标应用运行的是新 tag 且 Synced/Healthy
+                 → 台账 fixed；任一不满足 → 保持 mr_merged 并提醒
+```
+
+- **资产匹配**：Harbor 扫描给出「每个镜像有哪些 CVE」，ArgoCD 给出「镜像跑在哪个应用/集群」，补上当前漏洞台账缺的资产对应。前提是 Harbor 已启用扫描器（待核实）。
+- **云上手动同步**：新增确定性动作 `argocd_sync`（write，需审批），只针对 `*-vke` 应用；使用只授予 `applications, sync` 的 ArgoCD 项目角色令牌，不复用管理员账号。
+- **合并**：先由人合并。之后可按策略对低风险改动自动合并（如依赖补丁版本升级、CI 全绿、改动只在依赖文件），策略默认关闭。
+- **agent 永远不做**：合并、push main、`kubectl edit`、持有 CI/Harbor/集群凭据。
+
 ## 7. 安全模型
 
 | 威胁 | 对策 |
@@ -261,13 +289,15 @@ queued → claimed → running → succeeded / failed / cancelled
 |---|---|---|
 | M0 跑通 | 单 runner；Claude SDK 适配器；源码包下发；补丁回传；控制面应用补丁 + 现有提 MR；手动从飞书触发 | 3 个真实小修复（依赖升级、单测失败、配置错误）从飞书到 MR 全程无人工改代码；工作机上找不到任何公司凭据 |
 | M1 可运维 | 模型网关与预算；取消；租约重排；事件进运行记录；后台工作机页；runner 自测 | 运行中拔掉工作机网络/重启 runner，job 自动重排且不产生重复 MR；取消 10s 内容器消失 |
-| M2 闭环 | 补充 PR（评论/CI 失败触发追加提交）；CI 结果回写；漏洞台账联动；dsh 适配器 | 一个漏洞从台账到 fixed 全程留痕；同一批任务上 Claude/DeepSeek 两个适配器的通过率、成本对比 |
+| M2 闭环 | 补充 PR（评论/CI 失败触发追加提交）；CI 结果回写；Harbor 扫描入台账与发布后复核；云上 `argocd_sync`；dsh 适配器 | 一个漏洞从台账到 fixed 全程留痕；同一批任务上 Claude/DeepSeek 两个适配器的通过率、成本对比 |
 | M3 扩展 | 多 runner；每 job 一台 microVM（需宿主 KVM）；有头浏览器 + noVNC 人工接管 | 并发 4 个 job 互不可见；验证码场景可人工接管后继续 |
 
 ## 11. 待确认
 
-1. 工作机放在哪：.51 同一宿主上的新 VM，还是独立机器？.51 是否支持 KVM（决定 M3 能否做 microVM）？
-2. 默认模型：Claude（经网关计费）还是 DeepSeek/豆包？这决定 M0 用哪个适配器更划算。
-3. 出境代理白名单的初始范围，以及是否有内网制品库可作依赖镜像。
-4. GitLab 能否给 harness 配 Note Hook / Pipeline Hook（补充 PR 依赖它）。
-5. 每月模型预算上限与单 job 预算默认值。
+1. 工作机用哪台：新装一台物理机、虚拟化平台上的独立 VM，还是云上 ECS（天然不在内网，回连 harness 经 up-server2 转发）？宿主是否支持 KVM（决定 M3 能否做 microVM）？
+2. Harbor 是否已启用 Trivy 扫描；harness 能否拿到一个只读的 Harbor robot 账号读取扫描结果。
+3. ArgoCD 能否为 harness 建一个只有 sync 权限的项目角色（云上手动同步用）。
+4. 默认模型：Claude（经网关计费）还是 DeepSeek/豆包？这决定 M0 用哪个适配器更划算。
+5. 出境代理白名单的初始范围；依赖镜像能否复用 Harbor 的代理缓存项目。
+6. GitLab 能否给 harness 配 Note Hook / Pipeline Hook（补充 PR 依赖它）。
+7. 每月模型预算上限与单 job 预算默认值。
