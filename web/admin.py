@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse
 
 from core import store
 from feishu import auth, bot
-from harness import policy
+from harness import policy, tasks, access, workflows
 from harness import skills as skills_sync
 from harness import workspace
 from ops import argocd as ops_argocd
@@ -74,6 +74,182 @@ def index():
 
 @app.get("/healthz")
 def healthz():
+    return {"ok": True}
+
+@app.get("/readyz")
+def readyz(response: Response):
+    h = tasks.health()
+    try:
+        store._conn.execute("SELECT 1").fetchone()
+        db = True
+    except Exception:
+        db = False
+    ok = db and h["workers"] > 0 and not h["stopping"]
+    if not ok:
+        response.status_code = 503
+    return {"ok": ok, "database": db, "runtime": h}
+
+
+# ---------- 应用自主持续巡检 ----------
+@app.get("/api/patrols/repositories")
+def patrol_repositories(request: Request):
+    _auth(request)
+    from ops import gitops_scan
+    return {"repositories": gitops_scan.configured()}
+
+
+@app.put("/api/patrols/repositories")
+async def patrol_repositories_update(request: Request):
+    _auth(request)
+    from ops import gitops_scan
+    from harness import patrols
+    body = await _body(request)
+    rows = body.get("repositories")
+    if not isinstance(rows, list) or len(rows) > 20:
+        raise HTTPException(status_code=400, detail="仓库连接必须是最多 20 项的数组")
+    try:
+        validated = [gitops_scan.validate_repository(row) for row in rows]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if len({row["project"] for row in validated}) != len(validated):
+        raise HTTPException(status_code=400, detail="GitOps 项目不能重复")
+    store.set_setting("gitops_repositories", json.dumps(validated, ensure_ascii=False))
+    for monitor in patrols.list_monitors():
+        if set(monitor["git_projects"]) & {row["project"] for row in validated}:
+            patrols.request_scan(monitor["id"])
+    return {"ok": True, "repositories": validated}
+
+
+@app.get("/api/patrols")
+def patrol_list(request: Request):
+    _auth(request)
+    from harness import patrols
+    from sched import runner
+    return {"monitors": patrols.list_monitors(), "runtime": patrols.health(),
+            "feishu": bot.health(), "scheduler": runner.health()}
+
+
+@app.post("/api/patrols")
+async def patrol_create(request: Request):
+    _auth(request)
+    from harness import patrols
+    body = await _body(request)
+    try:
+        row = patrols.configure(app_id=int(body.get("app_id") or 0), name=body.get("name") or "持续巡检",
+            cluster=body.get("cluster"), git_projects=body.get("git_projects") or [],
+            log_targets=body.get("log_targets") or [],
+            interval_seconds=int(body.get("interval_seconds") or 300), chat_id=body.get("chat_id") or None,
+            namespaces=body.get("namespaces") or [], enabled=bool(body.get("enabled", True)))
+        return {"monitor": row}
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.patch("/api/patrols/{monitor_id}")
+async def patrol_update(monitor_id: str, request: Request):
+    _auth(request)
+    from harness import patrols
+    body = await _body(request)
+    allowed = {"name", "cluster", "git_projects", "log_targets", "interval_seconds", "chat_id", "namespaces", "enabled"}
+    if set(body) - allowed:
+        raise HTTPException(status_code=400, detail="不支持的巡检设置")
+    try:
+        return {"monitor": patrols.update(monitor_id, **body)}
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/patrols/{monitor_id}/scan")
+def patrol_scan(monitor_id: str, request: Request):
+    _auth(request)
+    from harness import patrols
+    return {"queued": patrols.request_scan(monitor_id)}
+
+
+@app.get("/api/patrols/{monitor_id}")
+def patrol_detail(monitor_id: str, request: Request):
+    _auth(request)
+    from harness import patrols
+    monitor = patrols.get(monitor_id)
+    if not monitor:
+        raise HTTPException(status_code=404, detail="巡检不存在")
+    return {"monitor": monitor, "scans": patrols.list_scans(monitor_id=monitor_id, limit=20),
+            "issues": patrols.list_issues(monitor_id=monitor_id, limit=200)}
+
+
+@app.get("/api/feishu/chats/{app_id}")
+def feishu_chat_list(app_id: int, request: Request):
+    _auth(request)
+    from feishu import chats
+    application = store.get_app(app_id)
+    if not application:
+        raise HTTPException(status_code=404, detail="应用不存在")
+    result = chats.list_for(application)
+    result["observed"] = store.list_observed_feishu_chats(app_id)
+    return result
+
+
+def _task_view(t, detail=False):
+    checkpoint = t.get("checkpoint") or {}
+    fields = ("id", "app_id", "chat_id", "instruction", "speaker_open_id", "workflow", "trigger", "status",
+              "attempts", "created", "updated", "ended", "result", "error", "cancel_requested")
+    view = {k: t.get(k) for k in fields}
+    view.update(progress=checkpoint.get("progress", ""), steps=checkpoint.get("step", 0),
+                tokens=checkpoint.get("tokens", 0))
+    if detail:
+        from core import taskstore
+        view["evidence"] = checkpoint.get("evidence", [])
+        view["actions"] = [dict(r) for r in store._conn.execute(
+            "SELECT action_key,tool,risk,state,approval_id,created,updated FROM task_actions WHERE task_id=? ORDER BY created",
+            (t["id"],)).fetchall()]
+    return view
+
+
+@app.get("/api/tasks")
+def task_list(request: Request):
+    _auth(request)
+    q = request.query_params
+    return {"tasks": [_task_view(t) for t in tasks.list_tasks(app_id=q.get("app_id") or None,
+            status=q.get("status") or None, limit=100)],
+            "workflows": {k: v[0] for k, v in workflows.PROFILES.items()}, "runtime": tasks.health()}
+
+
+@app.post("/api/tasks")
+async def task_submit(request: Request):
+    user = _auth(request)
+    b = await _body(request)
+    try:
+        t, created = tasks.submit(int(b.get("app_id") or 0), b.get("chat_id"), b.get("instruction"),
+                                  source="admin", event_id=b.get("request_id"), workflow=b.get("workflow", "auto"),
+                                  speaker=user, speaker_open_id="admin:" + user)
+    except (ValueError, PermissionError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"task": _task_view(t), "created": created}
+
+
+@app.get("/api/tasks/{task_id}")
+def task_detail(task_id: str, request: Request):
+    _auth(request)
+    t = tasks.get(task_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return _task_view(t, detail=True)
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def task_cancel(task_id: str, request: Request):
+    _auth(request)
+    return {"ok": tasks.cancel(task_id)}
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def task_resume(task_id: str, request: Request):
+    _auth(request)
+    b = await _body(request)
+    if b.get("instruction") is not None and (not isinstance(b["instruction"], str) or len(b["instruction"]) > 100000):
+        raise HTTPException(status_code=400, detail="补充指令必须是不超过 100000 字的文本")
+    if not tasks.resume(task_id, instruction=b.get("instruction")):
+        raise HTTPException(status_code=409, detail="任务状态不允许恢复；未决变更须先人工核对，审批请用飞书卡片")
     return {"ok": True}
 
 
@@ -338,6 +514,37 @@ async def save_connections(request: Request):
             store.set_setting("argocd_insecure", "1" if c["insecure"] else "0")
     return {"ok": True}
 
+
+@app.get("/api/connections/gitlab-project-tokens")
+def gitlab_project_tokens(request: Request):
+    _auth(request)
+    from ops import gitops_scan
+    configured = {item["project"] for item in gitops_scan.configured() if isinstance(item, dict) and item.get("project")}
+    tokens = ops_gitlab.project_tokens()
+    return {"projects": [{"project": project, "token_set": bool(tokens.get(project))}
+                         for project in sorted(configured)]}
+
+
+@app.put("/api/connections/gitlab-project-tokens")
+async def save_gitlab_project_token(request: Request):
+    _auth(request)
+    from ops import gitops_scan
+    from harness import patrols
+    body = await _body(request)
+    project = body.get("project")
+    if not isinstance(project, str) or project not in {r.get("project") for r in gitops_scan.configured()}:
+        raise HTTPException(status_code=400, detail="请先配置对应的 GitOps 仓库")
+    token = body.get("token")
+    if not isinstance(token, str) or not token or len(token) > 1000 or any(c.isspace() for c in token):
+        raise HTTPException(status_code=400, detail="项目 API 令牌格式无效")
+    tokens = ops_gitlab.project_tokens()
+    tokens[project] = token
+    store.set_setting("gitlab_project_tokens", json.dumps(tokens, ensure_ascii=False))
+    for monitor in patrols.list_monitors():
+        if project in monitor["git_projects"]:
+            patrols.request_scan(monitor["id"])
+    return {"ok": True, "project": project, "token_set": True}
+
 @app.post("/api/connections/test")
 async def test_connection(request: Request):
     _auth(request)
@@ -449,7 +656,7 @@ async def edit_vuln(cve: str, request: Request):
 
 # ---------- 代码仓库与工作区（harness.workspace） ----------
 def _repo_view(r):
-    v = {k: r.get(k) for k in ("id", "name", "url", "branch", "username", "test_cmd", "enabled")}
+    v = {k: r.get(k) for k in ("id", "name", "url", "branch", "username", "test_cmd", "validation_kind", "enabled")}
     v.update(token_set=bool(r.get("token")), token_masked=_mask(r.get("token")),
              write_token_set=bool(r.get("write_token")), write_token_masked=_mask(r.get("write_token")))
     return v
@@ -467,6 +674,10 @@ def _repo_fields(b, creating):
     for k in ("branch", "username", "test_cmd"):
         if k in b:
             f[k] = (b.get(k) or "").strip()
+    if "validation_kind" in b:
+        f["validation_kind"] = (b.get("validation_kind") or "").strip()
+        if f["validation_kind"] not in ("", "gitops"):
+            raise HTTPException(status_code=400, detail="不支持的仓库静态校验类型")
     for k in ("token", "write_token"):
         if b.get(k):
             f[k] = b[k].strip()
@@ -676,6 +887,7 @@ def _app_view(a):
         "thinking": bool(a.get("thinking", True)),
         "policy": policy.normalize(a.get("policy")),
         "approvers": a.get("approvers") or [],
+        "resources": a.get("resources") or {},
         "enabled": a["enabled"],
         "running": bot.is_running(a["id"]),
     }
@@ -696,6 +908,15 @@ def _policy_from(b):
     if preset not in policy.PRESETS:
         raise HTTPException(status_code=400, detail=f"未知的策略预设：{preset}")
     return {"preset": preset}
+
+def _resources_from(b):
+    if "resources" not in b:
+        return None
+    try:
+        return access.validate(b["resources"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
 
 def _approvers_from(b):
     """审批人 open_id 名单：接受数组或换行/逗号分隔的字符串；没传返回 None（不改）。"""
@@ -745,6 +966,7 @@ async def create_app(request: Request):
         raise HTTPException(status_code=400, detail="请填应用名称")
     pol = _policy_from(b)
     appr = _approvers_from(b)
+    resources = _resources_from(b)
     aid = store.create_app(
         name, (b.get("feishu_app_id") or "").strip(), (b.get("feishu_app_secret") or "").strip(),
         b.get("ai_provider_id"), b.get("system_prompt") or "",
@@ -757,6 +979,8 @@ async def create_app(request: Request):
         store.update_app(aid, policy=pol)
     if appr is not None:
         store.update_app(aid, approvers=appr)
+    if resources is not None:
+        store.update_app(aid, resources=resources)
     return {"ok": True, "id": aid, "note": "新应用的飞书长连接需重启服务后建立"}
 
 @app.put("/api/apps/{aid}")
@@ -777,6 +1001,9 @@ async def edit_app(aid: int, request: Request):
     appr = _approvers_from(b)
     if appr is not None:
         fields["approvers"] = appr
+    resources = _resources_from(b)
+    if resources is not None:
+        fields["resources"] = resources
     store.update_app(aid, **fields)
     auth.reset(aid)   # 该应用飞书凭证若变更，取数立即用新值；长连接仍需重启
     return {"ok": True, "note": "人设/工具/AI 即时生效；飞书凭证或启用状态变更需重启服务重连"}

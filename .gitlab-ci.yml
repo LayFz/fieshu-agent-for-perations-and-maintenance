@@ -1,4 +1,5 @@
-# feishu-agent CI/CD：build(构镜像→推 Harbor) → deploy(.51 内网) → notify(飞书)。仅 main 分支触发。
+# feishu-agent CI/CD：test → build(构镜像→推 Harbor) → deploy(.51 内网) → notify(飞书)。
+# MR 与 main 执行本地替身测试；构建、部署、通知仍只在 main 运行。
 # 镜像双标签 :SHA(精确回滚) + :latest。单容器(Python + SQLite，前端内置)，比支付中台简单。
 #
 # 需在 GitLab 项目 Settings → CI/CD → Variables 配置（Masked 标注的勿泄漏）：
@@ -11,12 +12,32 @@
 # 前置：build runner(tags: build，shell executor，宿主有 docker + daemon.json insecure-registries:[<harbor-host>])；
 #       .51 已放好 config.yaml（飞书凭证+管理员密码）与 data/。
 
-stages: [build, deploy, notify]
+stages: [test, build, deploy, notify]
 
 variables:
   REGISTRY: "$HARBOR_REGISTRY"
   PROJECT: "$HARBOR_PROJECT"
   TAG: "$CI_COMMIT_SHORT_SHA"
+
+# 现有 build runner 是 shell executor，直接用宿主 Docker 提供固定 Python 版本。
+# 不挂载 Docker socket/生产配置，不启用 live sandbox，不发送真实飞书消息。
+test:
+  stage: test
+  tags: [build]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - >-
+      docker run --rm
+      --mount "type=bind,src=$CI_PROJECT_DIR,dst=/workspace,readonly"
+      --workdir /workspace
+      --env PYTHONDONTWRITEBYTECODE=1
+      --env FEISHU_AGENT_CONFIG=
+      --env FEISHU_AGENT_DATA_DIR=/tmp/feishu-agent-tests
+      --env HARNESS_LIVE_SANDBOX=0
+      python:3.12-slim
+      sh -c 'python -m pip install --disable-pip-version-check -r requirements-dev.txt && python -m unittest discover -s tests -v'
 
 build:
   stage: build

@@ -184,6 +184,8 @@
       <a data-page="intel" data-ic="radar"><span class="t">情报源</span></a>
       <div class="nlabel">工程</div>
       <a data-page="code" data-ic="branch"><span class="t">代码仓库</span></a>
+      <a data-page="tasks" data-ic="activity"><span class="t">任务中心</span></a>
+      <a data-page="patrols" data-ic="activity"><span class="t">持续巡检</span></a>
       <a data-page="runs" data-ic="activity"><span class="t">运行记录</span></a>
       <div class="nlabel">运维集成</div>
       <a data-page="connections" data-ic="key"><span class="t">连接凭证</span></a>
@@ -241,7 +243,7 @@ function enterApp(username){ $('#login').style.display='none'; $('#app').style.d
 $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
-const PAGES = { overview, apps, providers, skills, mcp, code: codePage, schedules, memory, runs: runsPage, usage, obs, ssh, k8s, account,
+const PAGES = { patrols: patrolsPage, tasks: tasksPage, overview, apps, providers, skills, mcp, code: codePage, schedules, memory, runs: runsPage, usage, obs, ssh, k8s, account,
   vulns: vulnsPage, intel: intelPage, connections: connectionsPage };
 function go(page){
   if(!PAGES[page]) page='overview';
@@ -282,6 +284,85 @@ async function refreshNavBadge(){
   try{ const {total}=await api('GET','/api/vulns?kev=1&status=new&limit=1'); const b=$('#nav-vuln-badge');
     b.textContent=total; b.style.display=total?'inline-block':'none'; b.title='在野利用(KEV)且未研判'; }catch(e){}
 }
+
+/* ---------- 持久任务中心 ---------- */
+async function patrolsPage(){
+  $('#content').innerHTML='<h2>持续巡检</h2><p class="desc">feishu-agent 自主读取真实环境，持续记录问题。新问题、恢复与采集失败才通知；没有汇报群时仍保存结果。</p><div class="toolbar"><button class="btn" onclick="newPatrol()">配置巡检</button><button class="btn ghost" onclick="patrolRepositories()">GitOps 仓库连接</button><button class="btn ghost" onclick="patrolProjectTokens()">GitLab 项目 API 凭据</button><button class="btn ghost" onclick="patrolsPage()">刷新</button></div><div id="patrol-body">加载中…</div>';
+  try{
+    const r=await api('GET','/api/patrols');
+    $('#patrol-body').innerHTML=`<div class="card"><b>运行状态</b><p>飞书守护：${r.feishu.supervisor_running?'运行':'未运行'} · 定时调度：${r.scheduler.running?'运行':'未运行'}</p>${(r.feishu.apps||[]).map(a=>`<p>应用 ${a.app_id}：${esc(a.state)}${a.connected?' · 已连接':''}${a.last_error?' · '+esc(a.last_error):''}</p>`).join('')}<details><summary>巡检与通知状态</summary><pre>${esc(JSON.stringify(r.runtime,null,2))}</pre></details></div>`+(r.monitors.length?`<table><thead><tr><th>巡检</th><th>范围</th><th>周期</th><th>汇报目标</th><th>操作</th></tr></thead><tbody>${r.monitors.map(m=>`<tr><td>${esc(m.name)}<div class="muted">${m.enabled?'已启用':'已暂停'}</div></td><td>${esc(m.cluster||'—')}<div>${esc((m.git_projects||[]).join(', '))}</div><div>${esc((m.log_targets||[]).map(t=>t.org+'/'+t.stream).join(', '))}</div></td><td>${m.interval_seconds} 秒</td><td>${esc(m.chat_id||'未绑定，结果仅保存本地')}</td><td><button class="btn sm ghost" onclick="patrolDetail('${m.id}')">报告 / 问题</button> <button class="btn sm" onclick="patrolNow('${m.id}')">立即扫描</button> <button class="btn sm ghost" onclick="patrolEdit('${m.id}')">编辑范围</button> <button class="btn sm ghost" onclick="patrolBind('${m.id}',${m.app_id})">绑定会话</button> <button class="btn sm ghost" onclick="patrolToggle('${m.id}',${!m.enabled})">${m.enabled?'暂停':'启用'}</button></td></tr>`).join('')}</tbody></table>`:'<div class="empty">尚未配置巡检。先给应用授权资源，再添加巡检。</div>');
+  }catch(e){$('#patrol-body').textContent=e.message;}
+}
+async function patrolDetail(id){
+  const r=await api('GET','/api/patrols/'+id);
+  openModal(`<h2>${esc(r.monitor.name)}</h2><h3>问题台账</h3>${r.issues.length?r.issues.map(i=>`<div class="card"><b>${esc(i.title||i.key)}</b><p>${esc(i.severity||'')} · ${i.active?'待处理':'已恢复'}</p><p>${esc(i.detail||'')}</p><div class="mono">${esc(typeof i.resource==='string'?i.resource:JSON.stringify(i.resource||''))}</div></div>`).join(''):'<p>尚无问题记录；请检查采集是否已经成功。</p>'}<h3>最近扫描</h3>${r.scans.map(s=>`<details><summary>${esc(s.id)} · ${dt(s.created)}</summary><pre style="white-space:pre-wrap;max-height:440px;overflow:auto">${esc(JSON.stringify(s.snapshot||s,null,2))}</pre></details>`).join('')||'<p>尚未扫描</p>'}<div class="save-bar"><button class="btn ghost" onclick="patrolDetail('${id}')">刷新</button><button class="btn" onclick="closeModal()">关闭</button></div>`);
+}
+async function patrolNow(id){try{await api('POST','/api/patrols/'+id+'/scan',{});toast('已排队，由应用执行');}catch(e){toast(e.message);}}
+async function patrolToggle(id,enabled){try{await api('PATCH','/api/patrols/'+id,{enabled});await patrolsPage();}catch(e){toast(e.message);}}
+async function patrolEdit(id){
+  try{
+    const {monitor:m}=await api('GET','/api/patrols/'+id);
+    openModal(`<h2>编辑巡检范围</h2><label>集群</label><input id="patrol-edit-cluster" value="${esc(m.cluster||'')}"><label>GitLab 项目（逗号分隔）</label><input id="patrol-edit-projects" value="${esc((m.git_projects||[]).join(', '))}"><label>日志目标（每行 org/stream）</label><textarea id="patrol-edit-logs">${esc((m.log_targets||[]).map(t=>t.org+'/'+t.stream).join('\n'))}</textarea><label>间隔秒数</label><input id="patrol-edit-interval" type="number" min="60" value="${m.interval_seconds}"><div class="save-bar"><button class="btn" onclick="savePatrolEdit('${id}')">保存并重新扫描</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+  }catch(e){toast(e.message);}
+}
+async function savePatrolEdit(id){
+  try{
+    const log_targets=$('#patrol-edit-logs').value.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>{const at=x.indexOf('/');if(at<=0||at===x.length-1)throw new Error('日志目标请按 org/stream 每行填写');return {org:x.slice(0,at),stream:x.slice(at+1)};});
+    await api('PATCH','/api/patrols/'+id,{cluster:$('#patrol-edit-cluster').value.trim()||null,git_projects:$('#patrol-edit-projects').value.split(',').map(x=>x.trim()).filter(Boolean),log_targets,interval_seconds:Number($('#patrol-edit-interval').value)});
+    closeModal();await patrolsPage();
+  }catch(e){toast(e.message);}
+}
+async function patrolBind(id,appId){
+  const r=await api('GET','/api/feishu/chats/'+appId);
+  const observed=r.observed||[];
+  openModal(`<h2>绑定汇报会话</h2><p class="desc">绑定后，应用会重新扫描并发送首次报告。请选择目标群或单聊；最近交互记录只证明机器人收到过消息，不保证当前仍在群内。</p>${r.error?`<p class="hint">${esc(r.error)}。在目标群 @机器人发送“我的身份”，即可留下 chat_id 和 open_id 供后台选择。</p>`:''}<label>可读取的群</label><select id="patrol-chat-select" onchange="$('#patrol-chat').value=this.value"><option value="">选择群</option>${r.chats.map(c=>`<option value="${esc(c.chat_id)}">${esc(c.name)} · ${esc(c.chat_id)}</option>`).join('')}</select><label>最近交互的会话</label><select id="patrol-observed-select" onchange="$('#patrol-chat').value=this.value"><option value="">选择会话</option>${observed.map(c=>`<option value="${esc(c.chat_id)}">${c.chat_type==='group'?'群':'单聊'} · ${esc(c.chat_id)}</option>`).join('')}</select>${observed.length?`<details><summary>最近交互的发言人 open_id（配置应用审批人时使用）</summary><pre>${esc(observed.map(c=>c.chat_id+'：'+(c.sender_open_ids||[]).join(', ')).join('\n'))}</pre></details>`:''}<label>chat_id</label><input id="patrol-chat" placeholder="oc_..."><div class="save-bar"><button class="btn" onclick="savePatrolChat('${id}')">保存汇报目标</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+}
+async function savePatrolChat(id){try{const chat_id=$('#patrol-chat').value.trim();if(!chat_id)throw new Error('请输入目标会话');await api('PATCH','/api/patrols/'+id,{chat_id});closeModal();await patrolsPage();}catch(e){toast(e.message);}}
+async function newPatrol(){
+  const r=await api('GET','/api/apps');
+  openModal(`<h2>配置持续巡检</h2><label>应用</label><select id="patrol-app">${r.apps.filter(a=>a.enabled).map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select><label>名称</label><input id="patrol-name" value="环境巡检"><label>已授权集群名称</label><input id="patrol-cluster"><label>已授权 GitLab 项目（逗号分隔）</label><input id="patrol-projects"><label>日志组织</label><input id="patrol-log-org" value="default"><label>已授权日志流（逗号分隔）</label><input id="patrol-log-streams" placeholder="k8s_upmore_api, k8s_argocd"><label>间隔秒数（至少 60）</label><input id="patrol-interval" type="number" value="300" min="60"><p class="desc">集群使用应用已配置的 namespace 权限。首次可不指定群，先在本页查看真实扫描结果。</p><div class="save-bar"><button class="btn" onclick="saveNewPatrol()">启用巡检</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+}
+async function saveNewPatrol(){try{const org=$('#patrol-log-org').value.trim(), streams=$('#patrol-log-streams').value.split(',').map(x=>x.trim()).filter(Boolean);await api('POST','/api/patrols',{app_id:Number($('#patrol-app').value),name:$('#patrol-name').value,cluster:$('#patrol-cluster').value.trim()||null,git_projects:$('#patrol-projects').value.split(',').map(x=>x.trim()).filter(Boolean),log_targets:streams.map(stream=>({org,stream})),interval_seconds:Number($('#patrol-interval').value)});closeModal();await patrolsPage();}catch(e){toast(e.message);}}
+async function patrolRepositories(){
+  try{
+    const r=await api('GET','/api/patrols/repositories');
+    openModal(`<h2>GitOps 仓库连接</h2><p class="desc">每个项目配置只读 SSH 地址和分支；使用服务进程现有 SSH 身份及 known_hosts。不要在 URL 中填口令。</p><textarea id="patrol-repositories" style="min-height:220px">${esc(JSON.stringify(r.repositories,null,2))}</textarea><div class="save-bar"><button class="btn" onclick="savePatrolRepositories()">保存并重新扫描</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+  }catch(e){toast(e.message);}
+}
+async function savePatrolRepositories(){
+  try{const repositories=JSON.parse($('#patrol-repositories').value);await api('PUT','/api/patrols/repositories',{repositories});closeModal();await patrolsPage();}catch(e){toast(e.message);}
+}
+async function patrolProjectTokens(){
+  try{
+    const r=await api('GET','/api/connections/gitlab-project-tokens');
+    openModal(`<h2>GitLab 项目 API 凭据</h2><p class="desc">每个项目单独使用项目访问令牌。仅巡检可用 Reporter + read_api；若还需审批后提修复 MR，可用 Developer + api。此处只用于只读项目与流水线查询；保存后令牌不再回显。</p><label>项目</label><select id="patrol-token-project">${r.projects.map(p=>`<option value="${esc(p.project)}">${esc(p.project)} · ${p.token_set?'已配置':'未配置'}</option>`).join('')}</select><label>项目访问令牌</label><input id="patrol-token-value" type="password" autocomplete="off"><div class="save-bar"><button class="btn" onclick="savePatrolProjectToken()">保存并重新扫描</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+  }catch(e){toast(e.message);}
+}
+async function savePatrolProjectToken(){
+  try{await api('PUT','/api/connections/gitlab-project-tokens',{project:$('#patrol-token-project').value,token:$('#patrol-token-value').value.trim()});closeModal();await patrolsPage();}catch(e){toast(e.message);}
+}
+
+const TASK_ST={queued:'排队中',running:'执行中',waiting_approval:'等待审批',waiting_input:'等待补充',needs_attention:'待核对',completed:'已交付',failed:'失败',cancelling:'取消中',cancelled:'已取消'};
+async function tasksPage(){
+  const c=$('#content');
+  c.innerHTML='<h2>任务中心</h2><p class="desc">集群排查、问题日志和漏洞修复共享持久任务；进度和结果通过飞书送达。</p><div class="toolbar"><button class="btn" onclick="newTask()">新建任务</button><button class="btn ghost" onclick="tasksPage()">刷新</button></div><div id="tasks-body">加载中…</div>';
+  const r=await api('GET','/api/tasks');
+  if(!$('#tasks-body')) return;
+  $('#tasks-body').innerHTML='<div class="hint">在线 worker：'+r.runtime.workers+'</div>'+(r.tasks.length?`<table><thead><tr><th>任务</th><th>工作流</th><th>状态</th><th>进度</th><th>更新时间</th></tr></thead><tbody>${r.tasks.map(t=>`<tr><td><a href="#tasks" onclick="taskDetail('${t.id}');return false">${esc(t.instruction.slice(0,80))}</a><div class="mono muted">${t.id}</div></td><td>${esc(r.workflows[t.workflow]||t.workflow)}</td><td>${esc(TASK_ST[t.status]||t.status)}</td><td>${esc(t.progress||'—')}</td><td>${dt(t.updated)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">还没有任务。在飞书 @ 助手，或点击新建任务。</div>');
+}
+async function newTask(){
+  const r=await api('GET','/api/apps');
+  openModal(`<h2>新建任务</h2><label>执行应用</label><select id="task-app">${r.apps.filter(a=>a.enabled).map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select><label>飞书 chat_id（结果发送到此群/单聊）</label><input id="task-chat" placeholder="oc_xxx"><label>工作流</label><select id="task-flow"><option value="auto">自动选择</option><option value="cluster">集群排障</option><option value="logs">问题日志</option><option value="vulnerability">漏洞分析与修复</option><option value="development">研发修复</option></select><label>任务目标与验收要求</label><textarea id="task-input" placeholder="排查 upmore-api 近 15 分钟的错误日志，给出根因证据和修复建议"></textarea><div class="save-bar"><button class="btn" onclick="submitTask()">提交</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+}
+async function submitTask(){
+  try{ const r=await api('POST','/api/tasks',{app_id:Number($('#task-app').value),chat_id:$('#task-chat').value.trim(),workflow:$('#task-flow').value,instruction:$('#task-input').value,request_id:window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`}); closeModal(); toast('任务已保存'); await tasksPage(); await taskDetail(r.task.id); }catch(e){toast(e.message);}
+}
+async function taskDetail(id){
+  const t=await api('GET','/api/tasks/'+id);
+  openModal(`<h2>任务详情</h2><div class="mono">${t.id}</div><p>${esc(t.instruction)}</p><p>状态：${esc(TASK_ST[t.status]||t.status)} · 模型轮数 ${t.steps} · token ${t.tokens}</p><p>${esc(t.progress||'')}</p><pre style="white-space:pre-wrap">${esc([t.result,t.error].filter(Boolean).join('\n\n')||'执行中，稍后刷新查看进度')}</pre><h3>执行证据</h3><pre style="white-space:pre-wrap;max-height:300px;overflow:auto">${esc(JSON.stringify(t.evidence,null,2))}</pre><h3>工具与审批</h3><pre style="white-space:pre-wrap;max-height:200px;overflow:auto">${esc(JSON.stringify(t.actions,null,2))}</pre><div class="save-bar"><button class="btn ghost" onclick="taskDetail('${id}')">刷新</button>${['failed','needs_attention','waiting_input'].includes(t.status)?`<button class="btn" onclick="resumeTask('${id}')">继续任务</button>`:''}${!['completed','cancelled','failed'].includes(t.status)?`<button class="btn danger" onclick="cancelTask('${id}')">取消任务</button>`:''}<button class="btn ghost" onclick="closeModal()">关闭</button></div>`);
+}
+async function cancelTask(id){try{await api('POST','/api/tasks/'+id+'/cancel',{});toast('已请求取消');await taskDetail(id);}catch(e){toast(e.message);}}
+async function resumeTask(id){const instruction=prompt('可补充任务信息；未决变更必须先核对，不能直接重试。');if(instruction===null)return;try{await api('POST','/api/tasks/'+id+'/resume',{instruction});toast('已排队');await taskDetail(id);}catch(e){toast(e.message);}}
 
 /* ---------- 概览 ---------- */
 async function overview(){
@@ -538,7 +619,7 @@ function _appForm(a){
   const mcp = _mcpPool.map(s=>`<label><input type="checkbox" class="mc" value="${s.id}" ${(a.mcp||[]).includes(s.id)?'checked':''}>
       <span><span class="tn">${esc(s.name)}${s.enabled?'':'（已停用）'}</span><br><span class="td">${esc(s.url||'')}</span></span></label>`).join('');
   const sset=a.feishu_secret_set;
-  const pol=a.policy||{preset:'compat'};
+  const pol=a.policy||{preset:'readonly'};
   const polOpts=_presetPool.map(p=>`<option value="${p.key}" ${pol.preset===p.key?'selected':''}>${esc(p.name)}</option>`).join('')
     +`<option value="custom" ${pol.preset==='custom'?'selected':''}>自定义规则</option>`;
   const polRules=JSON.stringify(pol.preset==='custom'?pol.rules:((_presetPool.find(p=>p.key===pol.preset)||_presetPool[0]||{}).rules||[]),null,2);
@@ -572,6 +653,9 @@ function _appForm(a){
     <label>审批人（飞书 open_id，一行一个；策略里有 ask 时由他们在群里点「批准一次」。留空＝谁都批不了，需要审批的操作一律拒绝）</label>
     <textarea id="ap-approvers" class="mono" style="min-height:60px" placeholder="ou_xxxxxxxx">${esc((a.approvers||[]).join('\n'))}</textarea>
     <div class="hint">open_id 可在「运行记录」里点开某次 run，看「触发人」。执行类操作不能由发起人自己批准。</div>
+    <label>资源权限（JSON；未列出的资源默认禁止访问）</label>
+    <textarea id="ap-resources" class="mono" style="min-height:150px">${esc(JSON.stringify(a.resources||{},null,2))}</textarea>
+    <div class="hint">例：{"k8s_clusters":["主集群"],"namespaces":["upmore-api"],"repos":["gitops"],"log_orgs":["default"],"log_streams":["k8s_upmore_api"]}。完整访问须显式填写 ["*"]。可选 users/chats 限制发起人和群。生产连接仍应使用最小权限账号。</div>
     <label>可用工具（只勾该应用该有的——能力隔离）</label>
     <div class="toolpick">${tools||'<span class="muted">工具池为空</span>'}</div>
     <label>可用技能（知识/工作方法包——只勾该应用该懂的）</label>
@@ -608,6 +692,7 @@ async function saveApp(id){
     try{ body.policy={preset:'custom', rules:JSON.parse($('#ap-pol-rules').value)}; }
     catch(e){ toast('自定义规则不是合法 JSON'); return; }
   } else body.policy={preset:pv};
+  try{ body.resources=JSON.parse($('#ap-resources').value); }catch(e){ toast('资源权限不是合法 JSON'); return; }
   body.approvers=$('#ap-approvers').value.split(/[\s,，]+/).map(s=>s.trim()).filter(Boolean);
   try{
     if(id) await api('PUT','/api/apps/'+id,body); else await api('POST','/api/apps',body);
@@ -950,7 +1035,7 @@ async function codePage(){
       <td style="max-width:0;width:100%"><b class="mono">${esc(r.name)}</b>${r.enabled?'':' <span class="tag off">已停用</span>'}
         <div class="muted mono" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(r.url)}">${esc(r.url)}${r.branch?' @'+esc(r.branch):''}</div></td>
       <td class="muted" style="white-space:nowrap">${r.token_set?'✅ 可克隆':'⚠ 未配读令牌'}<br>${r.write_token_set?'✅ 可提 MR':'— 不能提 MR'}</td>
-      <td class="mono muted" style="font-size:12px">${esc(r.test_cmd||'（未配置）')}</td>
+      <td class="mono muted" style="font-size:12px">${esc(r.test_cmd|| (r.validation_kind==='gitops'?'GitOps 静态校验':'（未配置）'))}</td>
       <td style="white-space:nowrap"><button class="btn ghost sm" onclick="editRepo(${r.id})">编辑</button>
         <button class="btn danger" onclick="delRepo(${r.id},'${esc(r.name)}')">删除</button></td></tr>`).join('')
     : '<tr><td colspan="4" class="muted">还没有仓库。登记后，给应用勾上 code_* 工具，数字员工就能在一次性工作区里改代码、跑测试、提 MR。</td></tr>';
@@ -972,20 +1057,21 @@ async function codePage(){
 }
 function _repoForm(r){
   return `<h3>${r.id?'编辑仓库':'登记仓库'}</h3>
-    <p class="desc">读令牌用只读 Deploy Token（read_repository）；提 MR 用项目访问令牌（Project Access Token，角色 Developer，scope 只勾 api），只授予这一个项目。</p>
+    <p class="desc">可用同一个项目访问令牌读取仓库和在审批后提 MR：角色 Developer，scope 为 api + read_repository，仅授予这一个项目。无需 write_repository；应用不会直接 git push。</p>
     <div class="row">
       <div style="flex:0 0 220px"><label>名称（模型用它打开）</label><input id="cr-name" class="mono" value="${esc(r.name||'')}" placeholder="feishu-agent"></div>
       <div><label>仓库地址（https）</label><input id="cr-url" value="${esc(r.url||'')}" placeholder="https://gitlab.layfz.com/group/repo.git"></div>
       <div style="flex:0 0 130px"><label>默认分支</label><input id="cr-branch" value="${esc(r.branch||'')}" placeholder="main"></div>
     </div>
     <div class="row">
-      <div><label>读：Deploy Token 用户名</label><input id="cr-user" value="${esc(r.username||'')}" placeholder="gitlab+deploy-token-1"></div>
-      <div><label>读：Deploy Token ${r.token_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label><input id="cr-token" type="password" placeholder="${r.token_set?'留空保持不变':'粘贴令牌'}"></div>
+      <div><label>读：Git 用户名</label><input id="cr-user" value="${esc(r.username||'')}" placeholder="oauth2"></div>
+      <div><label>读：read_repository 令牌 ${r.token_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label><input id="cr-token" type="password" placeholder="${r.token_set?'留空保持不变':'粘贴令牌'}"></div>
     </div>
     <label>写：提 MR 用的项目访问令牌 ${r.write_token_set?'<span class="muted">（已设置，留空＝不改）</span>':'<span class="muted">（不填＝只能改和看 diff，不能提 MR）</span>'}</label>
     <input id="cr-wtoken" type="password" placeholder="${r.write_token_set?'留空保持不变':'glpat-…'}">
     <label>测试命令（在仓库根目录用 sh -c 执行；不填＝不能跑测试）</label>
     <input id="cr-test" class="mono" value="${esc(r.test_cmd||'')}" placeholder="pip install -q -r requirements.txt && pytest -q">
+    <label>静态校验</label><select id="cr-validation"><option value="" ${!r.validation_kind?'selected':''}>无</option><option value="gitops" ${r.validation_kind==='gitops'?'selected':''}>GitOps YAML/JSON（提 MR 前必须通过）</option></select>
     <div class="row"><div style="flex:0 0 160px"><label>启用</label><select id="cr-enabled"><option value="1" ${r.enabled!==false?'selected':''}>启用</option><option value="0" ${r.enabled===false?'selected':''}>停用</option></select></div></div>
     <div class="save-bar"><button class="btn" onclick="saveRepo(${r.id||0})">保存</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
 }
@@ -993,7 +1079,8 @@ function newRepo(){ openModal(_repoForm({})); }
 function editRepo(id){ openModal(_repoForm(_repoCache.find(r=>r.id===id)||{})); }
 async function saveRepo(id){
   const body={ name:$('#cr-name').value.trim(), url:$('#cr-url').value.trim(), branch:$('#cr-branch').value.trim(),
-    username:$('#cr-user').value.trim(), test_cmd:$('#cr-test').value.trim(), enabled:Number($('#cr-enabled').value) };
+    username:$('#cr-user').value.trim(), test_cmd:$('#cr-test').value.trim(),
+    validation_kind:$('#cr-validation').value, enabled:Number($('#cr-enabled').value) };
   const t=$('#cr-token').value.trim(); if(t) body.token=t;
   const w=$('#cr-wtoken').value.trim(); if(w) body.write_token=w;
   try{ if(id) await api('PUT','/api/code-repos/'+id,body); else await api('POST','/api/code-repos',body);

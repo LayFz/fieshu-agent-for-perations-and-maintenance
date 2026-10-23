@@ -88,7 +88,6 @@ _conn.executescript("""
 """)
 _conn.commit()
 
-
 def _ensure_col(table, col, decl):
     cols = [r["name"] for r in _conn.execute(f"PRAGMA table_info({table})").fetchall()]
     if col not in cols:
@@ -97,13 +96,18 @@ def _ensure_col(table, col, decl):
 
 # 老库迁移：给记忆/用量表补 app_id（已存在则跳过）
 _ensure_col("msgs", "app_id", "INTEGER")
+_ensure_col("msgs", "task_id", "TEXT")
+_ensure_col("msgs", "context_key", "TEXT")
+_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgs_task ON msgs(task_id,role) WHERE task_id IS NOT NULL")
+_conn.commit()
 _ensure_col("notes", "app_id", "INTEGER")
 _ensure_col("token_usage", "app_id", "INTEGER")
 _ensure_col("apps", "skills", "TEXT DEFAULT '[]'")
 _ensure_col("apps", "mcp", "TEXT DEFAULT '[]'")     # 应用勾选的 MCP server id 名单
 _ensure_col("apps", "thinking", "INTEGER DEFAULT 1")  # 是否开启模型「思考(reasoning)」模式，默认开
-_ensure_col("apps", "policy", "TEXT DEFAULT '{}'")    # 工具调用策略（harness.policy），空=默认「兼容」预设
+_ensure_col("apps", "policy", "TEXT DEFAULT '{}'")    # 工具调用策略，空=默认只读
 _ensure_col("apps", "approvers", "TEXT DEFAULT '[]'")  # 审批人 open_id 名单（harness.approval），空=谁都批不了
+_ensure_col("apps", "resources", "TEXT DEFAULT '{}'")  # 资源白名单；未配置不开放受管资源
 # 技能来源（harness.skills）：source_id 为空=后台手工技能；非空=从 Git 同步，后台只读
 _ensure_col("skills", "source_id", "INTEGER")
 _ensure_col("skills", "plugin", "TEXT")          # 所属 plugin（能力仓）名
@@ -178,6 +182,14 @@ _conn.executescript("""
         status TEXT DEFAULT 'open',
         created REAL, last_used REAL);
     CREATE INDEX IF NOT EXISTS idx_ws_app ON workspaces(app_id, chat_id, status);
+    CREATE TABLE IF NOT EXISTS feishu_observed_chats(
+        app_id INTEGER NOT NULL,
+        chat_id TEXT NOT NULL,
+        sender_open_id TEXT NOT NULL,
+        chat_type TEXT,
+        last_seen REAL NOT NULL,
+        PRIMARY KEY(app_id, chat_id, sender_open_id));
+    CREATE INDEX IF NOT EXISTS idx_feishu_observed_app ON feishu_observed_chats(app_id, last_seen);
     CREATE TABLE IF NOT EXISTS intel_sources(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL, kind TEXT, category TEXT,
@@ -207,6 +219,7 @@ _conn.executescript("""
     CREATE INDEX IF NOT EXISTS idx_vulns_seen ON vulns(last_seen);
 """)
 _conn.commit()
+_ensure_col("code_repos", "validation_kind", "TEXT DEFAULT ''")
 
 
 # ---------- 运行时设置(kv：引导 + 全局，如 OpenObserve 连接) ----------
@@ -279,6 +292,10 @@ def delete_provider(pid):
 # ---------- 应用（数字员工/席位） ----------
 def _app_row(r):
     d = dict(r)
+    try:
+        d["resources"] = json.loads(d.get("resources") or "{}")
+    except Exception:
+        d["resources"] = {}
     for col in ("tools", "skills", "mcp"):
         try:
             d[col] = json.loads(d.get(col) or "[]")
@@ -287,7 +304,7 @@ def _app_row(r):
     try:
         d["policy"] = json.loads(d.get("policy") or "{}")
     except Exception:
-        d["policy"] = {}
+        d["policy"] = {"preset": "deny"}
     try:
         d["approvers"] = json.loads(d.get("approvers") or "[]")
     except Exception:
@@ -324,6 +341,8 @@ def create_app(name, feishu_app_id="", feishu_app_secret="", ai_provider_id=None
 
 def update_app(aid, **f):
     sets, vals = [], []
+    if "resources" in f:
+        sets.append("resources=?"); vals.append(json.dumps(f["resources"], ensure_ascii=False))
     for k in ("name", "feishu_app_id", "ai_provider_id", "system_prompt", "history_turns", "enabled", "thinking"):
         if k in f and f[k] is not None:
             sets.append(f"{k}=?")
@@ -708,16 +727,41 @@ def set_password(new_password):
 
 
 # ---------- 对话记忆（按应用隔离） ----------
-def save(app_id, chat_id, role, content):
+def save(app_id, chat_id, role, content, task_id=None, context_key=None):
     with _lock:
-        _conn.execute("INSERT INTO msgs(app_id,chat_id,role,content,ts) VALUES(?,?,?,?,?)",
-                      (app_id, chat_id, role, content, time.time()))
+        _conn.execute("INSERT OR IGNORE INTO msgs(app_id,chat_id,role,content,ts,task_id,context_key) VALUES(?,?,?,?,?,?,?)",
+                      (app_id, chat_id, role, content, time.time(), task_id, context_key))
         _conn.commit()
 
-def load_history(app_id, chat_id, turns):
-    rows = _conn.execute("SELECT role,content FROM msgs WHERE app_id=? AND chat_id=? ORDER BY id DESC LIMIT ?",
-                         (app_id, chat_id, turns * 2)).fetchall()
+def load_history(app_id, chat_id, turns, context_key=None):
+    clause = " AND context_key=?" if context_key is not None else ""
+    values = (app_id, chat_id) + ((context_key,) if context_key is not None else ()) + (turns * 2,)
+    rows = _conn.execute("SELECT role,content FROM msgs WHERE app_id=? AND chat_id=?" + clause +
+                         " ORDER BY id DESC LIMIT ?", values).fetchall()
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def observe_feishu_chat(app_id, chat_id, sender_open_id, chat_type):
+    """仅记录机器人真实收到的会话与发言人标识，不保存消息正文。"""
+    with _lock:
+        _conn.execute("INSERT INTO feishu_observed_chats(app_id,chat_id,sender_open_id,chat_type,last_seen) "
+                      "VALUES(?,?,?,?,?) ON CONFLICT(app_id,chat_id,sender_open_id) DO UPDATE SET "
+                      "chat_type=excluded.chat_type,last_seen=excluded.last_seen",
+                      (app_id, str(chat_id)[:200], str(sender_open_id or "")[:200], str(chat_type or "")[:20], time.time()))
+        _conn.commit()
+
+
+def list_observed_feishu_chats(app_id, limit=100):
+    rows = _conn.execute("SELECT chat_id,sender_open_id,chat_type,last_seen FROM feishu_observed_chats "
+                         "WHERE app_id=? ORDER BY last_seen DESC LIMIT ?", (app_id, max(1, min(int(limit), 500)))).fetchall()
+    result = {}
+    for row in rows:
+        chat = result.setdefault(row["chat_id"], {"chat_id": row["chat_id"], "chat_type": row["chat_type"],
+                                                   "last_seen": row["last_seen"], "sender_open_ids": []})
+        if row["sender_open_id"] and row["sender_open_id"] not in chat["sender_open_ids"]:
+            chat["sender_open_ids"].append(row["sender_open_id"])
+    return list(result.values())
+
 
 def list_chats(app_id=None):
     if app_id is None:
@@ -737,15 +781,17 @@ def chat_messages(app_id, chat_id, limit=200):
 
 
 # ---------- 长期笔记（按应用隔离） ----------
-def add_note(app_id, content):
+def add_note(app_id, content, scope="app"):
     with _lock:
         _conn.execute("INSERT INTO notes(app_id,scope,content,ts) VALUES(?,?,?,?)",
-                      (app_id, "app", content, time.time()))
+                      (app_id, scope, content, time.time()))
         _conn.commit()
 
-def load_notes(app_id, limit=30):
-    rows = _conn.execute("SELECT content FROM notes WHERE app_id=? ORDER BY id DESC LIMIT ?",
-                         (app_id, limit)).fetchall()
+def load_notes(app_id, limit=30, scope=None):
+    clause = " AND scope=?" if scope is not None else ""
+    values = (app_id,) + ((scope,) if scope is not None else ()) + (limit,)
+    rows = _conn.execute("SELECT content FROM notes WHERE app_id=?" + clause +
+                         " ORDER BY id DESC LIMIT ?", values).fetchall()
     return [r["content"] for r in rows]
 
 def list_notes(app_id=None, limit=300):
@@ -928,7 +974,7 @@ def cancel_pending_approvals():
 
 
 # ---------- 代码仓库与工作区（harness.workspace） ----------
-_REPO_FIELDS = ("name", "url", "branch", "username", "token", "write_token", "test_cmd", "enabled")
+_REPO_FIELDS = ("name", "url", "branch", "username", "token", "write_token", "test_cmd", "validation_kind", "enabled")
 
 def list_code_repos():
     return [dict(r, enabled=bool(r["enabled"]))

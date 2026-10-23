@@ -17,10 +17,15 @@ RISKS = ("read", "local", "write", "exec")
 # local 只改本次代码工作区（一次性目录），对外无影响；对外的出口只有 write 类的「提 MR」
 # write 改外部状态（文档、笔记、定时任务、提 MR）
 # exec  在机器/集群上执行命令，或跑仓库里可能被改过的代码
-DEFAULT_PRESET = "compat"
+DEFAULT_PRESET = "readonly"
 CUSTOM = "custom"
 
 PRESETS = {
+    "deny": {
+        "name": "禁止执行",
+        "description": "拒绝全部工具。策略格式无效时使用此预设，避免错误配置扩大权限。",
+        "rules": [{"decision": "deny"}],
+    },
     "compat": {
         "name": "兼容",
         "description": "和改造前一致：勾选的工具全部放行，只叠加 guard（黑名单、只读集群、旁听拦截）。",
@@ -34,7 +39,7 @@ PRESETS = {
     "approval": {
         "name": "审批",
         "description": "只读工具和代码工作区内的改动直接放行；写入（含提 MR）和执行（含跑测试）先在群里发审批卡片，"
-                       "审批人点「批准一次」才执行。定时任务、旁听等没人在线的场景一律拒绝。需要在下方配置审批人。",
+                       "审批人点「批准一次」才执行。持久定时任务可挂起等待审批；旁听和委派任务不能发起审批。需要在下方配置审批人。",
         "rules": [{"risk": ["read", "local"], "decision": "allow"}, {"decision": "ask"}],
     },
 }
@@ -65,21 +70,29 @@ def validate_rules(rules):
 
 
 def normalize(policy):
-    """把库里的 policy（dict / JSON 字符串 / 空）规范成 {"preset", "rules"?}。坏数据退回默认预设。"""
+    """未配置默认只读；坏数据禁止执行；兼容放行必须显式选择。"""
+    if policy is None or policy == "":
+        return {"preset": DEFAULT_PRESET}
     if isinstance(policy, str):
         try:
-            policy = json.loads(policy or "{}")
+            policy = json.loads(policy)
         except Exception:
-            policy = {}
+            return {"preset": "deny"}
     if not isinstance(policy, dict):
-        policy = {}
-    preset = policy.get("preset") or DEFAULT_PRESET
+        return {"preset": "deny"}
+    preset = policy.get("preset")
+    if preset is None or preset == "":
+        preset = DEFAULT_PRESET
+    if not isinstance(preset, str) or set(policy) - {"preset", "rules"}:
+        return {"preset": "deny"}
     if preset == CUSTOM:
         try:
             return {"preset": CUSTOM, "rules": validate_rules(policy.get("rules"))}
-        except ValueError:
-            return {"preset": DEFAULT_PRESET}
-    return {"preset": preset if preset in PRESETS else DEFAULT_PRESET}
+        except (ValueError, TypeError):
+            return {"preset": "deny"}
+    if "rules" in policy:
+        return {"preset": "deny"}
+    return {"preset": preset if preset in PRESETS else "deny"}
 
 
 def rules_of(policy):
@@ -98,6 +111,8 @@ def _matches(rule, tool, risk):
 def decide(policy, tool, risk):
     """返回 (decision, 规则序号(1 起，没命中为 None), 预设名)。"""
     p = normalize(policy)
+    if risk not in RISKS:
+        return "deny", None, p["preset"]
     for i, rule in enumerate(rules_of(p), 1):
         if _matches(rule, tool, risk):
             return rule["decision"], i, p["preset"]
@@ -149,5 +164,19 @@ def _guard_proactive(call):
                 "如果确实需要处理，请在回复里说明，等有人点名你再做。")
 
 
+def _guard_untrusted(call):
+    """外部文本可以用于分析/沙箱修复，不能直接获得生产执行权限。"""
+    if not call.extra.get("tainted") or call.risk == "read":
+        return None
+    if call.risk == "local" and call.tool.startswith("code_"):
+        return None
+    if call.tool == "code_test" and call.extra.get("sandboxed"):
+        return None
+    if call.tool == "code_propose_mr":
+        return None       # pipeline 强制审批，快照由执行器复核
+    return "本任务已读取外部内容，禁止直接写入外部系统或执行生产命令；请提交独立授权的变更任务。"
+
+
 register_guard("not_exposed", _guard_not_exposed)
 register_guard("proactive", _guard_proactive)
+register_guard("untrusted_content", _guard_untrusted)

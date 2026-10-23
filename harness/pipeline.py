@@ -1,17 +1,12 @@
-"""工具执行管道：所有工具调用（原生 / MCP）都走 run_tool()，固定五段：
+"""统一工具管道：策略/guard、持久动作、审批、执行与结果记录。
 
-  1. 记录   写 tool/call；参数从此冻结，后面任何一段都改不了（执行器拿到的是副本）
-  2. 策略   按应用规则表决定 allow / deny / ask（harness.policy.decide）
-  3. guard  只拒不放；任何一个给出理由就拒绝，策略的 allow 也推翻不了
-  4. 执行   allow 才执行；统一超时；抛异常归一为 {"error": ...}，不让整轮对话崩
-  5. 后处理 写 tool/result，返回给模型的字符串
-
-被拒绝不会让对话失败：给模型一个错误结果，写明被谁、为什么拦下，让它换路或如实告诉用户。
-ask：guard 先跑（别让人去批一个反正会被 guard 拦下的操作），过了再走 harness.approval 问人，
-只有「批准一次」才执行；guard 只看冻结的参数，等待期间 run 被阻塞，所以先跑与后跑结果一致。
+有副作用的动作必须先落库，超时或中断进入待核对，不能由模型盲目重试。
+线程超时只停止等待；代码沙箱的实际终止由独立执行器负责。
 """
 import contextvars
 import copy
+import hashlib
+import inspect
 import json
 import threading
 import time
@@ -19,109 +14,209 @@ from dataclasses import dataclass, field
 
 from . import policy
 
-RESULT_PREVIEW = 4000        # 事件里保留的工具结果预览长度（完整结果外存留待 P3）
+RESULT_PREVIEW = 4000
 DEFAULT_TIMEOUT = 120
 
 
 @dataclass
 class ToolCall:
-    """一次工具调用。guard 读它做判断；args 已冻结（深拷贝），guard 不应修改。"""
     id: str
     tool: str
     args: dict
-    risk: str = "exec"             # read / write / exec（未知按最高风险）
-    external: bool = False         # 结果是否含外部不可信文本（污染标记 P4 用）
+    risk: str = "exec"
+    external: bool = False
     timeout: int = DEFAULT_TIMEOUT
-    exposed: bool = True           # 是否在本应用暴露给模型的工具清单里
-    raw_args: str = None           # 参数 JSON 解析失败时的原文
+    exposed: bool = True
+    raw_args: str = None
     trigger: str = ""
     app_id: int = None
     extra: dict = field(default_factory=dict)
 
 
 def _run_with_timeout(fn, args, timeout):
-    """在独立线程里执行，超时就放弃等待（同进程代码杀不掉，线程会自己跑完后丢弃结果）。
-    用 copy_context 让执行线程继承 contextvar（飞书文档工具靠它拿本应用凭证）。"""
+    """不把等待超时描述成取消；执行结果不明时由调用者停止有副作用任务。"""
     box = {}
     ctx = contextvars.copy_context()
 
     def target():
         try:
-            box["result"] = ctx.run(fn, args)
+            box["result"] = ctx.run(fn, copy.deepcopy(args))
         except Exception as e:
-            box["result"] = {"error": f"工具执行出错：{type(e).__name__}: {e}"}
+            box["exception"] = e
 
     th = threading.Thread(target=target, name="tool-exec", daemon=True)
     th.start()
     th.join(timeout)
     if th.is_alive():
-        return {"error": f"工具执行超时（超过 {timeout} 秒），已放弃等待它的结果。"}
+        return {"error": f"工具等待超过 {timeout} 秒；执行可能仍在继续，需核对实际结果。",
+                "outcome": "unknown", "timed_out": True, "retry_safe": False}
+    if "exception" in box:
+        from . import tasks
+        exc = box["exception"]
+        if isinstance(exc, (tasks.TaskCancelled, tasks.TaskSuspended, tasks.TaskUncertain)):
+            raise exc
+        return {"error": f"工具执行出错：{type(exc).__name__}: {exc}",
+                "outcome": "unknown", "retry_safe": False}
     return box.get("result")
 
 
 def _denied_result(by, name, reason):
-    who = "安全检查" if by == "guard" else "应用的工具策略"
-    return {"error": f"调用被{who}拒绝，没有执行。原因：{reason}", "denied_by": f"{by}:{name}"}
+    return {"error": f"调用被拒绝，没有执行。原因：{reason}", "denied_by": f"{by}:{name}"}
+
+
+def _digest(tool, args):
+    body = json.dumps({"tool": tool, "args": args}, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def preview(call):
+    """新预览函数接收规范后的参数；保留旧无参回调兼容。"""
+    fn = call.extra.get("preview")
+    if not callable(fn):
+        return None
+    params = inspect.signature(fn).parameters
+    if params and next(iter(params.values())).default is inspect.Parameter.empty:
+        return fn(copy.deepcopy(call.args))
+    return fn()
+
+
+def _result(rec, call, result, status, started):
+    content = json.dumps(result, ensure_ascii=False, default=str)
+    rec.emit("tool/result", {"status": status,
+             "duration_ms": int((time.time() - started) * 1000), "chars": len(content),
+             "result": content[:RESULT_PREVIEW], "truncated": len(content) > RESULT_PREVIEW},
+             call_id=call.id, tool=call.tool)
+    return content
 
 
 def run_tool(rec, call, app_policy, executor, app=None):
-    """执行一次工具调用，返回给模型的结果字符串。executor(args) -> 任意可 JSON 化的结果。
-    app：审批要用（审批人名单、发卡片的飞书凭证）；不传时需要审批的调用按拒绝。"""
-    # 1. 记录（先于执行）
-    payload = {"args": call.args, "risk": call.risk}
-    if call.raw_args is not None:
-        payload.update(raw_args=call.raw_args, parse_error=True)
-    if call.external:
-        payload["external"] = True
-    rec.emit("tool/call", payload, call_id=call.id, tool=call.tool)
-    call.args = copy.deepcopy(call.args)        # 冻结：执行器和 guard 拿到的是副本
+    from core import taskstore, store
+    from . import tasks
 
-    # 2. 策略
+    started = time.time()
+    tasks.check_active()
+    scope = tasks.current()
+    key = call.extra.get("action_key") or call.id
+    lease = ({"lease_owner": scope["lease_owner"], "lease_epoch": scope["lease_epoch"]}
+             if scope else {})
+    action = taskstore.action_get(scope["id"], key) if scope else None
+    call.args = copy.deepcopy(call.args)
+    call.extra["tainted"] = bool(getattr(rec, "tainted", False))
+
+    def update(**fields):
+        if scope:
+            return taskstore.action_update(scope["id"], key, **lease, **fields)
+
+    def deny(reason, by="guard", name="validation", persist=True):
+        content = _result(rec, call, _denied_result(by, name, reason), "denied", started)
+        if action and persist:
+            update(state="denied", result=content)
+        return content
+
+    if call.raw_args is not None or not isinstance(call.args, dict):
+        rec.emit("tool/call", {"parse_error": True, "risk": call.risk}, call_id=call.id, tool=call.tool)
+        return deny("工具参数不是有效的 JSON 对象，必须重新生成有效参数。")
+    if action:
+        if action["tool"] != call.tool or action["risk"] != call.risk:
+            raise tasks.TaskUncertain("恢复动作的工具或风险等级发生变化，需要人工核对。")
+        call.args = copy.deepcopy(action["args"])
+        if action["state"] in ("completed", "denied"):
+            # 已执行结果的重放也是一次读取；撤权后不再把历史敏感结果送给模型。
+            fresh = store.get_app(scope["app_id"])
+            if not call.exposed or policy.decide(fresh.get("policy"), call.tool, call.risk)[0] == "deny":
+                return deny("当前应用权限不允许读取此动作的历史结果。", "guard", "replay_access", persist=False)
+            validate = call.extra.get("validate")
+            if callable(validate):
+                try:
+                    if validate(copy.deepcopy(call.args)) is False:
+                        raise ValueError("当前授权或动作版本无效")
+                except Exception as e:
+                    return deny(f"历史动作结果已不可访问：{e}", "guard", "replay_access", persist=False)
+            if call.external and action["state"] == "completed":
+                rec.tainted = True
+            return action["result"]
+        if action["state"] in ("running", "uncertain") and call.risk != "read":
+            raise tasks.TaskUncertain(f"动作 {call.tool} 的上次执行结果未确认，禁止自动重复执行。")
+    else:
+        prepare = call.extra.get("prepare")
+        if callable(prepare):
+            try:
+                call.args = prepare(copy.deepcopy(call.args))
+                if not isinstance(call.args, dict):
+                    raise ValueError("动作准备必须返回参数对象")
+            except Exception as e:
+                return deny(f"动作准备失败：{e}")
+        if scope:
+            action = taskstore.action_prepare(scope["id"], key, call.tool, call.args, call.risk,
+                                              digest=_digest(call.tool, call.args), **lease)
+    call.extra["action"] = action
+    call.extra["action_key"] = key
+    rec.emit("tool/call", {"args": call.args, "risk": call.risk, "external": call.external},
+             call_id=call.id, tool=call.tool)
+
+    # 恢复后读取最新策略，不沿用审批前快照中的权限。
+    if scope:
+        fresh = store.get_app(scope["app_id"])
+        if not fresh or not fresh["enabled"]:
+            raise tasks.TaskCancelled("应用已停用或删除")
+        app, app_policy = fresh, fresh.get("policy")
     decision, rule_no, preset = policy.decide(app_policy, call.tool, call.risk)
-    preset_name = policy.PRESETS.get(preset, {}).get("name", "自定义" if preset == policy.CUSTOM else preset)
-    where = f"策略「{preset_name}」" + (f"第 {rule_no} 条规则" if rule_no else "没有规则放行，")
-    verdict = {"decision": decision, "by": "policy", "preset": preset, "rule": rule_no}
-    if decision == "deny":
-        verdict["reason"] = f"{where}拒绝 {call.risk} 类工具"
-    elif decision == "ask":
-        verdict["reason"] = f"{where}要求 {call.risk} 类工具先经人工审批"
-
-    # 3. guard（策略已拒绝的也跑一遍，审计里能看到所有命中的拦截原因；只取第一个）
+    reason = f"策略 {preset} 第 {rule_no} 条规则：{decision} {call.risk}"
+    # 外部内容驱动的 MR 必须由人批准，不能通过 compat 自动对外提交。
+    if decision == "allow" and call.extra["tainted"] and call.tool == "code_propose_mr":
+        decision, reason = "ask", "外部内容参与的代码变更必须批准对应快照后再提 MR。"
+    if decision == "allow" and action and action.get("approval_id"):
+        decision, reason = "ask", "已有审批必须按其持久结果处理，不能跳过拒绝或过期决定。"
     hit = policy.check_guards(call)
     if hit:
-        verdict = {"decision": "deny", "by": "guard", "guard": hit[0], "reason": hit[1],
-                   "policy_decision": decision, "preset": preset, "rule": rule_no}
-    rec.emit("tool/decision", verdict, call_id=call.id, tool=call.tool)
-
-    # 3b. 审批（guard 已放过、策略要求 ask）
-    if verdict["decision"] == "ask":
+        decision, reason = "deny", hit[1]
+    rec.emit("tool/decision", {"decision": decision, "preset": preset, "rule": rule_no,
+                              "reason": reason, "guard": hit[0] if hit else None},
+             call_id=call.id, tool=call.tool)
+    if decision == "deny":
+        return deny(reason, "guard" if hit else "policy", hit[0] if hit else preset)
+    if decision == "ask":
+        from . import approval
         if app is None:
-            outcome, note = "unavailable", "缺少应用上下文，无法发起审批，已拒绝。"
-        else:
-            from . import approval      # 延迟导入：approval 依赖 store，避免与 policy 互相牵连
-            outcome, note = approval.request(rec, call, app, verdict["reason"])
-        if outcome == "allowed-once":
-            verdict = dict(verdict, decision="allow", approved=True)
-        else:
-            verdict = dict(verdict, decision="deny", reason=f"{verdict['reason']}；{note}", outcome=outcome)
-
-    # 4. 执行
-    t0 = time.time()
-    if verdict["decision"] == "allow":
-        result = _run_with_timeout(executor, call.args, call.timeout)
-        status = "error" if isinstance(result, dict) and "error" in result else "ok"
-    else:
-        name = verdict.get("guard") or (f"rule{rule_no}" if rule_no else preset)
-        result = _denied_result(verdict["by"], name, verdict["reason"])
-        status = "denied"
-
-    # 5. 后处理
+            return deny("没有应用上下文，无法发起审批。", "approval", "unavailable")
+        outcome, note = approval.request(rec, call, app, reason)
+        if outcome != "allowed-once":
+            return deny(note, "approval", outcome)
+        # 审批等待期间环境/权限可变化，批准不能绕过最新 guard。
+        tasks.check_active()
+        hit = policy.check_guards(call)
+        if hit:
+            return deny(hit[1], "guard", hit[0])
+        if scope:
+            fresh = store.get_app(scope["app_id"])
+            current_decision, _, _ = policy.decide(fresh.get("policy"), call.tool, call.risk)
+            if current_decision == "deny":
+                return deny("审批后应用策略已拒绝此操作。", "policy", "changed")
+    validate = call.extra.get("validate")
+    if callable(validate):
+        try:
+            validated = validate(copy.deepcopy(call.args))
+            if validated is False:
+                raise ValueError("动作快照已变化")
+        except Exception as e:
+            return deny(f"执行前校验失败，原审批失效：{e}", "guard", "snapshot")
+    tasks.check_active()
+    if action and action.get("digest") != _digest(call.tool, call.args):
+        return deny("动作参数在审批后发生变化，拒绝执行。", "guard", "digest")
+    if action:
+        update(state="running")
+    result = _run_with_timeout(executor, call.args, call.timeout)
+    if call.external:
+        # 远端错误正文也属于外部文本，不能借“请求失败”绕过来源限制。
+        rec.tainted = True
+    is_error = isinstance(result, dict) and "error" in result
+    uncertain = is_error and call.risk != "read"
     content = json.dumps(result, ensure_ascii=False, default=str)
-    rec.emit("tool/result", {
-        "status": status,
-        "duration_ms": int((time.time() - t0) * 1000),
-        "chars": len(content),
-        "result": content[:RESULT_PREVIEW],
-        "truncated": len(content) > RESULT_PREVIEW,
-    }, call_id=call.id, tool=call.tool)
+    if action:
+        update(state="uncertain" if uncertain else "completed", result=content)
+    _result(rec, call, result, "uncertain" if uncertain else ("error" if is_error else "ok"), started)
+    if uncertain:
+        rec.uncertain = True
+        raise tasks.TaskUncertain(f"{call.tool} 执行结果需要核对：{result['error']}")
     return content

@@ -3,18 +3,20 @@
 边界：
   - 模型只能动工作区里的文件（路径解析后必须落在仓库目录内，不能碰 .git，符号链接跳出一律拒）。
   - diff 只看「模型通过工具改过的文件」（workspaces.changed），和 HEAD 比；跑测试生成的产物不进 MR。
-  - 跑测试只能跑后台配置的命令（code_repos.test_cmd），清理环境变量、HOME 指到工作区；
-    但仓库代码模型能改，所以跑测试等同执行任意代码 —— 工具元数据按 exec 处理，建议配「审批」预设。
+  - 跑测试只能跑后台配置的命令，输入复制到无网络的独立 Docker 沙箱；不可用时拒绝，绝不回退主机 shell。
+  - 审批固定工作区和完整输入快照；测试证明与 MR 绑定同一快照，文件变化会使旧审批/测试失效。
   - 提 MR 不用 git push：调 GitLab「创建提交」API 在新分支上基于当初克隆的提交（start_sha）一次性提交，
     再建 MR。写权限令牌只在后台配置里，模型和工作区都拿不到。
   - 工作区按 应用+群 归属，闲置超过 TTL 自动清理；每个应用同时打开的数量有上限。
 """
 import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
-import subprocess
+import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -22,9 +24,10 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
+import yaml
 
 from core import store
-from . import gitutil
+from . import gitutil, sandbox
 
 TTL_HOURS = 24
 MAX_OPEN_PER_APP = 5
@@ -35,6 +38,8 @@ MAX_SEARCH_HITS = 200
 MAX_LIST = 500
 MAX_DIFF_CHARS = 60000
 TEST_TIMEOUT = 600
+MAX_SNAPSHOT_BYTES = 100 * 1024 * 1024
+MAX_SNAPSHOT_FILES = 20000
 _SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache", ".pytest_cache"}
 
 _locks = {}
@@ -51,14 +56,60 @@ def _root():
 
 def _lock(ws_id):
     with _locks_guard:
-        return _locks.setdefault(ws_id, threading.Lock())
+        return _locks.setdefault(ws_id, threading.RLock())
+
+
+def _task():
+    from . import tasks
+    return tasks.current()
+
+
+def _active():
+    from . import tasks
+    tasks.check_active()
+
+
+def _meta(ws_id):
+    with store._lock:
+        store._conn.execute("CREATE TABLE IF NOT EXISTS workspace_safety "
+                            "(workspace_id TEXT PRIMARY KEY, task_id TEXT, test_result TEXT, mr_state TEXT, "
+                            "mr_snapshot TEXT, commit_sha TEXT, validation_result TEXT)")
+        columns = {row["name"] for row in store._conn.execute("PRAGMA table_info(workspace_safety)")}
+        if "validation_result" not in columns:
+            store._conn.execute("ALTER TABLE workspace_safety ADD COLUMN validation_result TEXT")
+        store._conn.commit()
+    row = store._conn.execute("SELECT * FROM workspace_safety WHERE workspace_id=?", (ws_id,)).fetchone()
+    return dict(row) if row else {}
+
+
+def _save_meta(ws_id, **values):
+    _meta(ws_id)
+    allowed = {"task_id", "test_result", "mr_state", "mr_snapshot", "commit_sha", "validation_result"}
+    if not values or set(values) - allowed:
+        raise ValueError("invalid workspace metadata")
+    with store._lock:
+        store._conn.execute("INSERT OR IGNORE INTO workspace_safety(workspace_id) VALUES(?)", (ws_id,))
+        store._conn.execute("UPDATE workspace_safety SET " + ",".join(k + "=?" for k in values) +
+                            " WHERE workspace_id=?", [*values.values(), ws_id])
+        store._conn.commit()
+
+
+def _ensure_mutable(ws):
+    _active()
+    fresh = store.get_workspace(ws["id"])
+    if not fresh or fresh["status"] != "open":
+        raise WorkspaceError("工作区已关闭。")
+    if _meta(ws["id"]).get("mr_state"):
+        raise WorkspaceError("工作区已经开始提交 MR，不能再修改；请打开新工作区。")
 
 
 # ---------- 仓库与工作区 ----------
 def list_repos():
     """给模型看的可改仓库清单（不含任何凭证）。"""
     return [{"name": r["name"], "branch": r.get("branch") or "(默认分支)",
-             "can_test": bool(r.get("test_cmd")), "can_mr": bool(r.get("write_token"))}
+             "can_test": bool(r.get("test_cmd")) and bool(sandbox.image_name()),
+             "test_backend": "docker", "validation": r.get("validation_kind") or "",
+             "can_mr": bool(r.get("write_token"))}
             for r in store.list_code_repos() if r["enabled"]]
 
 
@@ -67,12 +118,13 @@ def _repo_dir(ws):
 
 
 def open_workspace(app_id, chat_id, repo_name, branch=None):
+    _active()
     repo = store.get_code_repo_by_name(repo_name)
     if not repo or not repo["enabled"]:
         raise WorkspaceError(f"没有可用的代码仓库「{repo_name}」。可用：{[r['name'] for r in list_repos()] or '（后台还没配）'}")
     opened = store.list_workspaces(status="open", app_id=app_id)
-    for old in opened[MAX_OPEN_PER_APP - 1:]:          # 超出上限：关掉最久没用的
-        close_workspace(old["id"], reason="超出同时打开上限")
+    if len(opened) >= MAX_OPEN_PER_APP:
+        raise WorkspaceError("打开的工作区已达上限，请先关闭已交付任务的工作区。")
     ws_id = uuid.uuid4().hex[:12]
     base = _root() / ws_id
     base.mkdir(parents=True, exist_ok=True)
@@ -83,6 +135,8 @@ def open_workspace(app_id, chat_id, repo_name, branch=None):
         shutil.rmtree(base, ignore_errors=True)
         raise WorkspaceError(str(e))
     store.create_workspace(ws_id, app_id, chat_id, repo["id"], str(base), br or "", commit)
+    task = _task()
+    _save_meta(ws_id, task_id=task["id"] if task else None)
     ws = store.get_workspace(ws_id)
     return {"workspace": ws_id, "repo": repo["name"], "branch": br or "(默认分支)", "commit": commit[:12],
             "tree": list_dir(ws, ".")["entries"]}
@@ -90,12 +144,20 @@ def open_workspace(app_id, chat_id, repo_name, branch=None):
 
 def get_workspace(ws_id, app_id, chat_id):
     """取工作区并校验归属；ws_id 为空取本应用本群最近打开的。"""
-    ws = store.get_workspace(ws_id) if ws_id else store.latest_workspace(app_id, chat_id)
+    task = _task()
+    task_id = task["id"] if task else None
+    if ws_id:
+        ws = store.get_workspace(ws_id)
+    else:
+        ws = next((w for w in store.list_workspaces(status="open", app_id=app_id)
+                   if w["chat_id"] == chat_id and _meta(w["id"]).get("task_id") == task_id), None)
     if not ws or ws["status"] != "open":
         raise WorkspaceError("没有打开的工作区，先用 code_open 打开一个仓库。" if not ws_id
                              else f"工作区 {ws_id} 不存在或已关闭。")
-    if ws["app_id"] != app_id:
-        raise WorkspaceError(f"工作区 {ws_id} 不属于本应用。")
+    if ws["app_id"] != app_id or ws["chat_id"] != chat_id:
+        raise WorkspaceError("工作区不属于本应用和会话。")
+    if _meta(ws["id"]).get("task_id") != task_id:
+        raise WorkspaceError("工作区不属于当前任务。")
     store.update_workspace(ws["id"], last_used=time.time())
     return ws
 
@@ -299,6 +361,7 @@ def write_file(ws, rel, content):
     if len(data) > MAX_WRITE_BYTES:
         raise WorkspaceError(f"内容超过 {MAX_WRITE_BYTES // 1024}KB，拆小一点或用 code_edit 局部修改。")
     with _lock(ws["id"]):
+        _ensure_mutable(ws)
         p, rel_norm = _resolve(ws, rel, for_write=True)
         if rel_norm == "." or p.is_dir():
             raise WorkspaceError(f"{rel} 是目录，不能写。")
@@ -310,6 +373,7 @@ def write_file(ws, rel, content):
 
 def edit_file(ws, rel, old, new, replace_all=False):
     with _lock(ws["id"]):
+        _ensure_mutable(ws)
         p, rel_norm = _resolve(ws, rel, must_exist=True, for_write=True)
         if not p.is_file():
             raise WorkspaceError(f"{rel} 不是普通文件。")
@@ -332,6 +396,7 @@ def edit_file(ws, rel, old, new, replace_all=False):
 
 def delete_file(ws, rel):
     with _lock(ws["id"]):
+        _ensure_mutable(ws)
         p, rel_norm = _resolve(ws, rel, must_exist=True, for_write=True)
         if not p.is_file():
             raise WorkspaceError(f"{rel} 不是普通文件，只能删文件。")
@@ -340,14 +405,102 @@ def delete_file(ws, rel):
     return {"ok": True, "path": rel_norm, "changed_files": len(changed)}
 
 
+# ---------- 固定目标与快照 ----------
+def _snapshot(ws, copy_to=None):
+    """完整输入摘要，包含未修改文件和测试配置；拷贝与摘要使用同一批读取的字节。"""
+    fresh = store.get_workspace(ws["id"])
+    repo = store.get_code_repo(ws["repo_id"]) or {}
+    if not fresh or fresh["status"] != "open" or not repo.get("enabled"):
+        raise WorkspaceError("工作区或代码仓库已停用。")
+    root = _repo_dir(ws).resolve()
+    digest = hashlib.sha256()
+    context = {"workspace": ws["id"], "repo_id": ws["repo_id"], "repo_url": repo.get("url"),
+               "base_commit": fresh["base_commit"], "base_branch": fresh["base_branch"],
+               "changed": fresh["changed"], "command": repo.get("test_cmd") or "",
+               "validation": repo.get("validation_kind") or "",
+               "sandbox_image": sandbox.resolve_image() if repo.get("test_cmd") else None}
+    digest.update(json.dumps(context, sort_keys=True, ensure_ascii=False).encode())
+    count, size = 0, 0
+    if copy_to:
+        copy_to = Path(copy_to)
+        copy_to.mkdir(parents=True, exist_ok=True)
+        copy_to.chmod(0o755)
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not (Path(directory) == root and d == ".git"))
+        for name in dirs:
+            if (Path(directory) / name).is_symlink():
+                raise WorkspaceError("测试/提交快照不接受符号链接目录。")
+        for name in sorted(files):
+            path = Path(directory) / name
+            rel = path.relative_to(root).as_posix()
+            if rel == ".git":
+                continue
+            mode = path.lstat().st_mode
+            if not stat.S_ISREG(mode) or path.is_symlink():
+                raise WorkspaceError(f"快照包含非普通文件：{rel}")
+            count += 1
+            size += path.stat().st_size
+            if count > MAX_SNAPSHOT_FILES or size > MAX_SNAPSHOT_BYTES:
+                raise WorkspaceError("工作区超过快照大小限制，请移除无关依赖/构建产物。")
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as handle:
+                data = handle.read(MAX_SNAPSHOT_BYTES + 1)
+            if len(data) > MAX_SNAPSHOT_BYTES:
+                raise WorkspaceError("快照文件过大。")
+            executable = bool(mode & 0o111)
+            digest.update(json.dumps([rel, executable, len(data)], ensure_ascii=False).encode())
+            digest.update(data)
+            if copy_to:
+                dest = copy_to / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                dest.chmod(0o755 if executable else 0o644)
+    return digest.hexdigest()
+
+
+def prepare_action(name, args, ctx):
+    """先固定 workspace 默认值，再把审批绑定到完整代码与测试配置。"""
+    if name not in ("code_test", "code_propose_mr"):
+        return dict(args)
+    ws = get_workspace(args.get("workspace"), ctx["app_id"], ctx["chat_id"])
+    with _lock(ws["id"]):
+        prepared = {k: v for k, v in args.items() if not k.startswith("_")}
+        prepared["workspace"] = ws["id"]
+        prepared["_snapshot"] = _snapshot(ws)
+        prepared["_test_command"] = (store.get_code_repo(ws["repo_id"]) or {}).get("test_cmd") or ""
+        return prepared
+
+
+def validate_action(name, args, ctx):
+    if name not in ("code_test", "code_propose_mr"):
+        return
+    ws = get_workspace(args.get("workspace"), ctx["app_id"], ctx["chat_id"])
+    with _lock(ws["id"]):
+        if not args.get("_snapshot") or _snapshot(ws) != args["_snapshot"]:
+            raise WorkspaceError("审批后的代码、目标或测试配置已变化，请重新准备并审批本次操作。")
+
+
+def _changed_bytes(ws):
+    """提交路径重新检查，不能通过测试产物的符号链接读取控制面文件。"""
+    fresh = store.get_workspace(ws["id"])
+    for rel, kind in sorted(fresh["changed"].items()):
+        path, norm = _resolve(ws, rel, must_exist=kind == "write", for_write=True)
+        if norm != rel or kind not in ("write", "delete") or norm == ".":
+            raise WorkspaceError("工作区变更路径无效。")
+        data = None
+        if kind == "write":
+            if not path.is_file() or path.stat().st_size > MAX_WRITE_BYTES:
+                raise WorkspaceError(f"变更文件不是受支持的普通文本文件：{rel}")
+            data = path.read_bytes()
+        yield rel, kind, data
+
+
 # ---------- diff ----------
 def diff(ws, max_chars=MAX_DIFF_CHARS):
     ws = store.get_workspace(ws["id"])
     files, chunks = [], []
-    for rel, kind in sorted(ws["changed"].items()):
+    for rel, kind, after in _changed_bytes(ws):
         before = gitutil.head_blob(_repo_dir(ws), rel)
-        p = _repo_dir(ws) / rel
-        after = p.read_bytes() if kind == "write" and p.is_file() else None
         status = "deleted" if after is None else ("added" if before is None else "modified")
         a = (before or b"").decode("utf-8", "replace").splitlines(keepends=True)
         b = (after or b"").decode("utf-8", "replace").splitlines(keepends=True)
@@ -363,25 +516,62 @@ def diff(ws, max_chars=MAX_DIFF_CHARS):
 
 
 # ---------- 测试 ----------
-def run_tests(ws, timeout=TEST_TIMEOUT):
+def run_tests(ws, timeout=TEST_TIMEOUT, expected_snapshot=None):
     repo = store.get_code_repo(ws["repo_id"]) or {}
     cmd = (repo.get("test_cmd") or "").strip()
     if not cmd:
         raise WorkspaceError("这个仓库在后台没配置测试命令，无法跑测试。")
-    root = _repo_dir(ws)
-    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": str(Path(ws["path"])),
-           "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "CI": "1", "PYTHONDONTWRITEBYTECODE": "1"}
-    t0 = time.time()
-    try:
-        proc = subprocess.run(["/bin/sh", "-c", cmd], cwd=root, env=env, capture_output=True,
-                              text=True, timeout=timeout)
-        code, out, err = proc.returncode, proc.stdout or "", proc.stderr or ""
-    except subprocess.TimeoutExpired as e:
-        code = None
-        out = (e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
-        err = f"测试超时（>{timeout}s），已终止。"
-    return {"command": cmd, "exit_code": code, "passed": code == 0, "duration_s": round(time.time() - t0, 1),
-            "stdout_tail": out[-6000:], "stderr_tail": err[-3000:]}
+    with _lock(ws["id"]):
+        _ensure_mutable(ws)
+        with tempfile.TemporaryDirectory(prefix="feishu-test-input-") as temp:
+            snapshot = _snapshot(ws, temp)
+            if expected_snapshot and snapshot != expected_snapshot:
+                raise WorkspaceError("代码/测试配置已变化，本次审批已失效。")
+            try:
+                result = sandbox.run(temp, cmd, timeout=timeout, check_active=_active)
+            except sandbox.SandboxUncertain as e:
+                return {"error": str(e), "outcome_unknown": True}
+            except sandbox.SandboxError as e:
+                raise WorkspaceError(str(e)) from e
+            _active()
+            if _snapshot(ws) != snapshot:
+                raise WorkspaceError("测试期间工作区发生变化，测试证明已失效。")
+            result["snapshot"] = snapshot
+            _save_meta(ws["id"], test_result=json.dumps(result, ensure_ascii=False))
+            return result
+
+
+def validate_manifests(ws):
+    """静态校验 GitOps 工作区的全部改动；不执行仓库代码，也不返回 Secret 载荷。"""
+    with _lock(ws["id"]):
+        _ensure_mutable(ws)
+        repo = store.get_code_repo(ws["repo_id"]) or {}
+        if repo.get("validation_kind") != "gitops":
+            raise WorkspaceError("该仓库未配置 GitOps 静态校验。")
+        snapshot = _snapshot(ws)
+        changes = list(_changed_bytes(ws))
+        if not changes:
+            raise WorkspaceError("工作区没有待校验的改动。")
+        errors, files = [], []
+        for rel, kind, data in changes:
+            files.append(rel)
+            if not rel.endswith((".yaml", ".yml", ".json")):
+                errors.append(f"{rel}: GitOps 修复仅接受 YAML/JSON 清单文件")
+                continue
+            if kind == "delete":
+                continue
+            try:
+                docs = list(yaml.safe_load_all(data.decode("utf-8")))
+                for index, doc in enumerate(docs, 1):
+                    if isinstance(doc, dict) and doc.get("kind") == "Secret" and any(
+                            bool(doc.get(field)) for field in ("data", "stringData")):
+                        errors.append(f"{rel} 第 {index} 段: 原生 Secret 含明文数据，请改用 SealedSecret")
+            except (UnicodeError, yaml.YAMLError):
+                errors.append(f"{rel}: YAML/JSON 语法无效")
+        result = {"passed": not errors, "files": files, "errors": errors[:20],
+                  "snapshot": snapshot, "kind": "gitops", "note": "仅校验改动文件语法与原生 Secret；发布仍需 CI 和 ArgoCD 验证"}
+        _save_meta(ws["id"], validation_result=json.dumps(result, ensure_ascii=False))
+        return result
 
 
 # ---------- 提 MR（GitLab API，写权限令牌只在后台） ----------
@@ -399,37 +589,60 @@ def _slug(text):
     return s[:30] or "change"
 
 
-def propose_mr(ws, title, description=""):
+def propose_mr(ws, title, description="", expected_snapshot=None):
+    with _lock(ws["id"]):
+        return _propose_mr_locked(ws, title, description, expected_snapshot)
+
+
+def _propose_mr_locked(ws, title, description, expected_snapshot):
+    _active()
     repo = store.get_code_repo(ws["repo_id"]) or {}
     if not repo.get("write_token"):
         raise WorkspaceError("这个仓库在后台没配置提 MR 用的令牌，不能提 MR（diff 可以给人看后手工提交）。")
     ws = store.get_workspace(ws["id"])
     if ws.get("mr_url"):
-        raise WorkspaceError(f"这个工作区已经提过 MR：{ws['mr_url']}。继续改请先 code_close 再重新打开。")
+        return {"ok": True, "mr_url": ws["mr_url"], "branch": ws.get("mr_branch"), "reused": True}
+    snapshot = _snapshot(ws)
+    if expected_snapshot and expected_snapshot != snapshot:
+        raise WorkspaceError("代码/目标/测试配置已变化，本次审批已失效。")
+    meta = _meta(ws["id"])
+    if meta.get("mr_snapshot") and meta["mr_snapshot"] != snapshot:
+        raise WorkspaceError("此前提交快照与当前工作区不一致，请核对已有远端提交。")
+    if meta.get("mr_state") in ("committing", "commit_unknown"):
+        return {"error": "上次创建提交的结果不确定，请核对远端分支后再处理，禁止自动重提。",
+                "outcome_unknown": True, "branch": ws.get("mr_branch")}
+    if repo.get("test_cmd"):
+        report = json.loads(meta.get("test_result") or "{}")
+        if not report.get("passed") or report.get("snapshot") != snapshot:
+            raise WorkspaceError("必须先对当前代码快照运行并通过沙箱测试，才能提 MR。")
+    if repo.get("validation_kind") == "gitops":
+        report = json.loads(meta.get("validation_result") or "{}")
+        if not report.get("passed") or report.get("snapshot") != snapshot:
+            raise WorkspaceError("必须先对当前代码快照通过 GitOps 静态校验，才能提 MR。")
     if not ws["changed"]:
         raise WorkspaceError("工作区里没有改动，没什么可提交的。")
     title = (title or "").strip()
     if not title:
         raise WorkspaceError("请给 MR 一个标题。")
     actions = []
-    for rel, kind in sorted(ws["changed"].items()):
+    for rel, kind, data in _changed_bytes(ws):
         before = gitutil.head_blob(_repo_dir(ws), rel)
         if kind == "delete":
             actions.append({"action": "delete", "file_path": rel})
             continue
-        data = (_repo_dir(ws) / rel).read_bytes()
         if not _is_text(data):
             raise WorkspaceError(f"{rel} 是二进制，不支持通过 MR 提交。")
         actions.append({"action": "update" if before is not None else "create", "file_path": rel,
                         "content": data.decode("utf-8"), "encoding": "text"})
     api = _gitlab(repo)
     headers = {"PRIVATE-TOKEN": repo["write_token"]}
-    branch = f"harness/{ws['id'][:8]}-{_slug(title)}"
+    branch = ws.get("mr_branch") or f"harness/{ws['id']}-{snapshot[:12]}"
     target = ws.get("base_branch") or repo.get("branch") or "main"
     body = (description or "").strip() + f"\n\n---\n由 feishu-agent 数字员工在工作区 `{ws['id']}` 中生成，" \
                                           f"基于 `{(ws.get('base_commit') or '')[:12]}`。"
 
-    def call(method, url, payload):
+    def call(method, url, payload=None):
+        _active()
         try:
             r = requests.request(method, url, json=payload, headers=headers, timeout=30)
         except requests.RequestException as e:
@@ -437,14 +650,45 @@ def propose_mr(ws, title, description=""):
         if r.status_code >= 300:
             txt = (r.text or "")[:400].replace(repo["write_token"], "***")
             raise WorkspaceError(f"GitLab 返回 {r.status_code}：{txt}")
-        return r.json()
+        try:
+            return r.json()
+        except ValueError as e:
+            raise WorkspaceError("GitLab 返回无效响应，需核对远端状态。") from e
 
-    with _lock(ws["id"]):
-        call("POST", f"{api}/repository/commits", {
-            "branch": branch, "start_sha": ws["base_commit"], "commit_message": title, "actions": actions})
-        mr = call("POST", f"{api}/merge_requests", {
-            "source_branch": branch, "target_branch": target, "title": title, "description": body,
-            "remove_source_branch": True})
-        store.update_workspace(ws["id"], mr_url=mr.get("web_url") or "", mr_branch=branch)
+    store.update_workspace(ws["id"], mr_branch=branch)
+    if not meta.get("commit_sha"):
+        _save_meta(ws["id"], mr_state="committing", mr_snapshot=snapshot)
+        try:
+            commit = call("POST", f"{api}/repository/commits", {
+                "branch": branch, "start_sha": ws["base_commit"],
+                "commit_message": title + f"\n\nHarness-Snapshot: {snapshot}", "actions": actions})
+            sha = commit.get("id")
+            if not sha:
+                raise WorkspaceError("GitLab 未返回提交 ID。")
+            _save_meta(ws["id"], mr_state="committed", commit_sha=sha)
+        except WorkspaceError as e:
+            _save_meta(ws["id"], mr_state="commit_unknown")
+            return {"error": str(e), "outcome_unknown": True, "branch": branch}
+    try:
+        # 上次建 MR 丢响应时，先核对同一确定性分支；绝不重复提交代码。
+        existing = call("GET", f"{api}/merge_requests?source_branch={quote(branch, safe='')}&state=all")
+        matches = [m for m in existing if m.get("source_branch") == branch and m.get("target_branch") == target]
+        if matches:
+            mr = matches[0]
+        else:
+            if meta.get("mr_state") in ("mr_creating", "mr_unknown"):
+                return {"error": "此前创建 MR 的结果尚未核实，请人工核对；不会再次发送创建请求。",
+                        "outcome_unknown": True, "branch": branch}
+            _save_meta(ws["id"], mr_state="mr_creating")
+            mr = call("POST", f"{api}/merge_requests", {
+                "source_branch": branch, "target_branch": target, "title": title, "description": body,
+                "remove_source_branch": True})
+        if not mr.get("web_url"):
+            raise WorkspaceError("GitLab 未返回 MR 地址。")
+        store.update_workspace(ws["id"], mr_url=mr["web_url"], mr_branch=branch)
+        _save_meta(ws["id"], mr_state="completed")
+    except WorkspaceError as e:
+        _save_meta(ws["id"], mr_state="mr_unknown")
+        return {"error": str(e), "outcome_unknown": True, "branch": branch}
     return {"ok": True, "mr_url": mr.get("web_url"), "mr_iid": mr.get("iid"), "branch": branch,
             "target_branch": target, "files": len(actions)}

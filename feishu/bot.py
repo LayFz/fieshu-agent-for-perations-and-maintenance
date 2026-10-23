@@ -1,13 +1,16 @@
 """飞书长连接（多应用）：每个启用的应用各起一条长连接，收群消息 → 该应用的 AI+工具 → 回群。
 
 每条连接绑定一个 app_id；收到消息时按 app_id 实时从 DB 取最新配置后再跑（后台改人设/工具/AI 即时生效）。
-只出站、不开入站端口。新增/改飞书凭证的应用需重启进程才会建立新连接。
+飞书连接只出站。守护线程刷新应用状态，连接异常退避重试，凭据变化后停旧连接再建立新连接。
 """
 import asyncio
+import hashlib
 import json
 import re
 import threading
 import time
+
+import requests
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (CreateMessageRequest, CreateMessageRequestBody,
@@ -15,7 +18,7 @@ from lark_oapi.api.im.v1 import (CreateMessageRequest, CreateMessageRequestBody,
 
 from core import store
 from feishu import members
-from harness import approval
+from harness import approval, tasks, access
 from llm.engine import run as llm_run
 
 # lark 的 ws 客户端用了一个【模块级全局事件循环】，所有 Client.start() 共用它，
@@ -36,19 +39,49 @@ class _ThreadLoopProxy:
 
 _wsc.loop = _ThreadLoopProxy()
 
-_send_clients = {}          # app_id -> lark.Client（回消息用）
-_running = {}               # app_id -> bool（连接状态，给后台看）
-_started = set()            # 已启动过 _serve 的 app_id，避免重复起线程
-_seen = set()              # (app_id, message_id) 去重：飞书事件可能重投
-_seen_lock = threading.Lock()
+_send_clients = {}          # app_id -> (凭据指纹, lark.Client)
+_running = {}               # app_id -> 已观察到连接建立
+_connections = {}           # 内部控制记录，health 只返回允许字段
+_connection_lock = threading.RLock()
+_lifecycle_lock = threading.RLock()
+_supervisor_stop = threading.Event()
+_supervisor_thread = None
+_SUPERVISOR_INTERVAL = 1.0
+_RETRY_BASE = 2.0
+_RETRY_MAX = 60.0
+_STABLE_CONNECTION = 60.0
+_task_executor_hook = None
+_command_handler_hook = None
+
+
+def register_task_executor(handler):
+    """注册确定性任务入口：返回 None 交给模型，返回 str 表示已完成处理。"""
+    global _task_executor_hook
+    if handler is not None and not callable(handler):
+        raise TypeError("任务执行钩子必须可调用")
+    _task_executor_hook = handler
+
+
+def register_command_handler(handler):
+    """注册已点名消息的扩展命令；None 表示未匹配。"""
+    global _command_handler_hook
+    if handler is not None and not callable(handler):
+        raise TypeError("命令钩子必须可调用")
+    _command_handler_hook = handler
+
+
+def _credential_key(app):
+    return hashlib.sha256(json.dumps([app.get("feishu_app_id"), app.get("feishu_app_secret")]).encode()).hexdigest()
 
 
 def _send_client(app):
-    c = _send_clients.get(app["id"])
-    if c is None:
-        c = lark.Client.builder().app_id(app["feishu_app_id"]).app_secret(app["feishu_app_secret"]).build()
-        _send_clients[app["id"]] = c
-    return c
+    key = _credential_key(app)
+    with _connection_lock:
+        cached = _send_clients.get(app["id"])
+        if cached is None or cached[0] != key:
+            c = lark.Client.builder().app_id(app["feishu_app_id"]).app_secret(app["feishu_app_secret"]).build()
+            _send_clients[app["id"]] = (key, c)
+        return _send_clients[app["id"]][1]
 
 
 def _tables_to_text(text):
@@ -130,10 +163,12 @@ def _rich_card(text):
     return {"config": {"wide_screen_mode": True}, "elements": elements}
 
 
-def _create_card(app, chat_id, card):
+def _create_card(app, chat_id, card, message_uuid=None):
+    body = CreateMessageRequestBody.builder().receive_id(chat_id).msg_type("interactive").content(json.dumps(card))
+    if message_uuid:
+        body = body.uuid(message_uuid)
     req = (CreateMessageRequest.builder().receive_id_type("chat_id")
-           .request_body(CreateMessageRequestBody.builder().receive_id(chat_id)
-                         .msg_type("interactive").content(json.dumps(card)).build()).build())
+           .request_body(body.build()).build())
     return _send_client(app).im.v1.message.create(req)
 
 
@@ -143,7 +178,7 @@ def _reply(app, chat_id, text, rich=False):
     if not resp.success() and rich:
         resp = _create_card(app, chat_id, _md_card(text))     # 真表格被拒 → 退回分行
     if not resp.success():
-        print(f"[app {app['id']}] 回消息失败:", resp.code, resp.msg, flush=True)
+        print(f"[app {app['id']}] 回消息失败 code={resp.code}", flush=True)
 
 
 def post(app, chat_id, text):
@@ -155,7 +190,7 @@ def _send_card(app, chat_id, text):
     """发一张交互卡片，返回 message_id（供后续原地更新）；失败返回 None。"""
     resp = _create_card(app, chat_id, _md_card(text))
     if not resp.success():
-        print(f"[app {app['id']}] 发卡片失败:", resp.code, resp.msg, flush=True)
+        print(f"[app {app['id']}] 发卡片失败 code={resp.code}", flush=True)
         return None
     return getattr(resp.data, "message_id", None)
 
@@ -174,7 +209,7 @@ def _update_card(app, message_id, text, rich=False):
     if not resp.success() and rich:
         resp = _patch_card(app, message_id, _md_card(text))    # 真表格被拒 → 退回分行
     if not resp.success():
-        print(f"[app {app['id']}] 更新卡片失败:", resp.code, resp.msg, flush=True)
+        print(f"[app {app['id']}] 更新卡片失败 code={resp.code}", flush=True)
         return False
     return True
 
@@ -202,7 +237,17 @@ def _approval_card(app, row, status="pending", decider_name=""):
     elements = [{"tag": "markdown", "content": "\n".join(lines)}]
     if row.get("preview"):                      # 工具给的审批预览（如提 MR 的 diff）——审批人真正要看的内容
         pv = str(row["preview"])
-        elements.append({"tag": "markdown", "content": pv[:3500] + ("\n…（已截断）" if len(pv) > 3500 else "")})
+        if row.get("tool") == "code_propose_mr":
+            # MR 审批必须展示全部 diff；预览过大已在生成阶段拒绝，不可在卡片里悄悄截断。
+            heading, marker, diff = pv.partition("\n```diff\n")
+            if not marker or not diff.endswith("\n```"):
+                raise ValueError("MR 审批预览缺少完整 diff")
+            elements.append({"tag": "markdown", "content": heading})
+            diff = diff[:-4]
+            for offset in range(0, len(diff), 2800):
+                elements.append({"tag": "markdown", "content": "```diff\n" + diff[offset:offset + 2800] + "\n```"})
+        else:
+            elements.append({"tag": "markdown", "content": pv[:3500] + ("\n…（已截断）" if len(pv) > 3500 else "")})
     elements.append({"tag": "markdown", "content": f"**参数**\n```json\n{args_txt}\n```"})
     if status == "pending":
         value = {"kind": "approval", "approval_id": row["id"]}
@@ -230,7 +275,7 @@ def _ask_approval(req):
            "preview": req.get("preview")}
     resp = _create_card(app, req["chat_id"], _approval_card(app, row))
     if not resp.success():
-        print(f"[app {app['id']}] 发审批卡片失败:", resp.code, resp.msg, flush=True)
+        print(f"[app {app['id']}] 发审批卡片失败 code={resp.code}", flush=True)
         return None
     return getattr(resp.data, "message_id", None)
 
@@ -251,7 +296,8 @@ def _on_card_action(app_id, data):
         operator = getattr(ev.operator, "open_id", "") if ev and ev.operator else ""
         if value.get("kind") != "approval":
             return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "这个按钮已失效"}})
-        ok, msg, row = approval.decide(value.get("approval_id"), value.get("choice") == "approve", operator)
+        ok, msg, row = approval.decide(value.get("approval_id"), value.get("choice") == "approve", operator,
+                                       app_id=app_id)
         print(f"[app {app_id}] 审批 {str(value.get('approval_id'))[:8]} by {operator[-6:]} "
               f"{value.get('choice')} -> {msg}", flush=True)
         body = {"toast": {"type": "success" if ok else "error", "content": msg}}
@@ -261,7 +307,7 @@ def _on_card_action(app_id, data):
             body["card"] = {"type": "raw", "data": _approval_card(app, row, row["status"], decider)}
         return P2CardActionTriggerResponse(body)
     except Exception as e:
-        print(f"[app {app_id}] 处理卡片回调出错:", e, flush=True)
+        print(f"[app {app_id}] 处理卡片回调出错: {type(e).__name__}", flush=True)
         return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "处理失败，请重试"}})
 
 
@@ -303,14 +349,10 @@ _TRIGGER_KW = ("挂了", "宕机", "崩了", "报错", "异常", "失败", "故�
                "连不上", "超时", "卡住", "卡死", "503", "502", "504", "oom", "爆了",
                "满了", "告警", "alert", "error", "down", "部署", "上线", "发布",
                "回滚", "求助", "帮忙看", "谁知道", "怎么回事", "什么原因")
-_POST_COOLDOWN = 30        # 同一个群两次主动发言至少间隔（秒），防刷屏
-_last_post = {}            # chat_id -> ts
-_inflight = set()          # 正在主动研判中的 chat_id，避免并发风暴
-_pro_lock = threading.Lock()
 # 「刚交互过」窗口：某人点名（@/喊名/单聊）之后，这段时间内 ta 的追问也算「对机器人说话」，
 # 不必每句都 @——连续对话更自然。按 (chat_id, 发言人) 隔离，只惠及正在跟它聊的那个人。
 _FOLLOWUP_WINDOW = 180     # 秒
-_last_engaged = {}         # (chat_id, sender_open_id) -> ts
+_last_engaged = {}         # (app_id, chat_id, sender_open_id) -> ts
 
 
 def _name_called(text):
@@ -323,180 +365,388 @@ def _worth_considering(text):
     return any(k in t for k in _TRIGGER_KW)
 
 
-def _observe_or_react(app_id, chat_id, text, sender_open_id):
-    """群里没点名的消息：先记历史攒上下文；像"有事"的再让 Jarvis 自己判断要不要主动开口。"""
-    app = store.get_app(app_id)
+def execute_task(task):
+    """worker 注册入口；运行结果统一由 outbox 送达。"""
+    app = store.get_app(task["app_id"])
+    access.actor(app, task["chat_id"], task.get("speaker_open_id", ""),
+                 system=task["trigger"] in ("schedule", "job", "webhook"))
+    if _task_executor_hook is not None and task["trigger"] != "proactive":
+        result = _task_executor_hook(task)
+        if result is not None:
+            if not isinstance(result, str):
+                raise TypeError("任务执行钩子必须返回文本或 None")
+            return result
+    return llm_run(app, task["chat_id"], task["instruction"],
+                   speaker=task.get("speaker") or task.get("speaker_open_id") or "",
+                   speaker_open_id=task.get("speaker_open_id", ""),
+                   proactive=task["trigger"] == "proactive", trigger=task["trigger"])
+
+
+def deliver_task(task, text):
+    app = store.get_app(task["app_id"])
     if not app:
-        return
-    speaker = members.name_of(app, chat_id, sender_open_id) if sender_open_id else ""
-
-    # 不值得花大模型判断的闲聊：只默默记历史
-    if not _worth_considering(text):
-        turn = f"「{speaker}」：{text}" if speaker else text
-        store.save(app_id, chat_id, "user", turn)
-        return
-
-    # 冷却中、或本群已有一条在研判：也只旁听记录，不重复烧钱
-    now = time.time()
-    with _pro_lock:
-        if chat_id in _inflight or now - _last_post.get(chat_id, 0) < _POST_COOLDOWN:
-            turn = f"「{speaker}」：{text}" if speaker else text
-            store.save(app_id, chat_id, "user", turn)
-            return
-        _inflight.add(chat_id)
-    try:
-        # 主动模式：engine 会存这条 user，并自行判断该不该说话（不该则返回 None）
-        ans = llm_run(app, chat_id, text, speaker=speaker,
-                      speaker_open_id=sender_open_id, proactive=True)
-        if ans:
-            _reply(app, chat_id, ans)
-            with _pro_lock:
-                _last_post[chat_id] = time.time()
-            print(f"[app {app_id}] Jarvis 主动发言 {ans[:60]!r}", flush=True)
-    finally:
-        with _pro_lock:
-            _inflight.discard(chat_id)
+        raise RuntimeError("任务所属应用不存在，无法投递")
+    resp = _create_card(app, task["chat_id"], _md_card(text), task.get("notification_id"))
+    if not resp.success():
+        raise RuntimeError(f"飞书投递失败 code={resp.code}")
 
 
-def _handle(app_id, chat_id, text, sender_open_id=""):
-    # 实时取最新应用配置（后台改了人设/工具/AI 立即生效）
-    app = store.get_app(app_id)
-    if not app:
-        return
-    # 解析发言人姓名（best-effort，无权限时回退 open_id 短码）
-    speaker = members.name_of(app, chat_id, sender_open_id) if sender_open_id else ""
-    # 即时回执 + 实时进度：先发一张「处理中」卡片，边查边把「正在跑什么」刷进同一张卡，最后更新为结论
-    mid = _send_card(app, chat_id, "🔍 收到，正在处理…")
-    steps = []
-    ans_buf = [""]
-    last = [0.0]
-    def _render():
-        blocks = []
-        if steps:
-            shown = steps[-10:]
-            more = f"…（前 {len(steps) - len(shown)} 步略）\n" if len(steps) > len(shown) else ""
-            blocks.append("🔍 处理中…\n" + more + "\n".join(f"- {s}" for s in shown))
-        if ans_buf[0]:
-            blocks.append(ans_buf[0])
-        return "\n\n".join(blocks) or "🔍 收到，正在处理…"
-    def on_step(labels):                                 # 进入新一轮工具调用：追加步骤 + 清掉上一轮零碎输出
-        if not mid:
-            return
-        steps.extend(labels or [])
-        ans_buf[0] = ""
-        _update_card(app, mid, _render())
-    def on_delta(piece):                                 # 最终答案的流式增量：累积 + 节流刷卡片
-        if not mid:
-            return
-        ans_buf[0] += piece
-        now = time.time()
-        if now - last[0] >= 0.5:                          # 最多每 0.5s 刷一次（在飞书更新限流内）
-            last[0] = now
-            _update_card(app, mid, _render())
-    try:
-        ans = llm_run(app, chat_id, text, speaker=speaker, speaker_open_id=sender_open_id,
-                      on_step=on_step, on_delta=on_delta)
-        print(f"[app {app_id}] 已回复 {ans[:80]!r}", flush=True)
-        if not (mid and _update_card(app, mid, ans, rich=True)):   # 最终定版：原生真表格（被拒自动退分行）
-            _reply(app, chat_id, ans, rich=True)
-    except Exception as e:
-        import traceback
-        print(f"[app {app_id}] 处理消息出错:", e, flush=True)
-        traceback.print_exc()
-        if mid:
-            _update_card(app, mid, "处理出错了，稍后再试～")
+def _task_command(app_id, chat_id, text, sender_open_id, event_id=None):
+    access.actor(store.get_app(app_id), chat_id, sender_open_id)
+    if text.strip() in ("我的身份", "/whoami"):
+        return f"当前飞书 open_id：{sender_open_id or '未提供'}\n当前 chat_id：{chat_id}"
+    if text.strip() in ("任务", "任务列表", "/tasks"):
+        rows = tasks.list_tasks(app_id=app_id, chat_id=chat_id, limit=10)
+        return "最近任务：\n" + "\n".join(f"`{t['id']}` · {t['status']} · {t['instruction'][:60]}" for t in rows)
+    match = re.fullmatch(r"(任务|查看任务|取消任务|继续任务|/task|/cancel|/resume)\s+([0-9a-f]{12,32})(?:\s+([\s\S]+))?", text.strip())
+    if not match:
+        result = (_command_handler_hook(app_id, chat_id, text, sender_open_id, event_id)
+                  if _command_handler_hook is not None else None)
+        if result is not None and not isinstance(result, str):
+            raise TypeError("命令钩子必须返回文本或 None")
+        return result
+    command, tid, extra = match.groups()
+    if len(tid) < 32:
+        matches = store._conn.execute("SELECT id FROM tasks WHERE app_id=? AND chat_id=? AND id LIKE ? LIMIT 2",
+                                      (app_id, chat_id, tid + "%")).fetchall()
+        if len(matches) != 1:
+            return "任务编号不唯一或不存在，请使用完整编号。"
+        tid = matches[0]["id"]
+    task = tasks.get(tid)
+    if not task or task["app_id"] != app_id or task["chat_id"] != chat_id:
+        return "找不到本会话的这个任务。"
+    if command in ("取消任务", "/cancel", "继续任务", "/resume"):
+        app = store.get_app(app_id) or {}
+        if sender_open_id != task.get("speaker_open_id") and sender_open_id not in (app.get("approvers") or []):
+            return "只有任务发起人或应用审批人能取消/继续这个任务。"
+        if command in ("取消任务", "/cancel"):
+            ok = tasks.cancel(tid, app_id=app_id, chat_id=chat_id)
+            return "已请求取消，执行器确认停止前可能仍在收尾。" if ok else "任务已结束或无法取消。"
+        ok = tasks.resume(tid, app_id=app_id, chat_id=chat_id, instruction=extra)
+        return "任务已重新排队。" if ok else "任务不能直接恢复；待审批请使用审批卡，结果不明的变更需先核对。"
+    checkpoint = task.get("checkpoint") or {}
+    detail = "\n\n".join(x for x in (task.get("result"), task.get("error")) if x)
+    return (f"任务 `{tid}`\n状态：{task['status']}\n目标：{task['instruction']}\n"
+            f"进展：{checkpoint.get('progress') or '尚无工具结果'}\n"
+            f"{detail}")
 
 
 def _on_message(app_id, data):
     try:
         msg = data.event.message
-        msg_id = getattr(msg, "message_id", None)
         chat_id = msg.chat_id
+        msg_id = getattr(msg, "message_id", None)
         mentions = getattr(msg, "mentions", None)
-        chat_type = getattr(msg, "chat_type", "")     # 'p2p' 单聊 / 'group' 群聊
         text = _strip_mentions(_extract_text(msg), mentions)
-        sender_open_id = ""
-        try:
-            sender_open_id = data.event.sender.sender_id.open_id or ""
-        except Exception:
-            pass
-        if not text:
+        if not text or not msg_id:
             return
-        seen_key = (app_id, msg_id)
-        with _seen_lock:
-            if seen_key in _seen:
-                return
-            _seen.add(seen_key)
-            if len(_seen) > 4000:
-                _seen.clear()
-                _seen.add(seen_key)
-        # 回应闸门（开了 group_msg 后群里所有消息都会来）：
-        #   单聊 / 被@ / 直接喊「贾维斯」= 点名 → 必回；
-        #   其余 → 旁听，像"有事"的再由 Jarvis 自己判断要不要主动开口。
+        sender = getattr(getattr(data.event.sender, "sender_id", None), "open_id", "") or ""
         app = store.get_app(app_id)
-        if not app:
-            return
+        access.actor(app, chat_id, sender)
+        store.observe_feishu_chat(app_id, chat_id, sender, getattr(msg, "chat_type", ""))
         now = time.time()
-        ekey = (chat_id, sender_open_id)
-        # 显式点名：@ / 喊名字 / 单聊
-        called = (chat_type == "p2p") or _is_bot_mentioned(app, mentions) or _name_called(text)
-        # 刚交互过：同一个人点名后 _FOLLOWUP_WINDOW 秒内的追问，也算对它说话（不必再 @）
-        engaged = bool(sender_open_id) and (now - _last_engaged.get(ekey, 0) < _FOLLOWUP_WINDOW)
-        addressed = called or engaged
-        if addressed and sender_open_id:                 # 刷新窗口，让连续对话保持"在聊"
-            if len(_last_engaged) > 2000:
-                _last_engaged.clear()
-            _last_engaged[ekey] = now
-        tag = "回应" if called else ("回应(追问)" if engaged else "旁听")
-        print(f"[app {app_id}] 收到 id={msg_id} chat={chat_id} from={sender_open_id[-6:]} "
-              f"{tag} -> {text!r}", flush=True)
+        ekey = (app_id, chat_id, sender)
+        called = getattr(msg, "chat_type", "") == "p2p" or _is_bot_mentioned(app, mentions) or _name_called(text)
+        addressed = called or (bool(sender) and now - _last_engaged.get(ekey, 0) < _FOLLOWUP_WINDOW)
         if addressed:
-            threading.Thread(target=_handle, args=(app_id, chat_id, text, sender_open_id), daemon=True).start()
-        else:
-            threading.Thread(target=_observe_or_react, args=(app_id, chat_id, text, sender_open_id), daemon=True).start()
-    except Exception as e:
-        print(f"[app {app_id}] 事件处理出错:", e, flush=True)
+            if sender:
+                _last_engaged[ekey] = now
+            command = _task_command(app_id, chat_id, text, sender, msg_id)
+            if command is not None:
+                _reply(app, chat_id, command)
+                return
+        elif not _worth_considering(text):
+            return
+        # 跨重启去重、同会话串行、接收回执都由持久任务服务负责。
+        tasks.submit(app_id, chat_id, text, source="feishu", event_id=msg_id,
+                     speaker_open_id=sender, trigger="chat" if addressed else "proactive")
+    except PermissionError as e:
+        print(f"[app {app_id}] 拒绝消息: {e}", flush=True)
+    except Exception:
+        # 不吞掉入队失败；让飞书重投消息，避免已应答但任务未落库。
+        raise
 
 
-def _serve(app):
+class _SupervisedClient(lark.ws.Client):
+    """保留 SDK 协议处理，重连与生命周期由每应用守护器负责。"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ended = asyncio.Event()
+        self.failure_type = "ConnectionEnded"
+
+    def _fmt_log(self, fmt, *args):
+        # SDK 默认会把签名 websocket URL、错误正文甚至事件 payload 写入日志。
+        # 格式串来自 SDK；所有动态参数都去掉，不记录 URL/token/消息正文。
+        return re.sub(r"\{[^}]*\}", "[redacted]", fmt)
+
+    def _get_conn_url(self):
+        # SDK 的同步 bootstrap POST 没有 timeout；显式限时，避免停用后旧线程永远卡住。
+        response = requests.post(self._domain + _wsc.GEN_ENDPOINT_URI,
+            headers={"locale": "zh", _wsc.USER_AGENT: getattr(self, "_user_agent", "feishu-agent")},
+            json={"AppID": self._app_id, "AppSecret": self._app_secret},
+            timeout=(5, 15), allow_redirects=False)
+        if response.status_code != 200:
+            raise ConnectionError("EndpointHTTPError")
+        endpoint = _wsc.JSON.unmarshal(response.content.decode("utf-8"), _wsc.EndpointResp)
+        if endpoint.code != _wsc.OK or endpoint.data is None:
+            raise ConnectionError("EndpointRejected")
+        if endpoint.data.ClientConfig is not None:
+            self._configure(endpoint.data.ClientConfig)
+        return endpoint.data.URL
+
+    async def _receive_message_loop(self):
+        try:
+            await super()._receive_message_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.failure_type = type(exc).__name__
+        finally:
+            self.ended.set()
+
+
+def _connection_current(entry):
+    if entry["stop"].is_set() or _supervisor_stop.is_set():
+        return False
+    app = store.get_app(entry["app_id"])
+    return bool(app and app.get("enabled") and _credential_key(app) == entry["credential_key"])
+
+
+def _mark_listening(entry, connected):
+    with _connection_lock:
+        if _connections.get(entry["app_id"]) is not entry or entry["stop"].is_set():
+            return
+        entry["state"] = "listening"
+        entry["connected"] = bool(connected)
+        entry["connected_at"] = time.time() if connected else None
+        entry["last_error"] = ""
+        _running[entry["app_id"]] = bool(connected)
+
+
+def _serve(app, entry):
     app_id = app["id"]
-    # 事件循环由上面的 _ThreadLoopProxy 按线程惰性创建（lark start() 首次访问 loop 时）
+    # 旧连接即使尚在关闭，也不能以新配置的应用身份接收命令或审批。
+    def on_message(data):
+        if _connection_current(entry):
+            return _on_message(app_id, data)
+
+    def on_card(data):
+        if _connection_current(entry):
+            return _on_card_action(app_id, data)
+        from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+        return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "连接配置已变更，请重新操作"}})
+
     handler = (lark.EventDispatcherHandler.builder("", "")
-               .register_p2_im_message_receive_v1(lambda data, _id=app_id: _on_message(_id, data))
-               .register_p2_card_action_trigger(lambda data, _id=app_id: _on_card_action(_id, data))
-               .build())
-    _running[app_id] = True
-    print(f"[app {app_id}] {app['name']} 长连接监听中", flush=True)
+               .register_p2_im_message_receive_v1(on_message)
+               .register_p2_card_action_trigger(on_card).build())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _loop_local.loop = loop
+    # asyncio 未处理异常也不能输出带签名 URL 的异常原文。
+    loop.set_exception_handler(lambda _loop, context: print(
+        f"[app {app_id}] websocket 后台异常: {type(context.get('exception')).__name__}", flush=True))
     try:
-        lark.ws.Client(app["feishu_app_id"], app["feishu_app_secret"],
-                       event_handler=handler, log_level=lark.LogLevel.INFO).start()
+        client = _SupervisedClient(app["feishu_app_id"], app["feishu_app_secret"],
+                                  event_handler=handler, log_level=lark.LogLevel.ERROR, auto_reconnect=False)
+    except BaseException:
+        loop.close()
+        _loop_local.loop = None
+        raise
+    with _connection_lock:
+        entry["loop"], entry["client"] = loop, client
+
+    async def session():
+        try:
+            if not _connection_current(entry):
+                return
+            await asyncio.wait_for(client._connect(), timeout=25)
+            if not _connection_current(entry):
+                return
+            # 确认 SDK 已建立 conn 才标 connected；只有线程存活不算连通。
+            _mark_listening(entry, getattr(client, "_conn", None) is not None)
+            loop.create_task(client._ping_loop())
+            while not entry["stop"].is_set() and not _supervisor_stop.is_set():
+                if client.ended.is_set():
+                    raise ConnectionError(client.failure_type)
+                await asyncio.sleep(0.2)
+        finally:
+            conn = getattr(client, "_conn", None)
+            try:
+                await asyncio.wait_for(client._disconnect(), timeout=3)
+            except (Exception, asyncio.CancelledError):
+                transport = getattr(conn, "transport", None)
+                if transport is not None:
+                    transport.abort()
+
+    runner = loop.create_task(session())
+    with _connection_lock:
+        entry["runner"] = runner
+    try:
+        loop.run_until_complete(runner)
+    except asyncio.CancelledError:
+        if not entry["stop"].is_set() and not _supervisor_stop.is_set():
+            raise RuntimeError("UnexpectedCancellation") from None
     finally:
-        _running[app_id] = False
+        # 每次重试创建新 loop；清掉 SDK receive/ping 等任务，避免旧凭据继续活动。
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.wait(pending, timeout=3))
+        loop.close()
+        _loop_local.loop = None
+        with _connection_lock:
+            entry["loop"], entry["client"], entry["runner"] = None, None, None
 
 
-def start_app(app):
-    """为单个应用起长连接（已起过或缺凭证则跳过）。"""
-    if not (app.get("feishu_app_id") and app.get("feishu_app_secret")):
+def _run_connection(app, entry):
+    failure = "ConnectionEnded"
+    try:
+        _serve(app, entry)
+    except Exception as exc:
+        failure = type(exc).__name__
+    finally:
+        now = time.time()
+        with _connection_lock:
+            entry["connected"] = False
+            _running[app["id"]] = False
+            entry["last_exit_at"] = now
+            if entry["stop"].is_set() or _supervisor_stop.is_set():
+                entry["state"] = "stopped"
+            else:
+                stable = entry.get("connected_at") and now - entry["connected_at"] >= _STABLE_CONNECTION
+                entry["failures"] = 1 if stable else entry["failures"] + 1
+                delay = min(_RETRY_MAX, _RETRY_BASE * 2 ** min(entry["failures"] - 1, 16))
+                entry["next_retry_at"] = now + delay
+                entry["state"], entry["last_error"] = "retrying", failure
+                print(f"[app {app['id']}] 飞书连接退出: {failure}，{delay:g}s 后重试", flush=True)
+
+
+def _request_stop(entry):
+    entry["stop"].set()
+    entry["connected"] = False
+    _running[entry["app_id"]] = False
+    thread = entry.get("thread")
+    entry["state"] = "stopping" if thread and thread.is_alive() else "stopped"
+    loop, runner = entry.get("loop"), entry.get("runner")
+    if loop is not None and runner is not None and not loop.is_closed():
+        try:
+            loop.call_soon_threadsafe(runner.cancel)
+        except RuntimeError:
+            pass
+
+
+def _ensure_connection(app, now):
+    """调用者持锁；同一应用旧线程退出前绝不启动第二条连接。"""
+    aid = app["id"]
+    key = _credential_key(app)
+    entry = _connections.get(aid)
+    if entry and entry.get("thread") and entry["thread"].is_alive():
+        if entry["credential_key"] != key:
+            _request_stop(entry)
+            _send_clients.pop(aid, None)
         return False
-    if app["id"] in _started:
+    if entry is None or entry["credential_key"] != key or entry["stop"].is_set():
+        entry = {"app_id": aid, "credential_key": key, "stop": threading.Event(),
+                 "thread": None, "loop": None, "runner": None, "client": None,
+                 "state": "starting", "connected": False, "attempts": 0, "failures": 0,
+                 "next_retry_at": None, "last_error": "", "started_at": None,
+                 "connected_at": None, "last_exit_at": None}
+        _connections[aid] = entry
+        _send_clients.pop(aid, None)
+    if entry["next_retry_at"] and now < entry["next_retry_at"]:
         return False
-    _started.add(app["id"])
-    threading.Thread(target=_serve, args=(app,), name=f"bot-{app['id']}", daemon=True).start()
+    entry.update(state="starting", connected=False, started_at=now, connected_at=None, next_retry_at=None)
+    entry["attempts"] += 1
+    thread = threading.Thread(target=_run_connection, args=(dict(app), entry), name=f"bot-{aid}", daemon=True)
+    entry["thread"] = thread
+    thread.start()
     return True
 
 
+def _supervise_once(now=None):
+    now = time.time() if now is None else now
+    apps = {a["id"]: a for a in store.list_apps()}
+    started = 0
+    with _connection_lock:
+        if _supervisor_stop.is_set():
+            return 0
+        for aid, entry in list(_connections.items()):
+            app = apps.get(aid)
+            if not app or not app.get("enabled") or not (app.get("feishu_app_id") and app.get("feishu_app_secret")):
+                _request_stop(entry)
+                _send_clients.pop(aid, None)
+                if not entry.get("thread") or not entry["thread"].is_alive():
+                    entry["state"] = "disabled" if not app or not app.get("enabled") else "unconfigured"
+        for app in apps.values():
+            if app.get("enabled") and app.get("feishu_app_id") and app.get("feishu_app_secret"):
+                started += int(_ensure_connection(app, now))
+    return started
+
+
+def _supervise():
+    while not _supervisor_stop.wait(_SUPERVISOR_INTERVAL):
+        try:
+            _supervise_once()
+        except Exception as exc:
+            # DB 暂时不可用也不杀掉守护线程，不输出可能带密钥的异常正文。
+            print(f"[feishu supervisor] 刷新失败: {type(exc).__name__}", flush=True)
+
+
+def start_app(app):
+    """兼容单应用入口；守护线程会持续读取 DB 中当前启用状态和凭据。"""
+    if not app or not app.get("enabled") or not (app.get("feishu_app_id") and app.get("feishu_app_secret")):
+        return False
+    before = {a["app_id"]: a["attempts"] for a in health()["apps"]}
+    start_all()
+    after = {a["app_id"]: a["attempts"] for a in health()["apps"]}
+    return after.get(app["id"], 0) > before.get(app["id"], 0)
+
+
 def start_all():
-    """启动所有「启用且配了飞书凭证」的应用长连接。"""
-    n = 0
-    for app in store.list_enabled_apps():
-        if start_app(app):
-            n += 1
-    print(f"★ 已启动 {n} 个应用的飞书长连接", flush=True)
-    return n
+    """启动一次 supervisor；重复调用只做幂等刷新，不创建重复连接。"""
+    global _supervisor_thread
+    with _lifecycle_lock:
+        _supervisor_stop.clear()
+        count = _supervise_once()
+        if _supervisor_thread is None or not _supervisor_thread.is_alive():
+            _supervisor_thread = threading.Thread(target=_supervise, name="feishu-supervisor", daemon=True)
+            _supervisor_thread.start()
+        return count
+
+
+def stop(timeout=5):
+    """请求断开并在有界时间内等待退出；未退出的连接在 health 中仍显示 stopping。"""
+    with _lifecycle_lock:
+        _supervisor_stop.set()
+        with _connection_lock:
+            for entry in _connections.values():
+                _request_stop(entry)
+            threads = [e["thread"] for e in _connections.values() if e.get("thread")]
+        if _supervisor_thread is not None:
+            threads.append(_supervisor_thread)
+        deadline = time.monotonic() + max(0, timeout)
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(max(0, deadline - time.monotonic()))
+        return all(not thread.is_alive() for thread in threads)
+
+
+def health():
+    """仅返回状态/时间/错误类别，不包含名称、凭据、指纹或 websocket URL。"""
+    fields = ("app_id", "state", "connected", "attempts", "failures", "next_retry_at", "last_error",
+              "started_at", "connected_at", "last_exit_at")
+    with _connection_lock:
+        return {"supervisor_running": bool(_supervisor_thread and _supervisor_thread.is_alive()),
+                "stopping": _supervisor_stop.is_set(),
+                "apps": [{key: entry.get(key) for key in fields} for _, entry in sorted(_connections.items())]}
 
 
 def is_running(app_id):
-    return bool(_running.get(app_id))
+    with _connection_lock:
+        return bool(_running.get(app_id))
+
 
 def any_running():
-    return any(_running.values())
+    with _connection_lock:
+        return any(_running.values())

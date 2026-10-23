@@ -4,7 +4,7 @@
 供后台「运行记录」页审计回放。事件类型是闭集（EVENT_TYPES），payload 为 JSON。
 
 约定：
-  - 写事件是 best-effort：落库失败只打日志，绝不让对话本身失败。
+  - 执行意图、模型输出、审批与工具结果必须落库成功，否则停止推进。
   - tool/call 必须先于工具执行写入（进程中途崩了也能看到它当时打算做什么）。
   - 进程启动时 abort_stale() 把上次遗留的 running 标为 aborted。
 当前 run 用 contextvar 传递（后续工具管道/审批从这里取，不用层层传参）。
@@ -17,7 +17,8 @@ import uuid
 from core import store
 
 TRIGGERS = ("chat", "proactive", "schedule", "job", "webhook", "delegate")
-STATUSES = ("running", "completed", "silent", "max-steps", "error", "aborted")
+STATUSES = ("running", "completed", "silent", "max-steps", "error", "aborted",
+            "waiting_approval", "waiting_input", "cancelled", "needs_attention")
 EVENT_TYPES = (
     "run/start", "user/message", "assistant/message",
     "tool/call", "tool/decision", "approval/asked", "approval/decided", "tool/result", "run/end",
@@ -40,6 +41,8 @@ class Run:
         self.speaker_open_id = speaker_open_id or ""
         self.approval_policy = approval_policy   # ask：可以发审批卡片；never：需要审批的一律拒
         self.total_tokens = 0
+        self.tainted = False
+        self.uncertain = False
         self.started = time.time()
         self._seq = 0
         self._lock = threading.Lock()
@@ -55,6 +58,8 @@ class Run:
             store.append_event(self.id, seq, etype, payload, call_id=call_id, tool=tool)
         except Exception as e:
             print(f"[run {self.id[:8]}] 写事件 {etype} 失败:", e, flush=True)
+            if etype != "run/end":
+                raise
 
     def add_tokens(self, n):
         self.total_tokens += int(n or 0)
@@ -65,15 +70,15 @@ def start(app_id, chat_id, trigger, speaker_open_id="", parent=None):
     if trigger not in TRIGGERS:
         raise ValueError(f"unknown trigger {trigger}")
     depth = (parent.depth + 1) if parent else 0
-    # 只有有人当场在等的群聊/单聊才发审批卡片；定时、job、webhook、旁听、委派一律 never
-    policy = "ask" if trigger == "chat" else "never"
+    from . import tasks
+    # 持久任务允许离线等待审批；旁听、委派不得借此扩大权限。
+    durable = tasks.current()
+    policy = "ask" if trigger == "chat" or (durable and trigger not in ("proactive", "delegate")) else "never"
     run = Run(uuid.uuid4().hex, app_id, chat_id, trigger, depth, speaker_open_id, policy)
-    try:
-        store.create_run(run.id, app_id, chat_id, trigger, speaker_open_id,
-                         parent_run_id=parent.id if parent else None, depth=depth,
-                         approval_policy=policy)
-    except Exception as e:
-        print(f"[run {run.id[:8]}] 建 run 失败:", e, flush=True)
+    run.task_id = durable["id"] if durable else None
+    store.create_run(run.id, app_id, chat_id, trigger, speaker_open_id,
+                     parent_run_id=parent.id if parent else None, depth=depth,
+                     approval_policy=policy)
     run._token = _current.set(run)
     return run
 
@@ -87,6 +92,10 @@ def end(run, status, reason=""):
                          "total_tokens": run.total_tokens})
     try:
         store.end_run(run.id, status, run.total_tokens)
+        if run.tainted:
+            with store._lock:
+                store._conn.execute("UPDATE runs SET tainted=1 WHERE id=?", (run.id,))
+                store._conn.commit()
     except Exception as e:
         print(f"[run {run.id[:8]}] 结束 run 失败:", e, flush=True)
     if run._token is not None:

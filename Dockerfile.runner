@@ -1,0 +1,7 @@
+# 最小可信测试镜像。项目依赖应由管理员构建到专用镜像，运行时默认无网络。
+# docker build -f Dockerfile.runner -t feishu-agent-runner:local .
+# 设置 HARNESS_SANDBOX_IMAGE=feishu-agent-runner:local 才启用代码测试。
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /workspace
+USER 65532:65532

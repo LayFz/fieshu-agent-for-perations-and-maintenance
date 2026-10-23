@@ -1,86 +1,96 @@
 # CLAUDE.md
 
-给在本仓库里干活的 agent / 开发者看的工程说明：架构、约定、以及若干**非踩不可的坑**。
+本仓库 agent / 开发者的工程说明。修改 `harness/`、`llm/engine.py` 前先读 [设计与历史路线](docs/harness-design.md)，验证步骤见 [本地测试手册](docs/local-harness-testing.md)。
 
-## 这是什么
+## 当前状态
 
-**飞书数字员工平台**：一个进程里跑多个「数字员工(应用)」。每个应用 = 一个独立飞书机器人 + 绑定一个 AI 模型 + 勾选的工具子集 + 勾选的技能子集 + 自己的人设。群里 @ 机器人 → 大模型 + 工具循环 → 回群；带对话记忆、长期记忆、定时任务，外加一个管理后台。
+飞书服务端 Harness：多个应用通过各自飞书机器人接任务，在服务端持久队列中推进集群排障、日志分析、漏洞分析与研发修复。应用分别配置模型、工具、技能、资源权限和审批人。
 
-单容器（Python + SQLite，前端内置），飞书走**长连接只出站**，不开入站端口。
+本轮已实现本地可测的任务恢复、非阻塞审批、动作账本、默认拒绝的资源边界、Docker 代码测试和应用自主持续巡检。**尚未云端部署**；本机已联调飞书长连接、Kubernetes/ArgoCD、两个 GitOps 仓库、GitLab 项目与流水线 API、三个 OpenObserve 日志流。群列表和巡检通知投递尚缺权限/目标会话，真实 MR 审批尚缺飞书审批人及端到端验收。完整漏洞资产匹配、自动复扫闭环、通用 webhook 与子 agent 委派仍不是已验收能力。`8801` 演示数据全部是替身；`8800` 才是当前真实本地服务。
 
-**方向**：整个服务正在改造成一个 harness（长期在线的个人助手：监听、定时、安全地动手、改代码、懂架构）。目标、进度、各期设计见 [`docs/harness-design.md`](docs/harness-design.md)，改 `harness/`、`llm/engine.py` 前先读它，做完一期顺手更新其中的进度表。
+飞书长连接主动出站；管理后台仍开放 HTTP 端口。当前以单服务实例 + 持久 SQLite 目录运行，未验证多实例或高可用。
 
-## 架构总览
+## 架构与模块
 
-```
-飞书群 ──长连接(出站)──▶ feishu/bot.py(每应用一条长连接,各自线程)
-                              │ 收消息 → 按 app_id 实时取最新配置
-                              ▼
-                        llm/engine.py(编排：历史+长期记忆+技能简介注入 → 工具循环)
-                              │                         │
-                              ▼                         ▼
-                        llm/tools.py(工具池)      绑定的 AI 供应商(OpenAI 兼容)
-                              │ 按应用勾选的子集
-            ┌─────────────────┼──────────────────┬──────────────┐
-        feishu/docs       obs/(只读监控)      sched(定时任务)   read_skill
-        (文档读写)    openobserve/beszel/uptimekuma            (按应用隔离)
-
-管理员浏览器 ──:8800──▶ web/admin.py(FastAPI) ──▶ 同一个 SQLite(core/store.py)
-sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.post 回群
+```text
+feishu/bot.py、sched/runner.py、web/admin.py
+                    ↓ 提交（source + app_id + event_id 去重）
+core/taskstore.py → harness/tasks.py（有界 worker、租约、取消、outbox）
+                    ↓ 注册的 executor
+llm/engine.py（授权上下文指纹、检查点、工具循环、最小证据验收）
+                    ↓
+harness/pipeline.py（准备/冻结 → 策略/guard → 持久审批 → 执行 → 结果）
+                    ↓
+原生工具 / MCP / 隔离代码工作区
 ```
 
-### 包分层（依赖单向）
-`core` ← `harness` ← `feishu` / `obs` / `sched` ← `llm` ← `web` ← `app`
-加新能力就平级再开个包（如 obs/、sched/ 就是这么加的）。`harness` 只依赖 `core`；需要上层能力时由上层反向注册进来，不要让 harness import 上层。
+包分层：`core` ← `harness` ← `feishu` / `obs` / `ops` / `sched` ← `llm` ← `web` ← `app`。`harness` 只依赖 `core`；上层能力通过注册 executor、sender、审批应答器和 guard 注入，不能反向 import 上层。
 
-| 包 | 职责 |
+| 模块 | 职责 |
 |---|---|
-| `core/` | `config.py` 冷启动引导配置；`store.py` 数据层(全部 SQLite) |
-| `harness/` | agent 内核：`runs.py` run 生命周期 + 事件日志；`pipeline.py` 工具执行管道 `run_tool()`；`policy.py` 策略预设/规则 + guard 注册表；`approval.py` 审批；`skills.py` 技能从 Git 同步；`workspace.py` 代码工作区；`gitutil.py` dulwich 克隆（后续：外存、jobs） |
-| `feishu/` | `bot.py` 多应用长连接；`auth.py` 按应用 tenant_token；`docs.py`/`md2feishu.py` 文档读写 |
-| `obs/` | 只读监控集成：`openobserve`(日志)、`beszel`(服务器负载)、`uptimekuma`(服务状态) |
-| `sched/` | `runner.py` 定时任务调度线程 |
-| `llm/` | `engine.py` 工具循环编排；`tools.py` 工具池 + 执行器 |
-| `web/` | `admin.py` 后台 API；`static/index.html` 单文件前端(无构建) |
-| `app/` | `main.py` 入口：引导/迁移 → 起各应用长连接 + 调度线程 + uvicorn 后台 |
+| `core/config.py` | 引导配置、独立数据目录；`FEISHU_AGENT_CONFIG=''` 禁用配置文件读取 |
+| `core/store.py` / `core/taskstore.py` | SQLite 业务数据 / 任务、动作账本与通知 outbox |
+| `harness/tasks.py` | worker、租约续期、检查点、挂起/唤醒、取消、恢复 |
+| `core/patrolstore.py` / `harness/patrols.py` | 持续巡检的快照、问题差异、来源成功才恢复、持久通知和租约 |
+| `app/patrol_service.py` / `ops/*_scan.py` | 应用自主调度的集群、GitOps 与日志固定只读采集；扫描结果不由 Codex 手工替代 |
+| `harness/runs.py` | 每次尝试的 run 与追加事件审计；不等于跨重启任务本身 |
+| `harness/policy.py` / `access.py` | 风险策略、单调 guard / 确定性资源权限与只读 kubectl 语法 |
+| `harness/pipeline.py` / `approval.py` | 工具持久动作、结果不明处理 / 审批保存、校验、唤醒 |
+| `harness/workspace.py` / `sandbox.py` | 按任务隔离工作区、快照、测试、GitLab MR / Docker 执行器 |
+| `harness/workflows.py` | cluster/logs/vulnerability/development/general 提示与最低证据门槛 |
+| `harness/skills.py` / `gitutil.py` | Git 技能同步 / dulwich 克隆 |
+| `llm/engine.py` / `authorization.py` | 模型工具循环、上下文恢复 / 新鲜授权、目标固定、上下文指纹 |
+| `llm/tools.py` / `mcp.py` | 原生工具及元数据 / 同步远程 HTTP MCP |
+| `feishu/` / `obs/` / `ops/` | 飞书入口、文档 / 只读监控 / SSH 与 K8s 连接 |
+| `sched/runner.py` | 到期计划原子入队并推进 next_run，避免同次定时重复入队 |
+| `web/` / `app/main.py` | 管理后台与 API / 启动迁移、worker、飞书连接、调度与 HTTP |
 
-## 数据模型（core/store.py，单个 SQLite）
+## 数据与恢复契约
 
-- `ai_providers` — 多个 AI 模型（name/base_url/model/api_key，任意 OpenAI 兼容接口）
-- `apps` — 多个应用（数字员工）：飞书凭证 + `ai_provider_id` + `tools`(JSON 名单) + `skills`(JSON id 名单) + `mcp`(JSON id 名单，勾选的 MCP server) + `system_prompt` + `history_turns` + `enabled`
-- `mcp_servers` — 外部 MCP server 注册表（name/url/headers(JSON 鉴权头)/enabled）；应用按 server 整体勾选后，其暴露的工具进该应用的工具循环
-- `skills` — 技能库（name/description/content），知识/工作方法包，应用按需勾选
-- `schedules` — 定时任务（app_id/chat_id/title/instruction/kind/spec/next_run_ts）
-- `msgs` / `notes` / `token_usage` — 对话记忆 / 长期笔记 / 用量，**都带 app_id 按应用隔离**
-- `runs` / `events` — 运行记录：一次 `engine.run` 是一个 run（trigger=chat/proactive/schedule/…、状态、token），每次模型回复与工具调用按 `seq` 只追加写进 `events`（类型见 `harness.runs.EVENT_TYPES`）。`tool/call` 先于执行写入；启动时遗留的 `running` 标 `aborted`；调度线程清理 90 天前的记录。后台「运行记录」页只读回放。`msgs` 仍负责对话记忆，两者并存
-- `apps.policy` — 工具调用策略 JSON：`{"preset":"compat"|"readonly"|"approval"}` 或 `{"preset":"custom","rules":[...]}`，空=兼容（见下「工具执行管道」）
-- `apps.approvers` — 审批人 open_id 名单；`approvals` — 每次审批一行（pending → allowed-once/rejected/expired/cancelled/unavailable，审批人、卡片 message_id）
-- `kv` — 引导配置 + 全局设置（OpenObserve/Beszel/UptimeKuma 连接 `oo_*`/`bz_*`/`uk_*`；SSH 受管主机+凭证 `ssh_hosts`、硬黑名单 `ssh_blacklist`）；`admin` — 管理员
-  - OpenObserve 按 **org** 隔离数据：`oo_org/oo_user/oo_pass` 是主 org，`oo_sources`（JSON 数组）存其余 org 各自的 service account；`query_logs`/`list_log_streams` 用可选 `org` 参数切换。每个 org 要用它自己建的 service account，主 org 的账号访问不了别的 org
+- `tasks`：任务指令、身份、工作流、状态、租约、检查点。状态包括 `queued/running/waiting_approval/waiting_input/completed/cancelled/failed/needs_attention`。同一应用/群同时只执行一个任务；审批挂起释放 worker。
+- `task_actions`：持久 `action_key`、固定工具参数、风险、审批 ID、结果与状态。模型回复和待执行工具先写检查点，再执行；已完成动作恢复时复用存储结果，但仍重查当前授权。未完成只读动作允许重试，执行过但结果不明的非只读动作停止等待人工核对。
+- `task_outbox`：任务通知持久保存并重试，稳定通知 ID 传给飞书；不宣称所有外部系统提供严格 exactly-once。
+- `runs/events`：一个任务可以有多次 run。遗留 running run 标 `aborted`，任务由租约/检查点恢复。执行前关键记录失败必须停止动作，不能降级成仅打日志后执行。`msgs` 仍负责对话历史。
+- `approvals`：`pending → allowed-once/rejected/expired/cancelled/unavailable`。任务审批绑定 action；重启保留任务审批，仅取消无任务的 legacy pending。
+- `apps`：飞书身份、`ai_provider_id/tools/skills/mcp/policy/approvers/resources` 与人设；`ai_providers/skills/mcp_servers` 保存模型、技能和外部工具配置。
+- `code_repos/workspaces/workspace_safety`：仓库配置、应用/群/任务归属、代码快照、测试记录与 MR 状态。工作区不装生产凭据。
+- `schedules`、`msgs/notes/token_usage`、`kv`、`admin`：计划、历史/笔记/用量、连接设置、管理员。历史和新笔记按应用、群和授权上下文指纹读取；旧全局笔记管理员仍可查。
 
-## 核心概念
+任务写入须使用当前 `lease_owner/lease_epoch` fencing；不要绕过 `tasks.check_active()`。控制异常 `TaskSuspended/TaskCancelled/TaskUncertain/TaskIncomplete` 要透传到 runtime，不能吞成普通工具错误。恢复时旧 worker 失去租约必须停止提交结果。
 
-- **应用 = 数字员工 = 席位**。四层隔离：身份(独立飞书应用) + AI(各绑各的) + 工具(勾选子集) + 技能(勾选子集)。防越权靠这套，不靠代码自觉。
-- **技能可以从 Git 同步（harness/skills.py）**：后台「技能」页登记技能源（公司 GitLab skill marketplace 索引仓或单个能力仓 + 只读 Deploy Token + ssh→https 改写规则 + 可选 plugin 名单），调度线程按间隔用 dulwich 拉取，写进 `skills`（`source_id` 非空）。Git 来源技能后台只读，改动走能力仓 MR；附属文件存 `skills.files`，`read_skill(name, file=…)` 读取。令牌只发同一主机；路径穿越、符号链接一律拒。
-- **代码工作区（harness/workspace.py）**：后台「代码仓库」页登记可改的仓库（读令牌、写令牌、测试命令）；应用勾 `code_*` 工具后，模型在 `data/workspaces/<id>/repo` 一次性工作区里读改文件、`code_test` 跑配置好的测试、`code_propose_mr` 由系统用写令牌调 GitLab「创建提交」+「建 MR」API（不 git push，令牌不进工作区）。风险等级多了 `local`（只改工作区）；`code_test`=exec、提 MR=write，配「审批」预设时这两步发卡，卡上带 diff（工具元数据 `preview`）。**跑测试=执行被改过的代码，目前没有容器隔离，别给不受信的应用勾 `code_test`。**
-- **工具(tool) vs 技能(skill)**：工具是「能做的动作」(查日志/发文档)；技能是「该懂的知识/方法」(如「公司架构」)。技能用**渐进披露**：系统提示词只注入名称+简介，模型需要详情时调 `read_skill(name)` 拉全文，且只能读本应用勾选的技能。
-- **定时任务**：到点用对应应用的 AI+工具+技能跑 instruction，结果发回原群(REST，不依赖长连接)。两种创建途径同一张表：对话创建(给应用勾 `schedule_task` 工具) + 后台「定时任务」页。
-- **监控集成是只读原生工具**(非 MCP)：`query_logs`/`server_stats`/`service_status`，连接信息走后台「可观测」页存 kv。这些是内置在 `llm/tools.py` 里的固定工具。
-- **MCP 工具是「外挂」工具**：后台「MCP 工具」页注册远程 HTTP MCP server（endpoint URL + 鉴权头），应用按 server 整体勾选 → 运行时 `llm/mcp.py` 连上它、把它 `tools/list` 出来的工具转成 OpenAI schema 挂进工具循环，名字统一 `mcp__{server_id}__{tool}` 便于路由与防撞名。**只支持远程 HTTP（Streamable HTTP，兼容 SSE 响应），不支持 stdio 本地进程。** 隔离照旧靠「勾了才有」。
-- **工具执行管道（harness/pipeline.py）**：engine 里每次工具调用（原生 + MCP）都走 `run_tool()`，固定五段：**记录**（写 `tool/call`，参数从此冻结）→ **策略**（`policy.decide` 按应用规则表给 allow/deny/ask，第一条命中生效，都不命中=拒）→ **guard**（只拒不放，策略的 allow 推翻不了）→ **执行**（独立线程 + 统一超时，`copy_context` 透传 contextvar；异常归一为 `{"error"}`）→ **后处理**（写 `tool/decision`、`tool/result`）。被拒不会让对话失败，模型拿到写明原因的错误结果。审批上线（P2）前 ask 按拒绝。
-  - 预设：**兼容**（默认，全部放行只叠加 guard，等于改造前行为）、**只读**（只放行 risk=read）、**审批**（read 放行，write/exec 走审批）。
-  - **审批（harness/approval.py）**：ask 且 guard 已放过 → 落 `approvals`(pending) → 在群里发卡片 → 工具线程在 `threading.Event` 上等（默认 10 分钟）→ 飞书回调线程 `decide()` 校验审批人、原子 pending→终态、唤醒。只有 `allowed-once` 执行；没配审批人、发卡失败、超时、重启遗留都不放行。只有 `trigger=chat` 的 run 会发卡（`approval_policy=ask`），定时/旁听/job/webhook/委派一律 `never`。exec 类不能由发起人自批。启动时遗留 pending → cancelled 并改卡片。
-  - **飞书后台必须配**：开发者后台「事件与回调 → 回调配置」选**长连接**并订阅 `card.action.trigger`（卡片回传交互），改完**发版**；否则点按钮没反应、审批全部超时。
-  - 现有 guard：`not_exposed`（模型说出本应用没勾的工具名——以前会被照样执行）、`proactive`（旁听时拒 write/exec）、`ssh_blacklist`、`k8s_precheck`（只读集群 + 黑名单）。后两个由 `ops/ssh.py`、`ops/k8s.py` 导入时 `policy.register_guard()` 注册；`run()` 内仍调同一个 `precheck()` 兜底，防绕过管道直接调用。guard 自身抛异常按拒绝。
-- **SSH 运维是高风险原生工具**：`ops/ssh.py`（paramiko）提供 `ssh_exec`/`list_ssh_hosts`，让数字员工在受管服务器上跑真实命令（如网掉了 `sudo wg-quick up wg0`）。受管主机+凭证存 kv（`ssh_hosts`/`ssh_blacklist`），后台「SSH 运维」页配。三层闸门：**① 模型判断为主**（工具说明里写死了「危险/不可逆就拒绝」，再叠加应用系统提示词+网络拓扑技能）；**② 硬黑名单兜底**（`ops.ssh._DEFAULT_BLACKLIST`，只挡 rm -rf /、mkfs、dd 到裸盘等不可逆命令，连接前就拦，不挡正常运维）；**③ 隔离**（应用勾了才有）。**铁律：绝不给「主动旁听」类应用勾 `ssh_exec`**——那等于让没人点名时也能自己 root 执行。
+`context_key` 绑定应用权限、工具、技能内容、MCP 配置、人设和模型供应商等。配置改变后旧检查点停下，**需核对旧任务后创建新任务**；不能用“继续”绕过，也不能把旧敏感证据自动重放给新供应商。代码快照/SSH 目标变更另有执行前校验。
 
-## 约定
+## 工具、授权与审批
 
-- **加一个工具**：在 `llm/tools.py` 的 `TOOLS` 池加 schema，`execute()` 加分支，**并在 `_META` 登记 `risk`（read/write/exec，可按参数判断）和需要时的 `timeout`**——漏登记按 exec（最高风险）处理，只读预设下会被拒；有安全检查就写成 guard 注册进 `harness.policy`，别只写在工具函数里。要按应用上下文就用 `ctx`(含 `app_id`/`chat_id`/`skills`)。然后应用在后台勾选即可用。**若能力来自外部 MCP server，别写死进 tools.py——去后台「MCP 工具」注册 server，应用勾选即可，不用改代码。**
-- **配置存哪**：每应用的配置 → `apps` 表；全局/连接类 → `kv`(`store.get_setting`/`set_setting`)。
-- **记忆/用量一律按 `app_id` 隔离**。
-- 前端无构建，直接改 `web/static/index.html`（`admin.py` 每次请求从磁盘读它）。
-- 中文注释为主，跟现有风格走。
+- 工具可见性和资源访问是两道检查。`apps.resources` 默认空对象，资源名单未配置即拒绝；`*` 只有管理员显式授予才生效。`users/chats` 是可选限制，一旦设置即执行。新工具必须实现目标资源授权，不能只登记 schema。
+- 默认策略为 `readonly`；空策略按只读、非法策略按 deny。`approval` 放行 read/local，write/exec 需审批；`compat` 只能显式选择，仍受所有 guard 限制。自定义规则第一条匹配生效，未命中拒绝。
+- `run_tool()` 顺序为：严格解析对象参数 → `prepare` 固定资源/工作区 → 保存动作与审计 → 当前策略/guard → 持久审批 → 再查当前权限、guard 与 `validate` → 标 running → 执行 → 存结果。未知副作用停止任务，不提示模型随意换参数重试。
+- 读取外部文本使 run 和检查点 tainted；后续生产 write/exec 被 guard 拒绝。允许只读、隔离代码本地变更、显式沙箱 `code_test` 与受审批 `code_propose_mr`；任意 MCP 不能借此执行。
+- durable 审批等待不占 worker；点击回调校验同一 app、有效审批人、状态及过期时间，落库后唤醒任务。无审批人、发送失败、过期、拒绝均不执行；exec 不允许发起人自批。无 task 的 legacy 调用保留阻塞兼容路径。
+- 正常任务的 chat/schedule/job/webhook 可以审批；proactive/delegate 固定 never。不能用审批代替资源权限或 guard。
+- 飞书开发者后台需长连接订阅 `card.action.trigger` 并发版，才可点击卡片批准。真实回调链路本轮未联调。
+- `kubectl` 只开放有限只读语法；禁止读取 Secret、覆盖服务器/身份、原始 API 路径、本地模板等。缺省 namespace 固定成 `default`，未知/集群级资源要求全局 namespace 权限。底层 Kubernetes RBAC 仍必须收紧。
+- `ssh_exec` 只允许显式登记且授权的主机名称；审批固定 host/port/username 指纹，硬黑名单保留。不要把模型判断当权限边界。
+- MCP 仅支持远程 HTTP（Streamable HTTP，兼容 SSE），不支持 stdio；应用勾选 server 之外还须授权 `mcp_servers` 资源。
+
+## 代码工作区与沙箱
+
+代码仓库在后台登记读令牌、写令牌、固定测试命令或 GitOps 静态校验类型。同一个 Developer + `api` + `read_repository` 项目令牌可用于该项目 HTTPS 克隆和审批后的 GitLab API 提 MR，无需 `write_repository`。模型通过 `code_*` 在按应用/群/任务归属的工作区改代码；不能访问其他任务工作区。工作区路径、符号链接与 `.git` 受限制；并发容量满时拒绝新建，不自动删掉在用工作区。
+
+`code_test` 默认禁用，必须设置 `HARNESS_SANDBOX_IMAGE`，镜像须已在本地且不声明额外卷；不会自动拉镜像，也没有宿主 shell 回退。测试使用独立代码快照，容器无网络、只读根文件系统、非 root、去 capabilities，限定 CPU/内存/PID；不挂载数据库、配置、生产密钥或 Docker socket。依赖须预装。超时/取消需确认容器销毁，无法确认则标记结果不明。
+
+审批绑定全仓快照和验证证据；Docker 测试还绑定测试命令与实际 image ID。恢复时和实际执行前都重新校验。`code_propose_mr` 要求相同快照的成功隔离测试，或仓库配置为 GitOps 时通过 YAML/JSON 静态校验；GitOps 校验仅验证语法与原生 Secret 载荷，不代替 CI、ArgoCD 与发布复扫。飞书卡片必须呈现完整 diff，超过预览上限则拒绝审批。由确定性 GitLab API 提交和建 MR，模型不持有写令牌，工作区不 git push。结果不明停止核对，MR 不自动合并。
+
+当前主 Dockerfile 未安装 Docker CLI，现有 Compose 未接入沙箱运行器。云端启用前仍须设计并验证可信执行节点或控制面到 Docker daemon 的连接与同路径挂载；别把宿主 socket 挂进执行仓库代码的容器。
+
+## 开发约定
+
+- 新工具在 `llm/tools.py` 增 schema、execute 分支和 `_META`（risk=read/local/write/exec、timeout、external 等）；漏登记按 exec。还须在 `llm/authorization.py` 加当前资源授权，必要时提供 prepare/validate/preview；不能只靠模型提示词。
+- 单元/集成测试使用临时数据目录和 `FEISHU_AGENT_CONFIG=''`，外部连接使用替身；不要读取本机真实凭据或操作生产。Python 3.12 为统一测试版本，`httpx` 只在 `requirements-dev.txt`。
+- `core/taskstore.py` 只依赖 core；需要注册上层执行器。新动作的完成、等待、未知结果都须有可验证的恢复路径。
+- 每应用配置放 `apps`，全局连接放 `kv`。配置、模型/应用密钥和连接凭据可能存入 SQLite，数据库/备份属于敏感数据；不是“密钥不入库”。
+- 技能从 Git 同步时保持来源约束、同主机令牌限制、路径校验、失败保留旧版本等已有防护。Git 来源技能编辑走能力仓 MR。
+- 前端无构建，改 `web/static/index.html`；中文注释与现有风格一致。
 
 ## ⚠️ 非踩不可的坑（都被这些坑过，改前务必看）
 
@@ -93,10 +103,12 @@ sched/runner.py(调度线程,每30s) ──到点──▶ engine.run → bot.po
 7. **前端时间显示强制 `Asia/Shanghai`**：`dt()` 写死 `timeZone:'Asia/Shanghai'`，否则按访问者浏览器时区渲染会误导。
 8. **MCP 客户端是手写同步的，别换成官方异步 SDK**：`llm/mcp.py` 用同步 `requests` 手写 Streamable HTTP 传输，正是为了不碰坑#2——官方 `mcp` SDK 是 asyncio 的，塞进多线程 bot 会重演「全局事件循环已在运行」。每次工具调用**独立连接一次**（initialize→initialized→tools/call，用完关），无跨线程 loop、无持久连接，最贴合本仓库同步风格。工具清单按 server 缓存 `_CACHE_TTL`(默认 300s) 避免每条消息都 `tools/list`；server 配置改动/删除时 `mcp.invalidate(id)` 清缓存（admin 里已接）。某个 server 连不上时 `tools_for_app` 只跳过它、不让整轮对话崩。
 
-## 运行 / 部署
+## 运行与验收
 
-- 本地：`pip install -r requirements.txt` → `cp config.example.yaml config.yaml`(填飞书凭证+管理员密码) → `python -m app.main` → 开 http://localhost:8800。
-- 容器：`docker compose up -d --build`。
-- 生产：推 `main` → CI 构镜像推 Harbor → SSH 部署。内网部署细节见 `deploy/DEPLOY.md`。
-- 首启自动把旧版单应用配置迁成「默认模型 + 默认应用」（`app/main.py:_migrate_legacy`），无损。
-- 密钥不入库：`config.yaml`(gitignore) 或环境变量；运行时设置存 `data/agent.db`。
+- 创建/使用 Python 3.12 虚拟环境，安装 `requirements-dev.txt`，运行 `FEISHU_AGENT_CONFIG='' python -m unittest discover -s tests -v`。默认跳过显式启用的真实 Docker 测试。
+- 本地模拟：`.venv/bin/python scripts/local_demo.py --seed --port 8801`；先确认该 `.venv` 是 Python 3.12。演示不读取生产配置，不连接真实飞书、模型、集群或漏洞源。
+- 本机真实常驻：`.venv-runtime/bin/python` 安装依赖后用 `python3 scripts/local_service.py install/status/uninstall` 管理当前用户的 launchd 服务；后台 `http://127.0.0.1:8800/#patrols`。启动时保存旧数据库备份，运行中不要把测试数据目录指向正式 `data`。云端仍须单实例守护、持久卷和 SSH 身份配置。
+- 正式入口：配置 `config.yaml` 后 `python -m app.main`；本机可用 `WEB_HOST=127.0.0.1` 仅监听本地。
+- 容器：现有 `docker compose up -d --build`。部署资料见 [deploy/DEPLOY.md](deploy/DEPLOY.md)，本轮未部署。
+- CI 新增 MR/main 的 Python 3.12 Docker 测试，运行通过后原有 main 构建/发布才继续；本次未触发远程流水线。
+- 首启旧配置迁移逻辑保留。数据路径默认为 `data/agent.db`，用 `FEISHU_AGENT_DATA_DIR` 可隔离测试目录；改路径会切换数据库，而不是迁移数据。

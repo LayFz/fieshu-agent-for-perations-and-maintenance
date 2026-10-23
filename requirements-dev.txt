@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# FastAPI TestClient / local harness integration tests; not needed by the server runtime.
+httpx>=0.27,<1

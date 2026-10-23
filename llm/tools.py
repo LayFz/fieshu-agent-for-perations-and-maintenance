@@ -13,7 +13,7 @@ from ops import ssh as ops_ssh
 from ops import k8s as ops_k8s
 from ops import argocd as ops_argocd
 from ops import gitlab as ops_gitlab
-from harness import workspace
+from harness import workspace, tasks
 from sec import feeds
 
 
@@ -214,7 +214,7 @@ TOOLS = [
     }},
 ]
 
-# ---------- 代码工作区（harness.workspace）：在一次性工作区里改代码 → 跑测试 → 出 diff → 提 MR ----------
+# ---------- 代码工作区（harness.workspace）：隔离改动 → 测试/静态校验 → diff → 审批提 MR ----------
 _WS_PARAM = {"workspace": {"type": "string", "description": "可选，工作区 id（code_open 返回）；不传用本群最近打开的那个"}}
 TOOLS += [
     {"type": "function", "function": {
@@ -225,7 +225,8 @@ TOOLS += [
     {"type": "function", "function": {
         "name": "code_open",
         "description": "把一个仓库克隆到新的一次性工作区，返回工作区 id 和顶层目录。之后的读写都只作用于这个工作区，"
-                       "不会影响远端仓库；改完用 code_diff 看改动、code_test 跑测试、code_propose_mr 提 MR 给人评审。",
+                       "不会影响远端仓库；改完用 code_test 跑固定测试或用 code_validate 校验 GitOps 清单，"
+                       "再用 code_diff 看改动、code_propose_mr 申请提 MR 给人评审。",
         "parameters": {"type": "object", "properties": {
             "repo": {"type": "string", "description": "仓库名（见 code_repos）"},
             "branch": {"type": "string", "description": "可选，基于哪个分支，默认仓库的默认分支"},
@@ -294,9 +295,16 @@ TOOLS += [
         "parameters": {"type": "object", "properties": dict(_WS_PARAM)},
     }},
     {"type": "function", "function": {
+        "name": "code_validate",
+        "description": "静态校验 GitOps 仓库工作区的 YAML/JSON 改动与原生 Secret 风险；不执行仓库代码。"
+                       "校验通过后再查看 diff 并申请提 MR。",
+        "parameters": {"type": "object", "properties": dict(_WS_PARAM)},
+    }},
+    {"type": "function", "function": {
         "name": "code_propose_mr",
         "description": "把工作区里的改动提交到新分支并创建 Merge Request，返回 MR 链接，交给人评审合并（不会直接合并）。"
-                       "提交前请确认 code_diff 的改动正确、code_test 已通过（若可跑）。一个工作区只能提一次。",
+                       "提交前请确认 code_diff 的改动正确，并让当前快照通过固定测试或 GitOps 静态校验。"
+                       "必须通过飞书审批完整 diff，一个工作区只能提一次。",
         "parameters": {"type": "object", "properties": dict(_WS_PARAM, **{
             "title": {"type": "string", "description": "MR 标题，一句话说清改了什么"},
             "description": {"type": "string", "description": "MR 描述：为什么改、改了什么、怎么验证的"},
@@ -346,8 +354,8 @@ TOOLS += [
     {"type": "function", "function": {
         "name": "argocd_apps",
         "description": "列 ArgoCD 管理的全部应用：项目、目标集群/命名空间、来源仓库与路径、同步/健康状态，"
-                       "以及集群里【实际运行】的镜像（status.summary.images）。查组件真实版本时优先用它——"
-                       "gitops 仓库里很多是浮动 tag，只看声明拿不到真实版本。",
+                       "以及 status.summary.images 中的镜像引用。浮动 tag 不能证明精确运行版本；"
+                       "这些引用也不能替代 Pod imageID/digest 或组件版本证据。",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "可选，应用名关键字过滤"},
             "project": {"type": "string", "description": "可选，只看某个 ArgoCD project"},
@@ -364,12 +372,34 @@ TOOLS += [
         "parameters": {"type": "object", "properties": {"search": {"type": "string", "description": "可选，名称关键字"}}},
     }},
     {"type": "function", "function": {
+        "name": "gitlab_project",
+        "description": "读取一个已授权 GitLab 项目的详情、默认分支及其完整提交 SHA；用于固定后续文件查询版本。",
+        "parameters": {"type": "object", "properties": {
+            "project": {"type": "string", "description": "已授权的项目路径如 group/repo，或项目 id"},
+        }, "required": ["project"]},
+    }},
+    {"type": "function", "function": {
+        "name": "gitlab_pipelines",
+        "description": "读取一个已授权 GitLab 项目最近的流水线状态、ref、提交 SHA 和链接。"
+                       "只返回一页元数据，不读取日志、变量或制品；检查 pagination.has_more 判断是否还有记录。",
+        "parameters": {"type": "object", "properties": {
+            "project": {"type": "string", "description": "已授权的项目路径如 group/repo，或项目 id"},
+            "ref": {"type": "string", "description": "可选，按分支或标签过滤"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20,
+                      "description": "本次最多返回的流水线数量，默认 20，上限 100"},
+        }, "required": ["project"]},
+    }},
+    {"type": "function", "function": {
         "name": "gitlab_tree",
-        "description": "列 GitLab 项目某个目录下的文件（只读，不克隆）。",
+        "description": "分页列 GitLab 项目某个目录下的文件（只读，不克隆）。"
+                       "按 pagination.next_page 继续查询；跨页应固定 ref 为同一提交 SHA。",
         "parameters": {"type": "object", "properties": {
             "project": {"type": "string", "description": "项目路径如 group/repo，或项目 id"},
             "path": {"type": "string", "description": "目录，默认仓库根"},
             "ref": {"type": "string", "description": "分支/标签/提交，默认默认分支"},
+            "page": {"type": "integer", "minimum": 1, "default": 1, "description": "页码，从 1 开始"},
+            "per_page": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100,
+                         "description": "每页数量，默认及上限 100"},
         }, "required": ["project"]},
     }},
     {"type": "function", "function": {
@@ -462,6 +492,7 @@ _META = {
     "code_delete": {"risk": "local"},
     "code_diff": {"risk": "read"},
     "code_test": {"risk": "exec", "timeout": 630},     # 跑仓库代码（可能被改过）= 执行任意代码
+    "code_validate": {"risk": "local", "timeout": 60},
     "code_propose_mr": {"risk": "write", "timeout": 90},
     "code_close": {"risk": "local"},
     "cve_kev": {"risk": "read", "external": True, "timeout": 60},
@@ -470,6 +501,8 @@ _META = {
     "argocd_apps": {"risk": "read"},
     "argocd_app": {"risk": "read"},
     "gitlab_projects": {"risk": "read"},
+    "gitlab_project": {"risk": "read", "external": True},
+    "gitlab_pipelines": {"risk": "read", "external": True},
     "gitlab_tree": {"risk": "read"},
     "gitlab_read": {"risk": "read"},
     "vuln_list": {"risk": "read", "external": True},
@@ -480,10 +513,14 @@ _META = {
 def _preview_mr(args, ctx):
     """审批卡片上给人看的改动摘要：要批的是这些改动，不是模型写的标题。"""
     ws = workspace.get_workspace(args.get("workspace"), ctx.get("app_id"), ctx.get("chat_id"))
-    d = workspace.diff(ws, max_chars=2500)
+    d = workspace.diff(ws, max_chars=12000)
+    if d["truncated"]:
+        raise workspace.WorkspaceError("改动超过飞书审批卡片可完整展示的范围，请拆分成较小的 MR。")
     files = "\n".join(f"- {f['status']} `{f['path']}` (+{f['added']} -{f['removed']})" for f in d["files"])
-    return f"**改动 {len(d['files'])} 个文件**（基于 {d['base_commit']}）\n{files}\n```diff\n{d['diff']}\n```" \
-           + ("\n（diff 已截断，完整内容见 MR）" if d["truncated"] else "")
+    preview = f"**改动 {len(d['files'])} 个文件**（基于 {d['base_commit']}）\n{files}\n```diff\n{d['diff']}\n```"
+    if len(preview) > 16000:
+        raise workspace.WorkspaceError("改动文件列表超过飞书审批卡片可完整展示的范围，请拆分 MR。")
+    return preview
 
 
 def _preview_test(args, ctx):
@@ -495,6 +532,9 @@ def _preview_test(args, ctx):
 
 _META["code_propose_mr"]["preview"] = _preview_mr
 _META["code_test"]["preview"] = _preview_test
+
+for _untrusted in ("read_doc", "query_logs", "gitlab_read", "code_read", "code_search", "kubectl"):
+    _META[_untrusted]["external"] = True
 
 _UNKNOWN_META = {"risk": "exec", "external": False, "timeout": 120}
 # MCP 工具来自外部 server，能力未知：按 write 处理，结果视为外部内容
@@ -521,6 +561,8 @@ def approval_preview(name, args, ctx):
     try:
         return fn(args or {}, ctx or {})
     except Exception as e:
+        if name == "code_propose_mr":
+            raise
         return f"（预览生成失败：{e}）"
 
 # 技能工具：仅当应用勾了技能时由 engine 自动挂上（不在工具池里给用户单独勾）
@@ -557,7 +599,9 @@ def _code_tool(name, args, ctx):
     app_id, chat_id = ctx.get("app_id"), ctx.get("chat_id")
     try:
         if name == "code_repos":
-            return {"repos": workspace.list_repos()}
+            from harness import access
+            app = store.get_app(app_id) or {}
+            return {"repos": [r for r in workspace.list_repos() if access.allowed(app, "repos", r["name"])]}
         if name == "code_open":
             return workspace.open_workspace(app_id, chat_id, args.get("repo"), args.get("branch"))
         ws = workspace.get_workspace(args.get("workspace"), app_id, chat_id)
@@ -577,9 +621,12 @@ def _code_tool(name, args, ctx):
         if name == "code_diff":
             return workspace.diff(ws)
         if name == "code_test":
-            return workspace.run_tests(ws)
+            return workspace.run_tests(ws, expected_snapshot=args.get("_snapshot"))
+        if name == "code_validate":
+            return workspace.validate_manifests(ws)
         if name == "code_propose_mr":
-            return workspace.propose_mr(ws, args.get("title"), args.get("description") or "")
+            return workspace.propose_mr(ws, args.get("title"), args.get("description") or "",
+                                        expected_snapshot=args.get("_snapshot"))
         if name == "code_close":
             workspace.close_workspace(ws["id"])
             return {"ok": True, "closed": ws["id"]}
@@ -592,6 +639,8 @@ def execute(name, args, ctx=None):
     ctx = ctx or {}
     app_id = ctx.get("app_id")
     try:
+        from .authorization import validate
+        validate(name, args, ctx)
         if name == "read_skill":
             skills = ctx.get("skills") or {}          # 只含本应用勾选的技能 -> 隔离
             sk = skills.get(args.get("name"))
@@ -626,8 +675,13 @@ def execute(name, args, ctx=None):
             return ops_argocd.get_app(args.get("name"))
         if name == "gitlab_projects":
             return ops_gitlab.projects(args.get("search"))
+        if name == "gitlab_project":
+            return ops_gitlab.project_details(args.get("project"))
+        if name == "gitlab_pipelines":
+            return ops_gitlab.pipelines(args.get("project"), args.get("ref"), args.get("limit", 20))
         if name == "gitlab_tree":
-            return ops_gitlab.tree(args.get("project"), args.get("path") or "", args.get("ref"))
+            return ops_gitlab.tree(args.get("project"), args.get("path") or "", args.get("ref"),
+                                   page=args.get("page", 1), per_page=args.get("per_page", 100))
         if name == "gitlab_read":
             return ops_gitlab.read(args.get("project"), args.get("path"), args.get("ref"))
         if name == "vuln_list":
@@ -666,10 +720,14 @@ def execute(name, args, ctx=None):
             return feishu_docs.create_node(args["space_id"], args["title"], args["markdown"],
                                            args.get("parent_node_token"))
         if name == "remember":
-            store.add_note(app_id, args["note"])
+            store.add_note(app_id, args["note"], scope=f"chat:{ctx.get('chat_id', '')}:{ctx.get('context_key', '')}")
             return {"ok": True}
         if name == "list_log_streams":
-            return openobserve.list_streams(args.get("org"))
+            from harness import access
+            result = openobserve.list_streams(args.get("org"))
+            app = store.get_app(app_id) or {}
+            result["streams"] = [s for s in result.get("streams", []) if access.allowed(app, "log_streams", s)]
+            return result
         if name == "query_logs":
             return openobserve.search(args["stream"], args.get("where"),
                                       args.get("period", "15m"), args.get("limit", 50),
@@ -692,11 +750,19 @@ def execute(name, args, ctx=None):
         if name == "service_status":
             return uptimekuma.status()
         if name == "list_ssh_hosts":
-            return ops_ssh.list_hosts()
+            from harness import access
+            app = store.get_app(app_id) or {}
+            result = ops_ssh.list_hosts()
+            result["hosts"] = [h for h in result.get("hosts", []) if access.allowed(app, "ssh_hosts", h["name"])]
+            return result
         if name == "ssh_exec":
             return ops_ssh.run(args.get("target"), args.get("command"), args.get("timeout", 30))
         if name == "list_k8s_clusters":
-            return ops_k8s.list_clusters()
+            from harness import access
+            app = store.get_app(app_id) or {}
+            result = ops_k8s.list_clusters()
+            result["clusters"] = [c for c in result.get("clusters", []) if access.allowed(app, "k8s_clusters", c["name"])]
+            return result
         if name == "kubectl":
             return ops_k8s.run(args.get("target"), args.get("command"), args.get("timeout", 30))
         if name == "schedule_task":
@@ -718,5 +784,7 @@ def execute(name, args, ctx=None):
             store.delete_schedule(sc["id"])
             return {"ok": True}
         return {"error": f"unknown tool {name}"}
+    except (tasks.TaskCancelled, tasks.TaskSuspended, tasks.TaskUncertain, tasks.TaskIncomplete):
+        raise
     except Exception as e:
         return {"error": str(e)}
