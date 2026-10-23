@@ -5,99 +5,154 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>数字员工平台 管理后台</title>
 <style>
-  :root{ --bg:#f4f5f7; --card:#fff; --line:#e6e8eb; --ink:#1f2329; --sub:#646a73;
-         --pri:#3370ff; --pri-d:#1f5eff; --ok:#3bb346; --warn:#ff8800; --err:#f5222d; }
+  :root{
+    --bg:#f5f6f8; --card:#fff; --line:#e7e9ee; --line2:#f0f1f4; --ink:#111827; --sub:#6b7280; --sub2:#9ca3af;
+    --pri:#3b5bdb; --pri-d:#2f4ac0; --pri-soft:#eef2ff;
+    --ok:#16a34a; --ok-soft:#ecfdf3; --warn:#d97706; --warn-soft:#fffbeb; --err:#dc2626; --err-soft:#fef2f2;
+    --nav:#0f172a; --nav-2:#1e293b; --nav-ink:#94a3b8; --nav-label:#64748b;
+    --radius:12px; --shadow:0 1px 2px rgba(16,24,40,.04),0 1px 3px rgba(16,24,40,.06);
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
   *{ box-sizing:border-box; }
-  body{ margin:0; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-        color:var(--ink); background:var(--bg); }
-  a{ color:var(--pri); text-decoration:none; }
+  body{ margin:0; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+        color:var(--ink); background:var(--bg); -webkit-font-smoothing:antialiased; }
+  a{ color:var(--pri); text-decoration:none; } a:hover{ text-decoration:underline; }
   button{ font:inherit; cursor:pointer; }
-  .btn{ background:var(--pri); color:#fff; border:0; border-radius:6px; padding:8px 16px; }
-  .btn:hover{ background:var(--pri-d); }
-  .btn.ghost{ background:#fff; color:var(--ink); border:1px solid var(--line); }
-  .btn.danger{ background:#fff; color:var(--err); border:1px solid #ffd6d6; padding:4px 10px; font-size:13px; }
+  .btn{ background:var(--pri); color:#fff; border:1px solid var(--pri); border-radius:8px; padding:7px 16px; font-weight:500;
+        transition:background .15s,border-color .15s,box-shadow .15s; }
+  .btn:hover{ background:var(--pri-d); border-color:var(--pri-d); }
+  .btn:disabled{ opacity:.55; cursor:not-allowed; }
+  .btn.ghost{ background:#fff; color:var(--ink); border:1px solid var(--line); font-weight:400; }
+  .btn.ghost:hover{ background:#f9fafb; border-color:#d1d5db; }
+  .btn.danger{ background:#fff; color:var(--err); border:1px solid #fecaca; padding:4px 10px; font-size:13px; font-weight:400; }
+  .btn.danger:hover{ background:var(--err-soft); }
   .btn.sm{ padding:4px 12px; font-size:13px; }
-  input,textarea,select{ font:inherit; width:100%; padding:8px 10px; border:1px solid var(--line);
-        border-radius:6px; background:#fff; color:var(--ink); }
+  input,textarea,select{ font:inherit; width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px;
+        background:#fff; color:var(--ink); transition:border-color .15s,box-shadow .15s; }
+  input:focus,textarea:focus,select:focus{ outline:none; border-color:var(--pri); box-shadow:0 0 0 3px rgba(59,91,219,.12); }
   textarea{ resize:vertical; min-height:100px; font-family:inherit; }
-  label{ display:block; font-size:13px; color:var(--sub); margin:14px 0 6px; }
+  label{ display:block; font-size:13px; color:var(--sub); margin:14px 0 6px; font-weight:500; }
 
-  #login{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:var(--bg); z-index:50; }
-  #login .box{ width:340px; background:#fff; border:1px solid var(--line); border-radius:12px; padding:28px; box-shadow:0 8px 30px rgba(0,0,0,.06); }
-  #login h1{ font-size:18px; margin:0 0 4px; } #login p{ color:var(--sub); margin:0 0 18px; font-size:13px; }
+  /* 登录 */
+  #login{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:50;
+          background:radial-gradient(1200px 600px at 20% 10%,#e0e7ff 0,transparent 60%),var(--bg); }
+  #login .box{ width:360px; background:#fff; border:1px solid var(--line); border-radius:16px; padding:32px; box-shadow:0 12px 40px rgba(15,23,42,.08); }
+  #login h1{ font-size:20px; margin:0 0 4px; } #login p{ color:var(--sub); margin:0 0 18px; font-size:13px; }
   #login .err{ color:var(--err); font-size:13px; min-height:18px; margin-top:10px; }
 
+  /* 骨架：深色侧边栏 + 右侧内容 */
   #app{ display:none; }
-  header{ height:54px; background:#fff; border-bottom:1px solid var(--line); display:flex; align-items:center;
-          padding:0 20px; position:sticky; top:0; z-index:10; }
-  header .logo{ font-weight:600; } header .logo b{ color:var(--pri); }
-  header .right{ margin-left:auto; color:var(--sub); display:flex; align-items:center; gap:14px; }
-  .layout{ display:flex; min-height:calc(100vh - 54px); }
-  nav{ width:180px; background:#fff; border-right:1px solid var(--line); padding:12px 0; flex:0 0 auto; }
-  nav a{ display:block; padding:10px 20px; color:var(--ink); font-size:14px; border-left:3px solid transparent; }
-  nav a:hover{ background:#f7f8fa; } nav a.on{ color:var(--pri); border-left-color:var(--pri); background:#f0f5ff; font-weight:500; }
-  main{ flex:1; padding:24px 28px; max-width:1040px; }
-  h2{ font-size:18px; margin:0 0 4px; } .desc{ color:var(--sub); margin:0 0 20px; font-size:13px; }
-  .head{ display:flex; align-items:center; margin-bottom:20px; } .head .desc{ margin:0; } .head .btn{ margin-left:auto; }
+  .layout{ display:flex; min-height:100vh; }
+  nav{ width:224px; flex:0 0 224px; background:var(--nav); color:var(--nav-ink); position:sticky; top:0; height:100vh;
+       overflow-y:auto; padding:0 10px 20px; }
+  nav .brand{ display:flex; align-items:center; gap:10px; padding:18px 10px 14px; color:#fff; font-weight:600; font-size:15px; }
+  nav .brand .mark{ width:28px; height:28px; border-radius:8px; background:linear-gradient(135deg,#6366f1,#3b82f6);
+       display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; }
+  nav .brand small{ display:block; color:var(--nav-label); font-weight:400; font-size:11px; margin-top:-2px; }
+  nav .nlabel{ font-size:11px; letter-spacing:.06em; color:var(--nav-label); padding:16px 12px 6px; font-weight:600; }
+  nav a{ display:flex; align-items:center; gap:10px; padding:7px 12px; margin:1px 0; color:var(--nav-ink); font-size:13.5px;
+         border-radius:8px; transition:background .12s,color .12s; }
+  nav a:hover{ background:var(--nav-2); color:#e2e8f0; text-decoration:none; }
+  nav a.on{ background:rgba(99,102,241,.18); color:#fff; font-weight:500; }
+  nav a.on .ic{ color:#a5b4fc; }
+  nav .ic{ width:16px; height:16px; flex:0 0 16px; color:#64748b; }
+  nav .badge{ margin-left:auto; background:#ef4444; color:#fff; font-size:11px; border-radius:10px; padding:0 7px; line-height:18px; }
+  .main{ flex:1; min-width:0; display:flex; flex-direction:column; }
+  header{ height:56px; background:rgba(255,255,255,.85); backdrop-filter:saturate(180%) blur(8px); border-bottom:1px solid var(--line);
+          display:flex; align-items:center; padding:0 28px; position:sticky; top:0; z-index:10; }
+  header .crumb{ color:var(--sub); font-size:13px; } header .crumb b{ color:var(--ink); font-weight:600; }
+  header .right{ margin-left:auto; color:var(--sub); display:flex; align-items:center; gap:14px; font-size:13px; }
+  main{ padding:24px 28px 48px; max-width:1240px; width:100%; }
+  h2{ font-size:20px; margin:0 0 4px; letter-spacing:-.01em; } .desc{ color:var(--sub); margin:0 0 20px; font-size:13px; }
+  .head{ display:flex; align-items:flex-start; gap:16px; margin-bottom:20px; } .head .desc{ margin:0; } .head .btn{ margin-left:auto; white-space:nowrap; }
 
-  .card{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:16px; }
-  .grid{ display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); }
-  .stat{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px; }
-  .stat .k{ color:var(--sub); font-size:13px; } .stat .v{ font-size:26px; font-weight:600; margin-top:4px; }
+  /* 卡片与统计 */
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:18px 20px; margin-bottom:16px; box-shadow:var(--shadow); }
+  .card-title{ display:flex; align-items:center; gap:8px; font-weight:600; margin-bottom:12px; }
+  .card-title .muted{ font-weight:400; font-size:12px; } .card-title .btn{ margin-left:auto; }
+  .grid{ display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); }
+  .stat{ background:#fff; border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; box-shadow:var(--shadow); }
+  .stat .k{ color:var(--sub); font-size:12.5px; } .stat .v{ font-size:28px; font-weight:650; margin-top:2px; letter-spacing:-.02em; }
+  .stat .s{ color:var(--sub2); font-size:12px; }
+  .stat.alert{ border-color:#fecaca; background:linear-gradient(180deg,#fff,var(--err-soft)); } .stat.alert .v{ color:var(--err); }
+  .stat.warn .v{ color:var(--warn); } .stat.good .v{ color:var(--ok); }
   .chips{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:18px; }
-  .chip{ padding:5px 12px; border-radius:20px; font-size:13px; border:1px solid var(--line); background:#fff;
+  .chip{ padding:3px 10px; border-radius:20px; font-size:12.5px; border:1px solid var(--line); background:#fff;
          white-space:nowrap; display:inline-flex; align-items:center; }
-  .chip .dot{ display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
-  .dot.g{ background:var(--ok); } .dot.r{ background:var(--err); } .dot.y{ background:var(--warn); }
+  .chip .dot{ display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; }
+  .dot.g{ background:var(--ok); } .dot.r{ background:var(--err); } .dot.y{ background:var(--warn); } .dot:not(.g):not(.r):not(.y){ background:#cbd5e1; }
 
   .cards{ display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); }
-  .appcard{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
-  .appcard h3{ margin:0 0 2px; font-size:16px; display:flex; align-items:center; gap:8px; }
-  .appcard .meta{ color:var(--sub); font-size:13px; margin:8px 0; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .appcard{ background:#fff; border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; box-shadow:var(--shadow); }
+  .appcard h3{ margin:0 0 2px; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .appcard .meta{ color:var(--sub); font-size:13px; margin:8px 0; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
   .appcard .acts{ display:flex; gap:8px; margin-top:12px; }
-  .tag{ display:inline-block; font-size:12px; padding:1px 8px; border-radius:10px; background:#f0f5ff; color:var(--pri); }
-  .tag.off{ background:#f2f3f5; color:var(--sub); }
+  .tag{ display:inline-block; font-size:12px; padding:1px 8px; border-radius:6px; background:var(--pri-soft); color:var(--pri); }
+  .tag.off{ background:#f3f4f6; color:var(--sub); }
 
-  table{ width:100%; border-collapse:collapse; font-size:13px; }
-  th,td{ text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); }
-  th{ color:var(--sub); font-weight:500; background:#fafbfc; }
+  /* 严重度 / 状态徽章 */
+  .sev{ display:inline-block; font-size:11.5px; font-weight:600; padding:1px 8px; border-radius:6px; white-space:nowrap; }
+  .sev.critical{ background:#7f1d1d; color:#fff; } .sev.high{ background:var(--err-soft); color:var(--err); }
+  .sev.medium,.sev.moderate{ background:var(--warn-soft); color:var(--warn); } .sev.low{ background:#f3f4f6; color:var(--sub); }
+  .sev.kev{ background:#dc2626; color:#fff; }
+  .st{ display:inline-block; font-size:12px; padding:1px 8px; border-radius:6px; background:#f3f4f6; color:var(--sub); white-space:nowrap; }
+  .st.new{ background:var(--pri-soft); color:var(--pri); } .st.triaging{ background:var(--warn-soft); color:var(--warn); }
+  .st.affected{ background:var(--err-soft); color:var(--err); } .st.fixed{ background:var(--ok-soft); color:var(--ok); }
+  .bar{ height:6px; background:#f1f5f9; border-radius:4px; overflow:hidden; min-width:50px; }
+  .bar i{ display:block; height:100%; background:linear-gradient(90deg,#f59e0b,#dc2626); }
+
+  /* 表格 */
+  table{ width:100%; border-collapse:separate; border-spacing:0; font-size:13px; }
+  th,td{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line2); vertical-align:middle; }
+  th{ color:var(--sub); font-weight:500; font-size:12.5px; background:#fafbfc; position:sticky; top:56px; z-index:1; }
+  thead th:first-child{ border-top-left-radius:8px; } thead th:last-child{ border-top-right-radius:8px; }
+  tbody tr:hover td{ background:#fafbff; } tbody tr:last-child td{ border-bottom:0; }
   td.num,th.num{ text-align:right; font-variant-numeric:tabular-nums; }
-  .muted{ color:var(--sub); } .mono{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
-  .tabs{ display:flex; gap:6px; margin-bottom:14px; }
-  .tabs button{ background:#fff; border:1px solid var(--line); border-radius:6px; padding:6px 14px; color:var(--ink); }
-  .tabs button.on{ background:var(--pri); color:#fff; border-color:var(--pri); }
+  .muted{ color:var(--sub); } .mono{ font-family:var(--mono); font-size:12px; }
+  .clip{ max-width:0; width:100%; } .clip > *{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tabs{ display:inline-flex; gap:2px; margin-bottom:14px; background:#eef0f4; padding:3px; border-radius:9px; }
+  .tabs button{ background:transparent; border:0; border-radius:7px; padding:5px 14px; color:var(--sub); }
+  .tabs button.on{ background:#fff; color:var(--ink); box-shadow:var(--shadow); font-weight:500; }
+  .toolbar{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .toolbar input,.toolbar select{ width:auto; min-width:120px; padding:6px 10px; }
+  .toolbar .grow{ flex:1; min-width:200px; }
+  .pager{ display:flex; align-items:center; gap:10px; justify-content:flex-end; margin-top:12px; color:var(--sub); font-size:13px; }
   .row{ display:flex; gap:14px; } .row>div{ flex:1; }
   .save-bar{ margin-top:18px; display:flex; align-items:center; gap:12px; }
   .hint{ color:var(--sub); font-size:12px; margin-top:4px; }
-  .empty{ color:var(--sub); padding:30px; text-align:center; }
-  .bubble{ padding:8px 12px; border-radius:8px; margin:6px 0; max-width:80%; white-space:pre-wrap; word-break:break-word; }
-  .bubble.user{ background:#e8f0ff; } .bubble.assistant{ background:#f2f3f5; }
+  .empty{ color:var(--sub); padding:36px; text-align:center; }
+  .notice{ border:1px solid #fde68a; background:var(--warn-soft); color:#92400e; border-radius:10px; padding:10px 14px; font-size:13px; margin-bottom:16px; }
+  .bubble{ padding:8px 12px; border-radius:10px; margin:6px 0; max-width:80%; white-space:pre-wrap; word-break:break-word; }
+  .bubble.user{ background:var(--pri-soft); } .bubble.assistant{ background:#f3f4f6; }
   .bubble .who{ font-size:11px; color:var(--sub); margin-bottom:2px; }
-  .ev{ display:flex; gap:12px; padding:10px 0; border-bottom:1px solid var(--line); }
+  .ev{ display:flex; gap:12px; padding:10px 0; border-bottom:1px solid var(--line2); }
   .ev:last-child{ border-bottom:0; }
   .ev .t{ flex:0 0 64px; color:var(--sub); font-size:12px; font-variant-numeric:tabular-nums; padding-top:2px; }
   .ev .b{ flex:1; min-width:0; }
   .ev .txt{ white-space:pre-wrap; word-break:break-word; margin-top:4px; }
-  .ev pre{ background:#f7f8fa; border-radius:6px; padding:8px 10px; margin:6px 0 0; white-space:pre-wrap;
-    word-break:break-all; font-size:12px; max-height:360px; overflow:auto; }
+  .ev pre, pre.box{ background:#f8fafc; border:1px solid var(--line2); border-radius:8px; padding:8px 10px; margin:6px 0 0; white-space:pre-wrap;
+    word-break:break-all; font-size:12px; max-height:360px; overflow:auto; font-family:var(--mono); }
   .ev details summary{ cursor:pointer; color:var(--sub); font-size:12px; margin-top:4px; }
-  .etype{ font-family:ui-monospace,Menlo,monospace; font-size:12px; padding:1px 8px; border-radius:10px;
-    background:#f2f3f5; color:var(--sub); margin-right:8px; }
-  .etype.tool{ background:#fff7e6; color:#ad6800; } .etype.asst{ background:#f0f5ff; color:var(--pri); }
+  .etype{ font-family:var(--mono); font-size:11.5px; padding:1px 8px; border-radius:6px; background:#f3f4f6; color:var(--sub); margin-right:8px; }
+  .etype.tool{ background:#fff7ed; color:#c2410c; } .etype.asst{ background:var(--pri-soft); color:var(--pri); }
   .toolpick{ display:grid; gap:8px; grid-template-columns:1fr 1fr; }
   .toolpick label{ display:flex; gap:8px; align-items:flex-start; margin:0; padding:8px 10px; border:1px solid var(--line);
-        border-radius:8px; cursor:pointer; color:var(--ink); font-size:13px; }
+        border-radius:8px; cursor:pointer; color:var(--ink); font-size:13px; font-weight:400; }
+  .toolpick label:hover{ border-color:#c7d2fe; background:#fafbff; }
   .toolpick input{ width:auto; margin-top:3px; }
-  .toolpick .tn{ font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .toolpick .tn{ font-family:var(--mono); font-size:12px; }
   .toolpick .td{ color:var(--sub); font-size:12px; }
+  .kv{ display:grid; grid-template-columns:120px 1fr; gap:6px 14px; font-size:13px; } .kv dt{ color:var(--sub); } .kv dd{ margin:0; }
 
-  #modal{ position:fixed; inset:0; background:rgba(0,0,0,.35); display:none; align-items:flex-start;
-          justify-content:center; z-index:40; overflow:auto; padding:40px 16px; }
-  #modal .dlg{ width:640px; max-width:100%; background:#fff; border-radius:12px; padding:24px 26px; box-shadow:0 12px 40px rgba(0,0,0,.18); }
+  #modal{ position:fixed; inset:0; background:rgba(15,23,42,.45); display:none; align-items:flex-start;
+          justify-content:center; z-index:40; overflow:auto; padding:48px 16px; }
+  #modal .dlg{ width:680px; max-width:100%; background:#fff; border-radius:16px; padding:24px 26px; box-shadow:0 20px 50px rgba(15,23,42,.25); }
   #modal h3{ margin:0 0 4px; font-size:17px; }
-  #toast{ position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#1f2329; color:#fff;
-          padding:10px 18px; border-radius:8px; font-size:13px; opacity:0; transition:.25s; pointer-events:none; z-index:60; }
+  #toast{ position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#111827; color:#fff;
+          padding:10px 18px; border-radius:10px; font-size:13px; opacity:0; transition:.25s; pointer-events:none; z-index:60; box-shadow:0 8px 24px rgba(0,0,0,.2); }
   #toast.show{ opacity:1; }
+  @media (max-width:860px){ nav{ width:64px; flex-basis:64px; padding:0 6px; } nav .nlabel, nav a span.t, nav .brand .bt{ display:none; }
+    nav a{ justify-content:center; } main{ padding:16px; } header{ padding:0 16px; } .row{ flex-direction:column; } .toolpick{ grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -114,28 +169,40 @@
 </div>
 
 <div id="app">
-  <header>
-    <div class="logo">数字员工 <b>平台</b> 控制台</div>
-    <div class="right"><span id="who"></span><button class="btn ghost" onclick="doLogout()">退出</button></div>
-  </header>
   <div class="layout">
     <nav>
-      <a data-page="overview" class="on">概览</a>
-      <a data-page="apps">应用</a>
-      <a data-page="providers">AI 供应商</a>
-      <a data-page="skills">技能</a>
-      <a data-page="mcp">MCP 工具</a>
-      <a data-page="code">代码仓库</a>
-      <a data-page="schedules">定时任务</a>
-      <a data-page="memory">记忆系统</a>
-      <a data-page="runs">运行记录</a>
-      <a data-page="usage">Token 用量</a>
-      <a data-page="obs">可观测(日志)</a>
-      <a data-page="ssh">SSH 运维</a>
-      <a data-page="k8s">K8s 运维</a>
-      <a data-page="account">账号</a>
+      <div class="brand"><div class="mark">AI</div><div class="bt">数字员工平台<small>harness 控制台</small></div></div>
+      <a data-page="overview" data-ic="home" class="on"><span class="t">概览</span></a>
+      <div class="nlabel">数字员工</div>
+      <a data-page="apps" data-ic="bot"><span class="t">应用</span></a>
+      <a data-page="providers" data-ic="cpu"><span class="t">AI 供应商</span></a>
+      <a data-page="skills" data-ic="book"><span class="t">技能</span></a>
+      <a data-page="mcp" data-ic="plug"><span class="t">MCP 工具</span></a>
+      <a data-page="schedules" data-ic="clock"><span class="t">定时任务</span></a>
+      <div class="nlabel">安全</div>
+      <a data-page="vulns" data-ic="shield"><span class="t">漏洞台账</span><span class="badge" id="nav-vuln-badge" style="display:none"></span></a>
+      <a data-page="intel" data-ic="radar"><span class="t">情报源</span></a>
+      <div class="nlabel">工程</div>
+      <a data-page="code" data-ic="branch"><span class="t">代码仓库</span></a>
+      <a data-page="runs" data-ic="activity"><span class="t">运行记录</span></a>
+      <div class="nlabel">运维集成</div>
+      <a data-page="connections" data-ic="key"><span class="t">连接凭证</span></a>
+      <a data-page="obs" data-ic="chart"><span class="t">可观测(日志)</span></a>
+      <a data-page="ssh" data-ic="terminal"><span class="t">SSH 运维</span></a>
+      <a data-page="k8s" data-ic="boxes"><span class="t">K8s 运维</span></a>
+      <div class="nlabel">数据</div>
+      <a data-page="memory" data-ic="db"><span class="t">记忆系统</span></a>
+      <a data-page="usage" data-ic="bars"><span class="t">Token 用量</span></a>
+      <div class="nlabel">系统</div>
+      <a data-page="account" data-ic="user"><span class="t">账号</span></a>
     </nav>
-    <main id="content"></main>
+    <div class="main">
+      <header>
+        <div class="crumb" id="crumb"></div>
+        <div class="right"><span id="who"></span><button class="btn ghost sm" onclick="doLogout()">退出</button></div>
+      </header>
+      <main id="content"></main>
+    </div>
   </div>
 </div>
 
@@ -170,19 +237,58 @@ async function doLogin(){
   catch(e){ $('#lg-err').textContent=e.message; }
 }
 async function doLogout(){ try{ await api('POST','/api/logout'); }catch(e){} showLogin(); }
-function enterApp(username){ $('#login').style.display='none'; $('#app').style.display='block'; $('#who').textContent='👤 '+username; go('overview'); }
+function enterApp(username){ $('#login').style.display='none'; $('#app').style.display='block'; $('#who').textContent=username; go(location.hash.slice(1)||'overview'); refreshNavBadge(); }
 $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
-const PAGES = { overview, apps, providers, skills, mcp, code: codePage, schedules, memory, runs: runsPage, usage, obs, ssh, k8s, account };
-function go(page){ document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on', a.dataset.page===page)); PAGES[page](); }
-document.querySelectorAll('nav a').forEach(a=> a.onclick=()=>go(a.dataset.page));
+const PAGES = { overview, apps, providers, skills, mcp, code: codePage, schedules, memory, runs: runsPage, usage, obs, ssh, k8s, account,
+  vulns: vulnsPage, intel: intelPage, connections: connectionsPage };
+function go(page){
+  if(!PAGES[page]) page='overview';
+  let group='';
+  document.querySelectorAll('nav > *').forEach(el=>{
+    if(el.classList.contains('nlabel')) group=el.textContent;
+    if(el.tagName==='A'){ const on=el.dataset.page===page; el.classList.toggle('on',on);
+      if(on) $('#crumb').innerHTML=(group?esc(group)+' / ':'')+'<b>'+esc(el.querySelector('.t').textContent)+'</b>'; }
+  });
+  if(location.hash.slice(1)!==page) history.replaceState(null,'','#'+page);
+  PAGES[page]();
+}
+/* 菜单图标（线框，24 视框） */
+const ICONS={
+  home:'<path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
+  bot:'<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9 17h6"/>',
+  cpu:'<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+  book:'<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 19V5M8 7h7"/>',
+  plug:'<path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0zM12 17v5"/>',
+  clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  shield:'<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="M12 8v5M12 16h.01"/>',
+  radar:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><path d="M12 12 18 6"/>',
+  branch:'<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-11 7"/>',
+  activity:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  key:'<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3M14 9l2 2"/>',
+  chart:'<path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-6"/>',
+  terminal:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+  boxes:'<path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/>',
+  db:'<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+  bars:'<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  user:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/>',
+};
+document.querySelectorAll('nav a').forEach(a=>{
+  a.insertAdjacentHTML('afterbegin',`<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[a.dataset.ic]||''}</svg>`);
+  a.onclick=()=>go(a.dataset.page);
+});
+async function refreshNavBadge(){
+  try{ const {total}=await api('GET','/api/vulns?kev=1&status=new&limit=1'); const b=$('#nav-vuln-badge');
+    b.textContent=total; b.style.display=total?'inline-block':'none'; b.title='在野利用(KEV)且未研判'; }catch(e){}
+}
 
 /* ---------- 概览 ---------- */
 async function overview(){
   const c=$('#content'); c.innerHTML='<h2>概览</h2><p class="desc">加载中…</p>';
   const o=await api('GET','/api/overview');
   const chip=(ok,t,y)=>`<span class="chip"><span class="dot ${ok?'g':(y?'y':'r')}"></span>${t}</span>`;
+  const v=o.vulns||{}, is=o.intel_sources||{};
   const appsHtml = o.apps.length ? o.apps.map(a=>{
     const ready = a.feishu_set && a.provider_ready && a.enabled;
     return `<div class="appcard">
@@ -191,13 +297,28 @@ async function overview(){
         ${chip(a.running, a.running?'长连接在线':'长连接离线')}
         ${chip(a.provider_ready, 'AI '+(a.provider?esc(a.provider):'未绑定'), !a.provider_ready)}
         ${chip(a.feishu_set, '飞书凭证 '+(a.feishu_set?'已配':'缺失'), !a.feishu_set)}
-        <span class="chip">工具 ${a.tools_count}</span>
+        <span class="chip">工具 ${a.tools_count}</span><span class="chip">技能 ${a.skills_count}</span>
       </div>
-      ${ready?'':'<div class="hint" style="color:var(--warn)">⚠ 需配齐：飞书凭证 + 绑定可用 AI + 启用，长连接才会上线（改完点「应用」页里的重启服务）。</div>'}
+      ${ready?'':'<div class="hint" style="color:var(--warn)">需配齐：飞书凭证 + 绑定可用 AI + 启用，长连接才会上线（改完到「应用」页点重启服务）。</div>'}
     </div>`;
   }).join('') : '<div class="empty">还没有应用。去「应用」页新建一个数字员工。</div>';
+  const top=(o.top_vulns||[]).map(x=>`<tr style="cursor:pointer" onclick="go('vulns');setTimeout(()=>viewVuln('${esc(x.cve)}'),300)">
+      <td class="mono">${esc(x.cve)}</td><td class="clip"><div>${esc(x.title||'')}</div></td>
+      <td>${sevBadge(x.severity)}</td><td><span class="st ${esc(x.status)}">${esc(VULN_ST[x.status]||x.status)}</span></td></tr>`).join('');
   c.innerHTML=`
-    <div class="head"><div><h2>概览</h2><p class="desc">各数字员工(应用)的运行状态与平台累计用量。</p></div></div>
+    <div class="head"><div><h2>概览</h2><p class="desc">数字员工运行状态、安全态势与平台用量。</p></div></div>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="stat ${v.kev?'alert':''}"><div class="k">在野利用（KEV）</div><div class="v">${fmt(v.kev)}</div><div class="s">台账中被 CISA 确认在野利用的</div></div>
+      <div class="stat warn"><div class="k">待研判</div><div class="v">${fmt(v.triage)}</div><div class="s">新发现 + 研判中</div></div>
+      <div class="stat ${v.affected?'alert':'good'}"><div class="k">确认受影响</div><div class="v">${fmt(v.affected)}</div><div class="s">需要修复</div></div>
+      <div class="stat"><div class="k">近 7 天新增漏洞</div><div class="v">${fmt(v.new_7d)}</div><div class="s">台账共 ${fmt(v.total)} 条</div></div>
+      <div class="stat ${is.errors?'warn':''}"><div class="k">情报源</div><div class="v">${fmt(is.total)}</div><div class="s">${is.errors?is.errors+' 个抓取失败':'全部正常'}</div></div>
+    </div>
+    <div class="card"><div class="card-title">最新在野利用漏洞 <span class="muted">CISA KEV · 点击查看</span>
+        <button class="btn ghost sm" onclick="go('vulns')">打开漏洞台账</button></div>
+      ${top?`<table><thead><tr><th style="width:160px">CVE</th><th>标题</th><th style="width:90px">严重度</th><th style="width:90px">状态</th></tr></thead><tbody>${top}</tbody></table>`
+        :'<div class="empty">台账里还没有 KEV 条目。情报源首次抓取后会出现（「情报源」页可立即抓取）。</div>'}</div>
+    <div class="card-title" style="margin-top:8px">数字员工</div>
     <div class="cards" style="margin-bottom:18px">${appsHtml}</div>
     <div class="grid">
       <div class="stat"><div class="k">应用数</div><div class="v">${fmt(o.counts.apps)}</div></div>
@@ -206,6 +327,167 @@ async function overview(){
       <div class="stat"><div class="k">累计 Token</div><div class="v">${fmt(o.usage_total.total)}</div></div>
       <div class="stat"><div class="k">今日 Token</div><div class="v">${fmt(o.usage_today.total)}</div></div>
     </div>`;
+}
+
+/* ---------- 漏洞台账 ---------- */
+const VULN_ST={new:'新发现',triaging:'研判中',affected:'受影响',not_affected:'不受影响',fixed:'已修复',ignored:'忽略'};
+const sevBadge=s=>{ if(!s) return '<span class="muted">—</span>'; const k=String(s).toLowerCase(); return `<span class="sev ${esc(k)}">${esc(String(s).toUpperCase())}</span>`; };
+const epssBar=e=> e==null?'<span class="muted">—</span>':`<div style="display:flex;align-items:center;gap:6px"><div class="bar" style="width:60px"><i style="width:${Math.max(2,Math.round(e*100))}%"></i></div><span class="mono">${(e*100).toFixed(1)}%</span></div>`;
+let _vf={status:'',kev:false,q:'',sort:'last_seen',days:'',offset:0}; const _VLIMIT=50;
+async function vulnsPage(){
+  const c=$('#content');
+  const opt=(v,list)=>list.map(([k,t])=>`<option value="${k}" ${String(v)===String(k)?'selected':''}>${t}</option>`).join('');
+  c.innerHTML=`<div class="head"><div><h2>漏洞台账</h2><p class="desc">情报采集器自动从 KEV / GitHub Advisory / 厂商公告 / 社区舆情汇总的 CVE（近 30 天）。数字员工可以用 vuln_list / vuln_get 查，用 vuln_update 写研判结论。</p></div>
+      <button class="btn ghost" onclick="go('intel')">情报源</button></div>
+    <div id="vuln-stats" class="grid" style="margin-bottom:16px"></div>
+    <div class="card">
+      <div class="toolbar">
+        <input class="grow" id="vf-q" placeholder="搜 CVE / 标题 / 产品（如 gitlab、argo、postgres）" value="${esc(_vf.q)}" onkeydown="if(event.key==='Enter'){_vf.q=this.value;_vf.offset=0;renderVulns()}">
+        <select onchange="_vf.status=this.value;_vf.offset=0;renderVulns()">${opt(_vf.status,[['','全部状态']].concat(Object.entries(VULN_ST)))}</select>
+        <select onchange="_vf.sort=this.value;_vf.offset=0;renderVulns()">${opt(_vf.sort,[['last_seen','最近出现'],['first_seen','最早发现'],['kev','KEV 收录'],['epss','EPSS 最高'],['social','舆情最热']])}</select>
+        <select onchange="_vf.days=this.value;_vf.offset=0;renderVulns()">${opt(_vf.days,[['','全部时间'],['1','24 小时'],['7','7 天'],['30','30 天']])}</select>
+        <label style="margin:0;display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" ${_vf.kev?'checked':''} onchange="_vf.kev=this.checked;_vf.offset=0;renderVulns()">只看 KEV</label>
+      </div>
+      <div id="vuln-body">加载中…</div>
+    </div>`;
+  renderVulns();
+}
+async function renderVulns(){
+  const p=new URLSearchParams({sort:_vf.sort,limit:_VLIMIT,offset:_vf.offset});
+  if(_vf.status) p.set('status',_vf.status); if(_vf.kev) p.set('kev','1'); if(_vf.q) p.set('q',_vf.q); if(_vf.days) p.set('days',_vf.days);
+  const r=await api('GET','/api/vulns?'+p.toString()); const st=r.stats||{};
+  $('#vuln-stats').innerHTML=`
+    <div class="stat ${st.kev?'alert':''}"><div class="k">在野利用（KEV）</div><div class="v">${fmt(st.kev)}</div></div>
+    <div class="stat warn"><div class="k">待研判</div><div class="v">${fmt(st.triage)}</div></div>
+    <div class="stat ${st.affected?'alert':'good'}"><div class="k">受影响</div><div class="v">${fmt(st.affected)}</div></div>
+    <div class="stat good"><div class="k">已修复</div><div class="v">${fmt((st.by_status||{}).fixed)}</div></div>
+    <div class="stat"><div class="k">台账总数</div><div class="v">${fmt(st.total)}</div><div class="s">近 7 天新增 ${fmt(st.new_7d)}</div></div>`;
+  const b=$('#vuln-body');
+  if(!r.items.length){ b.innerHTML='<div class="empty">没有符合条件的漏洞。台账为空时，去「情报源」页点「立即抓取」。</div>'; return; }
+  b.innerHTML=`<table><thead><tr><th style="width:150px">CVE</th><th>标题 / 产品</th><th style="width:84px">严重度</th><th style="width:120px">EPSS</th>
+      <th class="num" style="width:70px" title="社区舆情提及次数 / 全部来源提及次数">舆情</th><th style="width:92px">状态</th><th style="width:110px">最近出现</th></tr></thead><tbody>
+    ${r.items.map(x=>`<tr style="cursor:pointer" onclick="viewVuln('${esc(x.cve)}')">
+      <td><div class="mono">${esc(x.cve)}</div>${x.kev?'<span class="sev kev">KEV 在野利用</span>':''}</td>
+      <td class="clip"><div>${esc(x.title||'(暂无标题)')}</div><div class="muted" style="font-size:12px">${esc((x.products||[]).slice(0,3).join(' · ')||(x.sources||[]).slice(0,2).join(' · '))}</div></td>
+      <td>${sevBadge(x.severity)}</td><td>${epssBar(x.epss)}</td>
+      <td class="num">${x.social?'<b>'+x.social+'</b>':'<span class="muted">0</span>'} <span class="muted">/ ${x.mentions}</span></td>
+      <td><span class="st ${esc(x.status)}">${esc(VULN_ST[x.status]||x.status)}</span></td>
+      <td class="muted" style="font-size:12px">${dt(x.last_seen)}</td></tr>`).join('')}</tbody></table>
+    <div class="pager">共 ${fmt(r.total)} 条 · 第 ${_vf.offset+1}-${Math.min(_vf.offset+_VLIMIT,r.total)} 条
+      <button class="btn ghost sm" ${_vf.offset?'':'disabled'} onclick="_vf.offset=Math.max(0,_vf.offset-${_VLIMIT});renderVulns()">上一页</button>
+      <button class="btn ghost sm" ${_vf.offset+_VLIMIT<r.total?'':'disabled'} onclick="_vf.offset+=${_VLIMIT};renderVulns()">下一页</button></div>`;
+}
+async function viewVuln(cve){
+  const {vuln:v,intel}=await api('GET','/api/vulns/'+encodeURIComponent(cve));
+  openModal(`<h3 class="mono">${esc(v.cve)} ${v.kev?'<span class="sev kev">KEV 在野利用</span>':''} ${sevBadge(v.severity)}</h3>
+    <p class="desc">${esc(v.title||'')}</p>
+    <dl class="kv">
+      <dt>EPSS</dt><dd>${epssBar(v.epss)} ${v.epss_pct!=null?'<span class="muted">（百分位 '+(v.epss_pct*100).toFixed(0)+'%）</span>':''}</dd>
+      ${v.cvss?`<dt>CVSS</dt><dd>${esc(v.cvss)}</dd>`:''}
+      ${v.kev?`<dt>KEV 收录</dt><dd>${esc(v.kev_added||'')}${v.ransomware&&v.ransomware!=='Unknown'?' · 勒索软件：'+esc(v.ransomware):''}</dd>`:''}
+      <dt>涉及产品</dt><dd>${esc((v.products||[]).join('、')||'—')}</dd>
+      <dt>来源</dt><dd>${esc((v.sources||[]).join('、'))}（提及 ${v.mentions} 次，舆情 ${v.social} 次）</dd>
+      <dt>首次发现</dt><dd>${dt(v.first_seen)} · 最近 ${dt(v.last_seen)}</dd>
+      <dt>参考</dt><dd><a href="https://nvd.nist.gov/vuln/detail/${esc(v.cve)}" target="_blank">NVD</a> · <a href="https://osv.dev/vulnerability/${esc(v.cve)}" target="_blank">OSV</a></dd>
+    </dl>
+    ${v.description?`<pre class="box">${esc(v.description)}</pre>`:''}
+    <label>研判状态</label>
+    <div class="row"><div style="flex:0 0 180px"><select id="vv-st">${Object.entries(VULN_ST).map(([k,t])=>`<option value="${k}" ${v.status===k?'selected':''}>${t}</option>`).join('')}</select></div>
+      <div><input id="vv-note" placeholder="备注：哪个服务、什么版本、依据是什么" value="${esc(v.note||'')}"></div></div>
+    ${(v.assets||[]).length?`<div class="hint">受影响资产：${esc(v.assets.join('、'))}</div>`:''}
+    <label>相关情报（${intel.length}）</label>
+    <div style="max-height:260px;overflow:auto">${intel.map(i=>`<div class="ev"><div class="t">${i.category==='social'?'<span class="tag">舆情</span>':'<span class="tag off">官方</span>'}</div>
+      <div class="b"><b>${esc(i.source||'')}</b> · <a href="${esc(i.url||'#')}" target="_blank">${esc(i.title||'(无标题)')}</a>
+      <div class="muted" style="font-size:12px">${esc(i.published||'')}</div></div></div>`).join('')||'<div class="muted">暂无</div>'}</div>
+    <div class="save-bar"><button class="btn" onclick="saveVuln('${esc(v.cve)}')">保存研判</button><button class="btn ghost" onclick="closeModal()">关闭</button></div>`);
+}
+async function saveVuln(cve){
+  try{ await api('PUT','/api/vulns/'+encodeURIComponent(cve),{status:$('#vv-st').value,note:$('#vv-note').value});
+    closeModal(); toast('已保存'); if($('#vuln-body')) renderVulns(); refreshNavBadge(); }catch(e){ toast(e.message); }
+}
+
+/* ---------- 情报源 ---------- */
+const INTEL_KIND={kev:'CISA KEV',rss:'RSS / Atom',jsonfeed:'JSON Feed',ghsa:'GitHub Advisory',ghsa_repo:'仓库安全公告',mastodon:'Mastodon',hackernews:'Hacker News',x:'X（推特）'};
+let _intelCache=[];
+async function intelPage(){
+  const c=$('#content'); c.innerHTML='<h2>情报源</h2><p class="desc">加载中…</p>';
+  const {sources}=await api('GET','/api/intel-sources'); _intelCache=sources;
+  const rows=list=>list.map(s=>{ const [st,dot]={ok:['正常','g'],error:['失败','r']}[s.last_status]||['未抓取',''];
+    return `<tr><td class="clip"><div><b>${esc(s.name)}</b>${s.enabled?'':' <span class="tag off">已停用</span>'}</div>
+        <div class="muted mono" title="${esc(s.url)}">${esc(INTEL_KIND[s.kind]||s.kind)} · ${esc(s.url)}</div></td>
+      <td><span class="chip"><span class="dot ${dot}"></span>${st}</span>
+        <div class="muted" style="font-size:12px">${s.last_fetch?dt(s.last_fetch)+' · 新增 '+s.last_new:''}</div>
+        ${s.last_error?`<div style="color:var(--err);font-size:12px" title="${esc(s.last_error)}">${esc(s.last_error.slice(0,80))}</div>`:''}</td>
+      <td class="muted">每 ${s.interval_min} 分钟</td>
+      <td style="white-space:nowrap"><button class="btn sm" id="if-${s.id}" onclick="fetchIntel(${s.id})">立即抓取</button>
+        <button class="btn ghost sm" onclick="editIntel(${s.id})">编辑</button>
+        <button class="btn danger" onclick="delIntel(${s.id},'${esc(s.name)}')">删除</button></td></tr>`;}).join('');
+  const table=(title,desc,list)=>`<div class="card"><div class="card-title">${title} <span class="muted">${desc}</span></div>
+    ${list.length?`<table><thead><tr><th>名称 / 地址</th><th style="width:230px">状态</th><th style="width:100px">频率</th><th style="width:230px"></th></tr></thead><tbody>${rows(list)}</tbody></table>`:'<div class="empty">没有</div>'}</div>`;
+  c.innerHTML=`<div class="head"><div><h2>情报源</h2><p class="desc">采集器按频率自动抓取（不经过大模型），抽取 CVE 进漏洞台账；近 30 天的才进台账。舆情源提到的 CVE 计入「舆情热度」。</p></div>
+      <button class="btn" onclick="newIntel()">+ 添加情报源</button></div>
+    <div class="notice">X（推特）读取接口需要付费档位的 Bearer Token，默认关闭；拿到 token 后在下方编辑填入并启用。在此之前用 Mastodon / Reddit / Hacker News 等公开源代替。</div>
+    ${table('官方 / 厂商','漏洞库、厂商安全公告',sources.filter(s=>s.category!=='social'))}
+    ${table('社区舆情','安全圈讨论热度，只加权、不直接触发修复',sources.filter(s=>s.category==='social'))}`;
+}
+function _intelForm(s){
+  const kinds=Object.entries(INTEL_KIND).map(([k,t])=>`<option value="${k}" ${s.kind===k?'selected':''}>${t}</option>`).join('');
+  return `<h3>${s.id?'编辑情报源':'添加情报源'}</h3><p class="desc">RSS/Atom 填订阅地址；仓库安全公告填 owner/repo；Mastodon 填话题时间线 API；X 填 Bearer Token 与检索式。</p>
+    <div class="row"><div><label>名称</label><input id="is-name" value="${esc(s.name||'')}"></div>
+      <div style="flex:0 0 170px"><label>类型</label><select id="is-kind">${kinds}</select></div>
+      <div style="flex:0 0 150px"><label>类别</label><select id="is-cat"><option value="official" ${s.category!=='social'?'selected':''}>官方/厂商</option><option value="social" ${s.category==='social'?'selected':''}>社区舆情</option></select></div></div>
+    <label>地址</label><input id="is-url" class="mono" value="${esc(s.url||'')}">
+    <label>检索式（Hacker News / X 用）</label><input id="is-query" value="${esc(s.query||'')}" placeholder="如：CVE OR 0day">
+    <label>令牌 ${s.token_set?'<span class="muted">（已设置，留空＝不改）</span>':'<span class="muted">（X 必填；GitHub 选填，可提高限额）</span>'}</label><input id="is-token" type="password">
+    <div class="row"><div style="flex:0 0 160px"><label>抓取间隔（分钟）</label><input id="is-int" type="number" min="10" value="${s.interval_min||60}"></div>
+      <div style="flex:0 0 160px"><label>启用</label><select id="is-en"><option value="1" ${s.enabled!==false?'selected':''}>启用</option><option value="0" ${s.enabled===false?'selected':''}>停用</option></select></div></div>
+    <div class="save-bar"><button class="btn" onclick="saveIntel(${s.id||0})">保存</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
+}
+function newIntel(){ openModal(_intelForm({})); }
+function editIntel(id){ openModal(_intelForm(_intelCache.find(s=>s.id===id)||{})); }
+async function saveIntel(id){
+  const body={name:$('#is-name').value.trim(),kind:$('#is-kind').value,category:$('#is-cat').value,url:$('#is-url').value.trim(),
+    query:$('#is-query').value.trim(),interval_min:Number($('#is-int').value)||60,enabled:Number($('#is-en').value)};
+  const t=$('#is-token').value.trim(); if(t) body.token=t;
+  try{ if(id) await api('PUT','/api/intel-sources/'+id,body); else await api('POST','/api/intel-sources',body); closeModal(); toast('已保存'); intelPage(); }catch(e){ toast(e.message); }
+}
+async function fetchIntel(id){
+  const b=$('#if-'+id); if(b){ b.disabled=true; b.textContent='抓取中…'; }
+  try{ const r=await api('POST','/api/intel-sources/'+id+'/fetch'); toast(r.ok?`抓到 ${r.fetched} 条，新增 ${r.new}，进台账 CVE ${r.cves}`:'失败：'+r.error); }catch(e){ toast(e.message); }
+  intelPage(); refreshNavBadge();
+}
+async function delIntel(id,name){ if(!confirm('删除情报源「'+name+'」？它抓到的情报原文一并删除（台账里的漏洞保留）。')) return;
+  await api('DELETE','/api/intel-sources/'+id); toast('已删除'); intelPage(); }
+
+/* ---------- 连接凭证 ---------- */
+async function connectionsPage(){
+  const c=$('#content'); c.innerHTML='<h2>连接凭证</h2><p class="desc">加载中…</p>';
+  const {argocd:a,gitlab:g}=await api('GET','/api/connections');
+  c.innerHTML=`<div class="head"><div><h2>连接凭证</h2><p class="desc">给数字员工「看」的只读连接：勾上 argocd_* / gitlab_* 工具的应用可以查 ArgoCD 应用与实际运行镜像、读 GitLab 仓库。令牌只存在服务端，模型拿不到。</p></div></div>
+    <div class="card"><div class="card-title">ArgoCD <span class="muted">看应用同步/健康状态与集群里实际运行的镜像版本</span></div>
+      <div class="row"><div><label>地址</label><input id="cn-a-url" value="${esc(a.url)}" placeholder="https://argocd.internal.example"></div>
+        <div><label>只读 API token ${a.token_set?'<span class="muted">（已设置 '+esc(a.token_masked)+'，留空＝不改）</span>':''}</label><input id="cn-a-token" type="password" placeholder="argocd account generate-token --account readonly"></div></div>
+      <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-a-ins" ${a.insecure?'checked':''}>跳过 TLS 证书校验（内网自签证书时勾选）</label>
+      <div class="hint">建议在 ArgoCD 里建只读账号：argocd-cm 加 <span class="mono">accounts.readonly: apiKey</span>，argocd-rbac-cm 绑 <span class="mono">role:readonly</span>，再生成 token。</div>
+      <div class="save-bar"><button class="btn" onclick="saveConn('argocd')">保存</button><button class="btn ghost" onclick="testConn('argocd')">测试连接</button><span id="cn-a-res" class="muted"></span></div></div>
+    <div class="card"><div class="card-title">GitLab <span class="muted">搜项目、列目录、读文件（不克隆、不写）</span></div>
+      <div class="row"><div><label>地址</label><input id="cn-g-url" value="${esc(g.url)}" placeholder="https://gitlab.upmore.net"></div>
+        <div><label>访问令牌（scope 只勾 read_api）${g.token_set?' <span class="muted">（已设置 '+esc(g.token_masked)+'，留空＝不改）</span>':''}</label><input id="cn-g-token" type="password" placeholder="glpat-…"></div></div>
+      <div class="hint">要改代码并提 MR，请到「代码仓库」页单独登记仓库与写令牌；技能同步在「技能」页配置技能源。</div>
+      <div class="save-bar"><button class="btn" onclick="saveConn('gitlab')">保存</button><button class="btn ghost" onclick="testConn('gitlab')">测试连接</button><span id="cn-g-res" class="muted"></span></div></div>`;
+}
+async function saveConn(kind){
+  const k=kind==='argocd'?'a':'g'; const body={url:$('#cn-'+k+'-url').value.trim()};
+  const t=$('#cn-'+k+'-token').value.trim(); if(t) body.token=t;
+  if(kind==='argocd') body.insecure=$('#cn-a-ins').checked;
+  try{ await api('PUT','/api/connections',{[kind]:body}); toast('已保存'); connectionsPage(); }catch(e){ toast(e.message); }
+}
+async function testConn(kind){
+  const el=$('#cn-'+(kind==='argocd'?'a':'g')+'-res'); el.textContent='测试中…'; el.style.color='';
+  try{ const r=await api('POST','/api/connections/test',{kind});
+    el.style.color=r.ok?'var(--ok)':'var(--err)';
+    el.textContent=r.ok?(kind==='argocd'?`✓ 连通，ArgoCD ${r.version||''}，${r.apps} 个应用`:`✓ 连通，用户 ${r.user}`):('✗ '+(r.error||'失败')); }
+  catch(e){ el.style.color='var(--err)'; el.textContent='✗ '+e.message; }
 }
 
 /* ---------- 应用 ---------- */

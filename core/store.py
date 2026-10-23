@@ -178,6 +178,33 @@ _conn.executescript("""
         status TEXT DEFAULT 'open',
         created REAL, last_used REAL);
     CREATE INDEX IF NOT EXISTS idx_ws_app ON workspaces(app_id, chat_id, status);
+    CREATE TABLE IF NOT EXISTS intel_sources(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, kind TEXT, category TEXT,
+        url TEXT, token TEXT, query TEXT,
+        enabled INTEGER DEFAULT 1, interval_min INTEGER DEFAULT 60,
+        last_fetch REAL, last_status TEXT, last_error TEXT, last_new INTEGER DEFAULT 0,
+        ts REAL);
+    CREATE TABLE IF NOT EXISTS intel_items(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id INTEGER, uid TEXT,
+        title TEXT, url TEXT, summary TEXT, published TEXT,
+        cves TEXT DEFAULT '[]', extra TEXT DEFAULT '{}',
+        fetched REAL,
+        UNIQUE(source_id, uid));
+    CREATE INDEX IF NOT EXISTS idx_intel_fetched ON intel_items(fetched);
+    CREATE TABLE IF NOT EXISTS vulns(
+        cve TEXT PRIMARY KEY,
+        title TEXT, description TEXT,
+        severity TEXT, cvss REAL,
+        kev INTEGER DEFAULT 0, kev_added TEXT, ransomware TEXT,
+        epss REAL, epss_pct REAL, epss_at REAL,
+        products TEXT DEFAULT '[]', sources TEXT DEFAULT '[]',
+        mentions INTEGER DEFAULT 0, social INTEGER DEFAULT 0,
+        first_seen REAL, last_seen REAL,
+        status TEXT DEFAULT 'new', note TEXT, assets TEXT DEFAULT '[]',
+        updated REAL);
+    CREATE INDEX IF NOT EXISTS idx_vulns_seen ON vulns(last_seen);
 """)
 _conn.commit()
 
@@ -990,6 +1017,156 @@ def update_workspace(ws_id, **f):
     with _lock:
         _conn.execute(f"UPDATE workspaces SET {','.join(sets)} WHERE id=?", vals)
         _conn.commit()
+
+
+# ---------- 安全情报与漏洞台账（sec） ----------
+_INTEL_FIELDS = ("name", "kind", "category", "url", "token", "query", "enabled", "interval_min")
+
+def list_intel_sources():
+    return [dict(r, enabled=bool(r["enabled"])) for r in _conn.execute("SELECT * FROM intel_sources ORDER BY id")]
+
+def get_intel_source(sid):
+    r = _conn.execute("SELECT * FROM intel_sources WHERE id=?", (sid,)).fetchone()
+    return dict(r, enabled=bool(r["enabled"])) if r else None
+
+def create_intel_source(**f):
+    cols = [k for k in _INTEL_FIELDS if k in f and f[k] is not None]
+    with _lock:
+        cur = _conn.execute(f"INSERT INTO intel_sources({','.join(cols + ['ts'])}) VALUES({','.join('?' * (len(cols) + 1))})",
+                            [int(f[k]) if k in ("enabled", "interval_min") else f[k] for k in cols] + [time.time()])
+        _conn.commit()
+        return cur.lastrowid
+
+def update_intel_source(sid, **f):
+    sets, vals = [], []
+    for k in _INTEL_FIELDS:
+        if k not in f or f[k] is None or (k == "token" and not f[k]):
+            continue
+        sets.append(f"{k}=?"); vals.append(int(f[k]) if k in ("enabled", "interval_min") else f[k])
+    if sets:
+        vals.append(sid)
+        with _lock:
+            _conn.execute(f"UPDATE intel_sources SET {','.join(sets)} WHERE id=?", vals)
+            _conn.commit()
+
+def set_intel_source_result(sid, status, error="", new=0):
+    with _lock:
+        _conn.execute("UPDATE intel_sources SET last_fetch=?, last_status=?, last_error=?, last_new=? WHERE id=?",
+                      (time.time(), status, error or "", int(new or 0), sid))
+        _conn.commit()
+
+def delete_intel_source(sid):
+    with _lock:
+        _conn.execute("DELETE FROM intel_items WHERE source_id=?", (sid,))
+        _conn.execute("DELETE FROM intel_sources WHERE id=?", (sid,))
+        _conn.commit()
+
+def add_intel_item(source_id, uid, title, url, summary, published, cves, extra=None):
+    """插入一条情报；同一来源同一 uid 已存在返回 None（去重）。"""
+    with _lock:
+        cur = _conn.execute("INSERT OR IGNORE INTO intel_items(source_id,uid,title,url,summary,published,cves,extra,fetched) "
+                            "VALUES(?,?,?,?,?,?,?,?,?)",
+                            (source_id, uid, title, url, summary, published, json.dumps(cves or []),
+                             json.dumps(extra or {}, ensure_ascii=False), time.time()))
+        _conn.commit()
+        return cur.lastrowid if cur.rowcount else None
+
+def intel_items(cve=None, q=None, source_id=None, days=None, limit=50):
+    where, args = [], []
+    if cve:
+        where.append("i.cves LIKE ?"); args.append(f'%"{cve}"%')
+    if q:
+        where.append("(i.title LIKE ? OR i.summary LIKE ?)"); args += [f"%{q}%", f"%{q}%"]
+    if source_id:
+        where.append("i.source_id=?"); args.append(source_id)
+    if days:
+        where.append("i.fetched>=?"); args.append(time.time() - float(days) * 86400)
+    sql = ("SELECT i.*, s.name AS source, s.category FROM intel_items i LEFT JOIN intel_sources s ON s.id=i.source_id"
+           + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY i.fetched DESC, i.id DESC LIMIT ?")
+    args.append(max(1, min(int(limit or 50), 500)))
+    out = []
+    for r in _conn.execute(sql, args).fetchall():
+        d = dict(r)
+        d["cves"] = json.loads(d.get("cves") or "[]")
+        d["extra"] = json.loads(d.get("extra") or "{}")
+        out.append(d)
+    return out
+
+def _vuln_row(r):
+    d = dict(r)
+    for k in ("products", "sources", "assets"):
+        try:
+            d[k] = json.loads(d.get(k) or "[]")
+        except Exception:
+            d[k] = []
+    d["kev"] = bool(d.get("kev"))
+    return d
+
+def get_vuln(cve):
+    r = _conn.execute("SELECT * FROM vulns WHERE cve=?", (cve,)).fetchone()
+    return _vuln_row(r) if r else None
+
+VULN_STATUSES = ("new", "triaging", "affected", "not_affected", "fixed", "ignored")
+
+def upsert_vuln(cve, **f):
+    """合并更新一条漏洞：列表字段取并集，数值字段只在给了值时覆盖，mentions/social 用 add_* 累加。"""
+    now = time.time()
+    with _lock:
+        r = _conn.execute("SELECT * FROM vulns WHERE cve=?", (cve,)).fetchone()
+        cur = _vuln_row(r) if r else None
+        if cur is None:
+            _conn.execute("INSERT INTO vulns(cve,first_seen,last_seen,updated) VALUES(?,?,?,?)", (cve, now, now, now))
+            cur = {"products": [], "sources": [], "assets": [], "mentions": 0, "social": 0}
+        sets = {"last_seen": now, "updated": now}
+        for k in ("title", "description", "severity", "cvss", "kev_added", "ransomware", "epss", "epss_pct", "epss_at",
+                  "status", "note"):
+            if f.get(k) not in (None, ""):
+                sets[k] = f[k]
+        if f.get("kev"):
+            sets["kev"] = 1
+        for k in ("products", "sources", "assets"):
+            if f.get(k):
+                merged = list(dict.fromkeys(list(cur.get(k) or []) + list(f[k])))
+                sets[k] = json.dumps(merged, ensure_ascii=False)
+        if f.get("add_mentions"):
+            sets["mentions"] = int(cur.get("mentions") or 0) + int(f["add_mentions"])
+        if f.get("add_social"):
+            sets["social"] = int(cur.get("social") or 0) + int(f["add_social"])
+        _conn.execute(f"UPDATE vulns SET {','.join(k + '=?' for k in sets)} WHERE cve=?", list(sets.values()) + [cve])
+        _conn.commit()
+
+def list_vulns(status=None, kev=None, q=None, days=None, sort="last_seen", limit=100, offset=0):
+    where, args = [], []
+    if status:
+        where.append("status=?"); args.append(status)
+    if kev:
+        where.append("kev=1")
+    if q:
+        where.append("(cve LIKE ? OR title LIKE ? OR products LIKE ? OR note LIKE ?)"); args += [f"%{q}%"] * 4
+    if days:
+        where.append("last_seen>=?"); args.append(time.time() - float(days) * 86400)
+    order = {"last_seen": "last_seen DESC", "epss": "COALESCE(epss,0) DESC", "social": "social DESC, mentions DESC",
+             "kev": "kev DESC, kev_added DESC", "first_seen": "first_seen DESC"}.get(sort, "last_seen DESC")
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+    total = _conn.execute("SELECT COUNT(*) n FROM vulns" + sql_where, args).fetchone()["n"]
+    rows = _conn.execute(f"SELECT * FROM vulns{sql_where} ORDER BY {order} LIMIT ? OFFSET ?",
+                         args + [max(1, min(int(limit or 100), 500)), max(0, int(offset or 0))]).fetchall()
+    return {"total": total, "items": [_vuln_row(r) for r in rows]}
+
+def vuln_stats():
+    c = lambda sql, *a: _conn.execute(sql, a).fetchone()["n"]
+    week = time.time() - 7 * 86400
+    return {"total": c("SELECT COUNT(*) n FROM vulns"),
+            "kev": c("SELECT COUNT(*) n FROM vulns WHERE kev=1"),
+            "new_7d": c("SELECT COUNT(*) n FROM vulns WHERE first_seen>=?", week),
+            "affected": c("SELECT COUNT(*) n FROM vulns WHERE status='affected'"),
+            "triage": c("SELECT COUNT(*) n FROM vulns WHERE status IN ('new','triaging')"),
+            "by_status": {r["status"]: r["n"] for r in _conn.execute("SELECT status, COUNT(*) n FROM vulns GROUP BY status")}}
+
+def vulns_needing_epss(limit=100, max_age=86400):
+    rows = _conn.execute("SELECT cve FROM vulns WHERE epss_at IS NULL OR epss_at<? ORDER BY last_seen DESC LIMIT ?",
+                         (time.time() - max_age, limit)).fetchall()
+    return [r["cve"] for r in rows]
 
 
 # ---------- 计数（概览用） ----------

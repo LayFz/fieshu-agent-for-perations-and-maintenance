@@ -19,6 +19,9 @@ from feishu import auth, bot
 from harness import policy
 from harness import skills as skills_sync
 from harness import workspace
+from ops import argocd as ops_argocd
+from ops import gitlab as ops_gitlab
+from sec import collector
 from llm import mcp as mcp_mod
 from llm.tools import all_tools, tool_list_for
 
@@ -132,6 +135,11 @@ def overview(request: Request):
         "counts": store.counts(),
         "usage_total": store.usage_total(),
         "usage_today": store.usage_since(24 * 3600),
+        "vulns": store.vuln_stats(),
+        "top_vulns": [{k: v.get(k) for k in ("cve", "title", "kev", "epss", "social", "status", "severity")}
+                      for v in store.list_vulns(kev=True, sort="kev", limit=5)["items"]],
+        "intel_sources": {"total": len(store.list_intel_sources()),
+                          "errors": sum(1 for s in store.list_intel_sources() if s.get("last_status") == "error")},
     }
 
 
@@ -298,6 +306,144 @@ def remove_skill(sid: int, request: Request):
     _auth(request)
     _manual_skill_or_400(sid)
     store.delete_skill(sid)
+    return {"ok": True}
+
+
+# ---------- 连接凭证（ArgoCD / GitLab 只读，给数字员工看） ----------
+@app.get("/api/connections")
+def connections(request: Request):
+    _auth(request)
+    a, g = ops_argocd.config(), ops_gitlab.config()
+    return {"argocd": {"url": a["url"], "insecure": a["insecure"], "token_set": bool(a["token"]), "token_masked": _mask(a["token"])},
+            "gitlab": {"url": g["url"], "token_set": bool(g["token"]), "token_masked": _mask(g["token"])}}
+
+@app.put("/api/connections")
+async def save_connections(request: Request):
+    _auth(request)
+    b = await _body(request)
+    for kind, keys in (("argocd", ("url", "token", "insecure")), ("gitlab", ("url", "token"))):
+        c = b.get(kind)
+        if not isinstance(c, dict):
+            continue
+        if "url" in c:
+            u = (c.get("url") or "").strip().rstrip("/")
+            if u and not u.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail=f"{kind} 地址需为 http(s):// 开头")
+            store.set_setting(f"{kind}_url", u)
+        if c.get("token"):
+            store.set_setting(f"{kind}_token", c["token"].strip())
+        if c.get("clear_token"):
+            store.set_setting(f"{kind}_token", "")
+        if kind == "argocd" and "insecure" in c:
+            store.set_setting("argocd_insecure", "1" if c["insecure"] else "0")
+    return {"ok": True}
+
+@app.post("/api/connections/test")
+async def test_connection(request: Request):
+    _auth(request)
+    kind = (await _body(request)).get("kind")
+    if kind == "argocd":
+        return ops_argocd.test()
+    if kind == "gitlab":
+        return ops_gitlab.test()
+    raise HTTPException(status_code=400, detail="kind 只能是 argocd / gitlab")
+
+
+# ---------- 情报源与漏洞台账（sec） ----------
+def _intel_view(s):
+    v = {k: s.get(k) for k in ("id", "name", "kind", "category", "url", "query", "enabled", "interval_min",
+                               "last_fetch", "last_status", "last_error", "last_new")}
+    v.update(token_set=bool(s.get("token")), token_masked=_mask(s.get("token")))
+    return v
+
+def _intel_fields(b, creating):
+    f = {}
+    if creating or "name" in b:
+        f["name"] = (b.get("name") or "").strip()
+        if not f["name"]:
+            raise HTTPException(status_code=400, detail="请填名称")
+    if creating or "kind" in b:
+        f["kind"] = b.get("kind")
+        if f["kind"] not in collector.KINDS:
+            raise HTTPException(status_code=400, detail=f"类型只能是：{'、'.join(collector.KINDS)}")
+    if creating or "category" in b:
+        f["category"] = b.get("category") or "official"
+        if f["category"] not in ("official", "social"):
+            raise HTTPException(status_code=400, detail="类别只能是 official / social")
+    for k in ("url", "query"):
+        if k in b:
+            f[k] = (b.get(k) or "").strip()
+    if creating and not f.get("url"):
+        raise HTTPException(status_code=400, detail="请填地址")
+    if b.get("token"):
+        f["token"] = b["token"].strip()
+    if "enabled" in b:
+        f["enabled"] = 1 if b["enabled"] else 0
+    if "interval_min" in b:
+        try:
+            f["interval_min"] = max(10, int(b.get("interval_min") or 60))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="抓取间隔需为分钟数")
+    return f
+
+@app.get("/api/intel-sources")
+def intel_sources(request: Request):
+    _auth(request)
+    return {"sources": [_intel_view(s) for s in store.list_intel_sources()], "kinds": list(collector.KINDS)}
+
+@app.post("/api/intel-sources")
+async def create_intel_source(request: Request):
+    _auth(request)
+    return {"ok": True, "id": store.create_intel_source(**_intel_fields(await _body(request), True))}
+
+@app.put("/api/intel-sources/{sid}")
+async def edit_intel_source(sid: int, request: Request):
+    _auth(request)
+    if not store.get_intel_source(sid):
+        raise HTTPException(status_code=404, detail="情报源不存在")
+    store.update_intel_source(sid, **_intel_fields(await _body(request), False))
+    return {"ok": True}
+
+@app.delete("/api/intel-sources/{sid}")
+def remove_intel_source(sid: int, request: Request):
+    _auth(request)
+    store.delete_intel_source(sid)
+    return {"ok": True}
+
+@app.post("/api/intel-sources/{sid}/fetch")
+def fetch_intel_source(sid: int, request: Request):
+    _auth(request)
+    r = collector.fetch_source(sid)
+    if r.get("ok"):
+        collector.enrich_epss()
+    return r
+
+@app.get("/api/vulns")
+def vulns(request: Request):
+    _auth(request)
+    q = request.query_params
+    r = store.list_vulns(q.get("status") or None, q.get("kev") in ("1", "true"), q.get("q") or None,
+                         q.get("days") or None, q.get("sort") or "last_seen", q.get("limit") or 50, q.get("offset") or 0)
+    r["stats"] = store.vuln_stats()
+    return r
+
+@app.get("/api/vulns/{cve}")
+def vuln_detail(cve: str, request: Request):
+    _auth(request)
+    v = store.get_vuln(cve.upper())
+    if not v:
+        raise HTTPException(status_code=404, detail="台账里没有这个 CVE")
+    return {"vuln": v, "intel": store.intel_items(cve=cve.upper(), limit=50)}
+
+@app.put("/api/vulns/{cve}")
+async def edit_vuln(cve: str, request: Request):
+    _auth(request)
+    b = await _body(request)
+    if not store.get_vuln(cve.upper()):
+        raise HTTPException(status_code=404, detail="台账里没有这个 CVE")
+    if b.get("status") and b["status"] not in store.VULN_STATUSES:
+        raise HTTPException(status_code=400, detail="状态不对")
+    store.upsert_vuln(cve.upper(), status=b.get("status"), note=b.get("note"))
     return {"ok": True}
 
 

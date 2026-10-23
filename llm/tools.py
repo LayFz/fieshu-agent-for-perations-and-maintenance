@@ -11,6 +11,8 @@ from feishu import docs as feishu_docs
 from obs import openobserve, beszel, uptimekuma
 from ops import ssh as ops_ssh
 from ops import k8s as ops_k8s
+from ops import argocd as ops_argocd
+from ops import gitlab as ops_gitlab
 from harness import workspace
 from sec import feeds
 
@@ -339,6 +341,89 @@ TOOLS += [
     }},
 ]
 
+# ---------- ArgoCD / GitLab 只读（ops.argocd / ops.gitlab，连接在后台「连接凭证」页配） ----------
+TOOLS += [
+    {"type": "function", "function": {
+        "name": "argocd_apps",
+        "description": "列 ArgoCD 管理的全部应用：项目、目标集群/命名空间、来源仓库与路径、同步/健康状态，"
+                       "以及集群里【实际运行】的镜像（status.summary.images）。查组件真实版本时优先用它——"
+                       "gitops 仓库里很多是浮动 tag，只看声明拿不到真实版本。",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "可选，应用名关键字过滤"},
+            "project": {"type": "string", "description": "可选，只看某个 ArgoCD project"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "argocd_app",
+        "description": "看单个 ArgoCD 应用详情：镜像、同步/健康、告警条件、最近一次同步结果、资源清单。",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "gitlab_projects",
+        "description": "在 GitLab 上搜项目（返回路径、默认分支、最近活动）。不确定项目叫什么时先调它。",
+        "parameters": {"type": "object", "properties": {"search": {"type": "string", "description": "可选，名称关键字"}}},
+    }},
+    {"type": "function", "function": {
+        "name": "gitlab_tree",
+        "description": "列 GitLab 项目某个目录下的文件（只读，不克隆）。",
+        "parameters": {"type": "object", "properties": {
+            "project": {"type": "string", "description": "项目路径如 group/repo，或项目 id"},
+            "path": {"type": "string", "description": "目录，默认仓库根"},
+            "ref": {"type": "string", "description": "分支/标签/提交，默认默认分支"},
+        }, "required": ["project"]},
+    }},
+    {"type": "function", "function": {
+        "name": "gitlab_read",
+        "description": "读 GitLab 项目里的一个文件（只读，不克隆；最多 200KB）。",
+        "parameters": {"type": "object", "properties": {
+            "project": {"type": "string"}, "path": {"type": "string"},
+            "ref": {"type": "string", "description": "默认 HEAD"},
+        }, "required": ["project", "path"]},
+    }},
+]
+
+# ---------- 漏洞台账与情报（sec，采集器自动维护；台账内容含外部文本 → external） ----------
+TOOLS += [
+    {"type": "function", "function": {
+        "name": "vuln_list",
+        "description": "查漏洞台账（情报采集器自动从 KEV/GHSA/厂商公告/社区舆情汇总的 CVE）："
+                       "每条含标题、严重度、是否在 KEV、EPSS、舆情热度、来源、研判状态。",
+        "parameters": {"type": "object", "properties": {
+            "status": {"type": "string", "enum": ["new", "triaging", "affected", "not_affected", "fixed", "ignored"]},
+            "kev": {"type": "boolean", "description": "只看在 KEV（在野利用）里的"},
+            "q": {"type": "string", "description": "关键字：CVE 编号、产品名（如 gitlab、argo、postgres）"},
+            "days": {"type": "integer", "description": "最近多少天出现过的"},
+            "sort": {"type": "string", "enum": ["last_seen", "epss", "social", "kev", "first_seen"]},
+            "limit": {"type": "integer", "description": "默认 30"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "vuln_get",
+        "description": "看台账里一条漏洞的完整记录，以及提到它的全部情报（官方公告、社区讨论）。",
+        "parameters": {"type": "object", "properties": {"cve": {"type": "string"}}, "required": ["cve"]},
+    }},
+    {"type": "function", "function": {
+        "name": "intel_search",
+        "description": "搜最近抓到的情报原文（公告/帖子标题与摘要），看某个产品或漏洞的最新动态与讨论热度。",
+        "parameters": {"type": "object", "properties": {
+            "q": {"type": "string", "description": "关键字"},
+            "days": {"type": "integer", "description": "最近多少天，默认 30"},
+            "limit": {"type": "integer", "description": "默认 30"},
+        }, "required": ["q"]},
+    }},
+    {"type": "function", "function": {
+        "name": "vuln_update",
+        "description": "研判后更新台账：状态（affected 受影响 / not_affected 不受影响 / fixed 已修复 / ignored 忽略 / triaging 研判中）"
+                       "与备注（写清依据：哪个服务、什么版本、怎么查到的）。会写入共享台账，请确认后再调用。",
+        "parameters": {"type": "object", "properties": {
+            "cve": {"type": "string"},
+            "status": {"type": "string", "enum": ["triaging", "affected", "not_affected", "fixed", "ignored"]},
+            "note": {"type": "string"},
+            "assets": {"type": "array", "items": {"type": "string"}, "description": "可选，受影响的服务/组件，如 argocd@3.4.5"},
+        }, "required": ["cve", "status", "note"]},
+    }},
+]
+
 _BY_NAME = {t["function"]["name"]: t for t in TOOLS}
 
 # 工具元数据：只给宿主（harness 管道）看，绝不发给模型。
@@ -382,6 +467,15 @@ _META = {
     "cve_kev": {"risk": "read", "external": True, "timeout": 60},
     "cve_osv": {"risk": "read", "external": True, "timeout": 60},
     "cve_detail": {"risk": "read", "external": True, "timeout": 60},
+    "argocd_apps": {"risk": "read"},
+    "argocd_app": {"risk": "read"},
+    "gitlab_projects": {"risk": "read"},
+    "gitlab_tree": {"risk": "read"},
+    "gitlab_read": {"risk": "read"},
+    "vuln_list": {"risk": "read", "external": True},
+    "vuln_get": {"risk": "read", "external": True},
+    "intel_search": {"risk": "read", "external": True},
+    "vuln_update": {"risk": "write"},
 }
 def _preview_mr(args, ctx):
     """审批卡片上给人看的改动摘要：要批的是这些改动，不是模型写的标题。"""
@@ -526,6 +620,40 @@ def execute(name, args, ctx=None):
             return feeds.osv_query(args.get("ecosystem"), args.get("package"), args.get("version"))
         if name == "cve_detail":
             return feeds.detail(args.get("id"))
+        if name == "argocd_apps":
+            return ops_argocd.list_apps(args.get("name"), args.get("project"))
+        if name == "argocd_app":
+            return ops_argocd.get_app(args.get("name"))
+        if name == "gitlab_projects":
+            return ops_gitlab.projects(args.get("search"))
+        if name == "gitlab_tree":
+            return ops_gitlab.tree(args.get("project"), args.get("path") or "", args.get("ref"))
+        if name == "gitlab_read":
+            return ops_gitlab.read(args.get("project"), args.get("path"), args.get("ref"))
+        if name == "vuln_list":
+            r = store.list_vulns(args.get("status"), args.get("kev"), args.get("q"), args.get("days"),
+                                 args.get("sort") or "last_seen", min(int(args.get("limit") or 30), 100))
+            keep = ("cve", "title", "severity", "cvss", "kev", "kev_added", "epss", "products", "sources",
+                    "mentions", "social", "status", "note", "assets")
+            return {"total": r["total"], "items": [{k: v.get(k) for k in keep} for v in r["items"]]}
+        if name == "vuln_get":
+            cve = (args.get("cve") or "").strip().upper()
+            v = store.get_vuln(cve)
+            items = store.intel_items(cve=cve, limit=30)
+            return {"vuln": v, "intel": [{k: i.get(k) for k in ("source", "category", "title", "url", "published", "summary")}
+                                         for i in items]} if v or items else {"error": f"台账里没有 {cve}"}
+        if name == "intel_search":
+            items = store.intel_items(q=args.get("q"), days=args.get("days") or 30, limit=min(int(args.get("limit") or 30), 100))
+            return {"count": len(items), "items": [{k: i.get(k) for k in ("source", "category", "title", "url", "published", "cves")}
+                                                   for i in items]}
+        if name == "vuln_update":
+            cve = (args.get("cve") or "").strip().upper()
+            if not store.get_vuln(cve):
+                return {"error": f"台账里没有 {cve}"}
+            if args.get("status") not in store.VULN_STATUSES:
+                return {"error": "状态不对"}
+            store.upsert_vuln(cve, status=args["status"], note=args.get("note"), assets=args.get("assets") or [])
+            return {"ok": True, "cve": cve, "status": args["status"]}
         if name == "list_knowledge_bases":
             return feishu_docs.list_kbs()
         if name == "list_nodes":

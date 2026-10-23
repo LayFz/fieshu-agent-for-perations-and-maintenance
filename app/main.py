@@ -61,6 +61,9 @@ def main():
 
     from harness import runs
     runs.abort_stale()            # 上次进程遗留的 running → aborted
+    from sec import collector
+    if collector.seed_defaults():  # 首次启动写入默认情报源（之后以后台为准）
+        print("★ 已写入默认情报源（后台「安全 → 情报源」可增删改）", flush=True)
 
     from feishu import bot        # 导入即注册审批应答者（发/改审批卡片）
     from harness import approval
