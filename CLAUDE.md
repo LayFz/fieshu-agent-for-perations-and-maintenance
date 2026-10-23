@@ -8,6 +8,8 @@
 
 单容器（Python + SQLite，前端内置），飞书走**长连接只出站**，不开入站端口。
 
+**方向**：整个服务正在改造成一个 harness（长期在线的个人助手：监听、定时、安全地动手、改代码、懂架构）。目标、进度、各期设计见 [`docs/harness-design.md`](docs/harness-design.md)，改 `harness/`、`llm/engine.py` 前先读它，做完一期顺手更新其中的进度表。
+
 ## 架构总览
 
 ```
