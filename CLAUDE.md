@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-本仓库 agent / 开发者的工程说明。修改 `harness/`、`llm/engine.py` 前先读 [设计与历史路线](docs/harness-design.md)，验证步骤见 [本地测试手册](docs/local-harness-testing.md)。
+本仓库 agent / 开发者的工程说明。修改 `harness/`、`llm/engine.py` 前先读 [设计与历史路线](docs/harness-design.md)，验证步骤见 [本地测试手册](docs/local-harness-testing.md)。工作机常驻编码 agent 的设计见 [worker-agent-design](docs/worker-agent-design.md)（未实现）。
 
 ## 当前状态
 
