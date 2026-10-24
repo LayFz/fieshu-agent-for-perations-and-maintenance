@@ -23,6 +23,7 @@ class RegistryTests(unittest.TestCase):
                          "3.13.7-management-alpine")
         self.assertEqual(registry.suggest("16.4", ["16.10", "17.2", "16.9-alpine"])[0], "16.10")
         self.assertIsNone(registry.suggest("latest", ["7.4.11"])[0])
+        self.assertEqual(registry.suggest("3.12-alpine", ["3.13.1-alpine", "3.12.8-alpine"], keep=2)[0], "3.12.8-alpine")
         self.assertIsNone(registry.suggest("7.4.11", ["6.2.1"])[0])
 
     def test_hub_repo(self):
@@ -79,10 +80,90 @@ class PlanTests(unittest.TestCase):
                 mock.patch.object(fixplan.registry, "tags", return_value=["5.7.44"]), \
                 mock.patch.object(fixplan.asset_scan, "own_registries", return_value=["harbor.upmore.net"]):
             out = fixplan.plan(allowed_project=lambda p: False)
-        g.assert_not_called()
+        # 未授权的项目：可以按名称列候选，但不能搜索或读取任何仓库内容
+        self.assertFalse([c for c in g.call_args_list if "/search" in c.args[0] or "/repository" in c.args[0]])
         self.assertEqual(out["third_party"][0]["gitops_refs"], [])
         self.assertIn("需人工定位", out["third_party"][0]["apply"])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from ops import source_repo
+
+
+class SourceRepoTests(unittest.TestCase):
+    OWN = ["harbor.upmore.net"]
+
+    def setUp(self):
+        for k in ("image_repo_map", "image_repo_cache"):
+            store.set_setting(k, "")
+        self.calls = []
+
+    def fake_get(self, path, params=None, raw=False, with_headers=False, project=None):
+        self.calls.append(path)
+        if path == "/projects":
+            return [{"id": 1, "path_with_namespace": "upmore/up-spider"}, {"id": 2, "path_with_namespace": "upmore/spider-web"}], None
+        if path.endswith("/repository/commits/1a2b3c4d"):
+            return ({"id": "1a2b3c4d" + "0" * 32}, None) if "up-spider" in path else (None, {"error": "404"})
+        return None, {"error": "unexpected"}
+
+    def test_resolve_by_commit_and_cache(self):
+        with mock.patch.object(source_repo.gitlab, "_get", side_effect=self.fake_get):
+            r = source_repo.resolve("harbor.upmore.net/up-spider/web:1a2b3c4d", own_registries=self.OWN)
+        self.assertEqual(r["project"], "upmore/up-spider")
+        self.assertIn("包含提交 1a2b3c4d", r["how"])
+        self.assertEqual(json.loads(store.get_setting("image_repo_cache"))["up-spider/web"], "upmore/up-spider")
+        with mock.patch.object(source_repo.gitlab, "_get", side_effect=self.fake_get):
+            denied = source_repo.resolve("harbor.upmore.net/up-spider/web:1a2b3c4d", allowed=lambda p: False,
+                                         own_registries=self.OWN)
+        self.assertIn("授权", denied["error"])
+        self.assertIn("不是自家 Harbor", source_repo.resolve("redis:7", own_registries=self.OWN)["error"])
+        with mock.patch.object(source_repo.gitlab, "_get", return_value=(None, {"error": "GitLab 还没配置"})):
+            r = source_repo.resolve("harbor.upmore.net/crm/web:609f7f79", own_registries=self.OWN)
+        self.assertIn("只读令牌", r["error"])
+
+    def test_dependency_file_filter(self):
+        tree = [{"type": "blob", "path": p} for p in (
+            "Dockerfile", "backend/requirements.txt", "web/package.json", "web/node_modules/x/package.json",
+            "src/app.py", "docs/requirements.txt", "deploy/prod.Dockerfile", "go.mod", ".env", "a/b/c/d/e/go.mod")]
+        with mock.patch.object(source_repo.gitlab, "_get", return_value=(tree, None)):
+            files = source_repo.dependency_files("p", "sha")
+        self.assertEqual(files, ["Dockerfile", "backend/requirements.txt", "web/package.json", "deploy/prod.Dockerfile", "go.mod"])
+
+    def test_redact_and_locate(self):
+        text = ("Pillow==11.3.0\nDjango>=4.1,<4.2\n--index-url https://user:s3cret@pypi.internal/simple\n"
+                "API_KEY=abcdef123\ndjango-redis==5.0\n")
+        files = {"requirements.txt": source_repo.redact(text), "go.mod": "require golang.org/x/net v0.20.0\n",
+                 "Dockerfile": "FROM python:3.12-alpine AS build\nRUN pip install pillow\nFROM scratch\n"}
+        self.assertNotIn("s3cret", files["requirements.txt"])
+        self.assertNotIn("abcdef123", files["requirements.txt"])
+        self.assertEqual([h["line"] for h in source_repo.locate("pillow", files)], [1])
+        self.assertEqual([h["line"] for h in source_repo.locate("Django", files)], [2])          # 不命中 django-redis
+        self.assertEqual(source_repo.locate("golang.org/x/net", files)[0]["path"], "go.mod")
+        self.assertEqual(source_repo.base_images(files), [{"path": "Dockerfile", "line": 1, "image": "python:3.12-alpine"}])
+
+
+class SelfBuiltPlanTests(PlanTests):
+    def test_self_built_plan_points_to_files_and_lines(self):
+        assetstore.replace_scans([
+            {"project": "crm", "repo": "web", "reference": "sha256:a", "image": "harbor.upmore.net/crm/web:1a2b3c4d",
+             "status": "Success", "summary": {"Critical": 2},
+             "vulns": [{"cve": "CVE-1", "package": "pillow", "version": "11.3.0", "fixed": "13.0.0", "severity": "Critical"},
+                       {"cve": "CVE-2", "package": "libssl3", "version": "3.3.5-r0", "fixed": "3.3.7-r0", "severity": "Critical"}]}])
+        files = {"requirements.txt": "Pillow==11.3.0\nDjango==4.2\n", "Dockerfile": "FROM python:3.12-alpine\nCOPY . .\n"}
+        with mock.patch.object(fixplan.source_repo, "resolve",
+                               return_value={"project": "upmore/crm", "commit": "1a2b3c4d" + "0" * 32, "how": "按名称"}), \
+                mock.patch.object(fixplan.source_repo, "dependency_files", return_value=list(files)), \
+                mock.patch.object(fixplan.source_repo, "read_files", return_value=files), \
+                mock.patch.object(fixplan.registry, "tags", return_value=["3.12.8-alpine", "3.13.1-alpine"]), \
+                mock.patch.object(fixplan.gitlab, "_get", return_value=([], None)), \
+                mock.patch.object(fixplan.asset_scan, "own_registries", return_value=["harbor.upmore.net"]):
+            item = fixplan.plan()["self_built"][0]
+        self.assertEqual(item["source"]["project"], "upmore/crm")
+        dep = item["dependency_changes"][0]
+        self.assertEqual((dep["package"], dep["fix_to"], dep["locations"][0]["path"], dep["locations"][0]["line"]),
+                         ("pillow", "13.0.0", "requirements.txt", 1))
+        self.assertEqual(item["base_image"]["system_packages"], ["libssl3 3.3.5-r0 → 3.3.7-r0"])
+        self.assertEqual(item["base_image"]["from_lines"][0]["suggested"], "3.12.8-alpine")

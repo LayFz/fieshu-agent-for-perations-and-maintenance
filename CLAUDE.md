@@ -44,7 +44,7 @@ harness/pipeline.py（准备/冻结 → 策略/guard → 持久审批 → 执行
 | `ops/web.py` / `ops/research.py` | 联网搜索与 SSRF 防护抓取（可选内网出境代理）/ 离线 Docker 研究沙箱 |
 | `harness/webhooks.py` | 外部系统 `POST /hooks/{id}` 触发任务：令牌哈希、去重、限流、模板渲染、污染 |
 | `core/assetstore.py` / `ops/asset_scan.py` / `sec/match.py` | 资产清单（集群运行时镜像、节点组件、ArgoCD 远端引用、GitLab）/ 采集 / 漏洞↔资产匹配与报告数据（P0~P3，OSV 按包版本判定） |
-| `sec/fixplan.py` / `ops/registry.py` | 修复方案（只读）：第三方镜像的 gitops 引用、Docker Hub 同线新 tag、停止维护提示；自研镜像待升级包 |
+| `sec/fixplan.py` / `ops/registry.py` / `ops/source_repo.py` | 修复方案（只读）：第三方镜像的 gitops 引用、Docker Hub 同线新 tag、停止维护提示；自研镜像经提交号定位业务仓库，只读依赖清单（打码后），落到具体文件行与 FROM 行 |
 | `ops/harbor.py` / `ops/image_scan.py` | Harbor 只读：制品扫描概览与漏洞明细；对在用的自家 Harbor 镜像采集扫描结果，并入 vuln_report |
 | `core/boxstore.py` / `harness/box.py` | 工作机操作队列与 runner 登记 / 工具侧入队并等待结果；runner 经 `/runner/v1/*` 长轮询领取 |
 | `worker/desktop/` | 工作机原型镜像：runner（shell/files/有头浏览器/桌面 AT-SPI）、noVNC、主动连 harness 的拉取循环 |
@@ -83,6 +83,7 @@ harness/pipeline.py（准备/冻结 → 策略/guard → 持久审批 → 执行
 - `sandbox_run` 是 local + external：离线容器跑分析脚本，联网资源由控制面先下载；需要 `sandbox:["research"]` 与 `HARNESS_SANDBOX_IMAGE`（镜像须含 python3 等分析工具）。
 - Webhook 任务 trigger=webhook，从第一步即污染；令牌只显示一次，库里存 SHA-256。
 - `box_*` 工具（local + external）在工作机上执行：需要 `box:["<名称>"]` 资源；runner 令牌只存 SHA-256，只能调 `/runner/v1/*`；结果只接受领取它的 runner 回传。工作机上不放公司凭据、不能进内网——这是 box 工具不需审批的前提，部署时必须保证。
+- 业务仓库只读：`ops/source_repo.py` 只读依赖/构建清单（白名单文件名，跳过 node_modules/测试/文档），内容先打码再给模型；读的是镜像 tag 对应的提交；须应用资源 `gitlab_projects` 授权。提 MR 需另行配置写权限并经审批。
 - `index.html` 每次请求现读磁盘，后端只在启动时加载：改了后端要重启服务；`/api/me` 的 `stale` 会让前端提示。
 
 ## 代码工作区与沙箱

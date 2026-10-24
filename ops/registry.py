@@ -62,16 +62,21 @@ def split(tag):
     return tuple(int(x) for x in m.group(1).split(".")), m.group(2)
 
 
-def suggest(current, available):
-    """在同一变体（后缀相同，如 -alpine / -management-alpine）、同一大版本里，找比当前更新的最高版本；
+# 语言运行时的次版本号就是兼容性边界（python 3.12 → 3.13 不是补丁升级）：保持 major.minor 不变
+RUNTIMES = {"python", "golang", "php", "ruby", "openjdk", "eclipse-temurin", "amazoncorretto", "pypy"}
+
+
+def suggest(current, available, keep=1):
+    """在同一变体（后缀相同，如 -alpine / -management-alpine）、版本号前 keep 段相同的范围里，找比当前更新的最高版本；
     优先完整版本号（便于固定、强制拉到新构建）。返回 (建议 tag, 说明)。"""
     cur, suffix = split(current)
     if cur is None:
         return None, "当前 tag 不是版本号（如 latest），无法自动推荐"
+    keep = min(keep, len(cur))
     best = None
     for t in available or []:
         ver, suf = split(t)
-        if ver is None or suf != suffix or ver[0] != cur[0]:
+        if ver is None or suf != suffix or ver[:keep] != cur[:keep]:
             continue
         if len(cur) >= 2 and len(ver) >= 2 and ver[:2] < cur[:2]:
             continue
@@ -79,7 +84,7 @@ def suggest(current, available):
         if ver >= cur and (best is None or key > best[0]):
             best = (key, t)
     if not best:
-        return None, f"没有找到同一大版本（{cur[0]}.x{suffix}）里更新的 tag"
+        return None, f"没有找到同一版本线（{'.'.join(map(str, cur[:keep]))}.x{suffix}）里更新的 tag"
     target = best[1]
     tv, _ = split(target)
     if tv == cur:
