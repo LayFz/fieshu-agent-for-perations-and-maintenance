@@ -183,7 +183,8 @@ class _Client:
 
     def objects(self, path):
         # 调用者只能提供下面的固定只读集合端点，不提供通用 API 透传。
-        if not re.fullmatch(r"/(?:api/v1/(?:namespaces/[a-z0-9.-]+/)?(?:pods|nodes|events)|"
+        if not re.fullmatch(r"/(?:api/v1/(?:namespaces/[a-z0-9.-]+/)?(?:pods|nodes|events|services)|"
+                            r"apis/networking\.k8s\.io/v1/ingresses|"
                             r"apis/argoproj\.io/v1alpha1/namespaces/argocd/applications|"
                             r"apis/postgresql\.cnpg\.io/v1/(?:namespaces/[a-z0-9.-]+/)?"
                             r"(?:clusters|backups|scheduledbackups))", path):

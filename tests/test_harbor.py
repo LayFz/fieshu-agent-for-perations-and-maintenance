@@ -138,6 +138,11 @@ class CollectAndReportTests(unittest.TestCase):
         self.assertEqual(r["coverage"]["scanned"], 1)
         self.assertEqual(len(r["coverage"]["not_scanned"]), 1)
         self.assertEqual(match.image_findings(assets, kev={"CVE-2026-0002"})["items"][0]["priority"], "P0")
+        assetstore.replace("cluster:upmore", [dict(a, exposure="cluster", exposure_note="仅集群内 Service web")
+                                              for a in assetstore.list_assets() if a["source"] == "cluster:upmore"])
+        internal = match.image_findings(assetstore.list_assets(), kev=set())["items"][0]
+        self.assertEqual((internal["priority"], internal["reachability"]), ("P2", "仅集群内部可达"))
+        self.assertIn("降一级", internal["priority_reason"])
         common = {c["package"]: c for c in r["common_fixes"]}
         self.assertEqual((common["openssl"]["fix_to"], common["openssl"]["images"], common["openssl"]["critical"]), (["3.0.15"], 1, 1))
 
@@ -152,6 +157,17 @@ class CollectAndReportTests(unittest.TestCase):
         with mock.patch.object(match, "_detail", return_value=None):
             rep = tools._asset_tool("vuln_report", {"days": 7}, app_id)
         self.assertEqual(rep["image_findings"]["items"][0]["service"], "up-oa")
+        # 情报里的 pip 包若在镜像里出现，不算无关
+        now = time.time()
+        with taskstore.transaction() as conn:
+            conn.execute("INSERT INTO vulns(cve,title,products,sources,first_seen,last_seen,status) VALUES(?,?,?,?,?,?,'new')",
+                         ("CVE-2026-0002", "x/net bug", json.dumps(["go:golang.org/x/net"]), "[]", now, now))
+            conn.execute("INSERT INTO vulns(cve,title,products,sources,first_seen,last_seen,status) VALUES(?,?,?,?,?,?,'new')",
+                         ("CVE-2026-9999", "other", json.dumps(["npm:left-pad"]), "[]", now, now))
+        with mock.patch.object(match, "_detail", return_value=None):
+            rep = tools._asset_tool("vuln_report", {"days": 7}, app_id)
+        self.assertEqual(rep["in_images"]["count"], 1)
+        self.assertEqual(rep["unrelated"]["count"], 1)
         self.assertIn("image_findings", rep["self_built_images"]["note"])
 
 

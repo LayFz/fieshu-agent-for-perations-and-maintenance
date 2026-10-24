@@ -76,6 +76,47 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual([(r["cluster"], r["component"], r["version"]) for r in apps], [("vke-cn-shanghai", "redis", "7.2.4")])
 
 
+class ExposureTests(unittest.TestCase):
+    SVCS = [
+        {"metadata": {"namespace": "crm", "name": "crm-web"}, "spec": {"type": "ClusterIP", "selector": {"app": "web"}}},
+        {"metadata": {"namespace": "crm", "name": "crm-mysql"}, "spec": {"type": "ClusterIP", "selector": {"app": "mysql"}}},
+        {"metadata": {"namespace": "ops", "name": "headlamp"}, "spec": {"type": "ClusterIP", "selector": {"app": "headlamp"}}},
+        {"metadata": {"namespace": "ingress-nginx", "name": "ctrl"}, "spec": {"type": "LoadBalancer", "selector": {"app": "ctrl"}},
+         "status": {"loadBalancer": {"ingress": [{"ip": "192.168.110.75"}]}}},
+    ]
+    INGS = [
+        {"metadata": {"namespace": "crm", "name": "web"}, "spec": {"rules": [
+            {"host": "crm.192.168.110.75.sslip.io", "http": {"paths": [{"backend": {"service": {"name": "crm-web"}}}]}},
+            {"host": "crm.upmore.net", "http": {"paths": [{"backend": {"service": {"name": "crm-web"}}}]}}]}},
+        {"metadata": {"namespace": "ops", "name": "hl"}, "spec": {"rules": [
+            {"host": "headlamp.192.168.110.75.sslip.io", "http": {"paths": [{"backend": {"service": {"name": "headlamp"}}}]}}]}},
+    ]
+
+    def level(self, ns, labels):
+        exp = asset_scan.service_exposure(self.SVCS, self.INGS, asset_scan._INTERNAL_SUFFIXES)
+        return asset_scan.pod_exposure({"metadata": {"namespace": ns, "labels": labels}}, self.SVCS, exp)
+
+    def test_backend_behind_public_frontend_is_indirect_but_datastore_is_not(self):
+        pods = [{"metadata": {"namespace": "crm", "name": n, "labels": {"app": app}},
+                 "spec": {"containers": [{"name": "c", "image": image}]}, "status": {"phase": "Running"}}
+                for n, app, image in (("api-1", "api", "harbor.upmore.net/crm/api:1a2b3c4d"),
+                                      ("mysql-0", "mysql", "mysql:5.7"), ("web-1", "web", "harbor.upmore.net/crm/web:1a2b3c4d"))]
+        rows = {r["workload"].split(" · ")[0]: r for r in asset_scan.pods_to_assets(pods, "upmore", OWN, self.SVCS, self.INGS)}
+        self.assertEqual(rows["Pod/web-1"]["exposure"], "public")     # 公网 Ingress 的后端
+        self.assertEqual(rows["Pod/api-1"]["exposure"], "indirect")   # 无入口，但同命名空间有公网入口
+        self.assertIn("crm.upmore.net", rows["Pod/api-1"]["exposure_note"])
+        self.assertEqual(rows["Pod/mysql-0"]["exposure"], "cluster")  # 数据库不算间接暴露
+
+    def test_public_lan_cluster_none(self):
+        self.assertEqual(self.level("crm", {"app": "web"}), ("public", "公网域名 crm.upmore.net"))
+        self.assertEqual(self.level("crm", {"app": "mysql"})[0], "cluster")             # 数据库只有 ClusterIP
+        self.assertEqual(self.level("ops", {"app": "headlamp"})[0], "lan")              # 只有 sslip.io 内网域名
+        self.assertEqual(self.level("ingress-nginx", {"app": "ctrl"})[0], "lan")        # MetalLB 内网 VIP
+        self.assertEqual(self.level("crm", {"app": "worker"})[0], "none")
+        self.assertFalse(asset_scan.is_public_host("10.0.0.1", asset_scan._INTERNAL_SUFFIXES))
+        self.assertTrue(asset_scan.is_public_host("pay.upmore.com.cn", asset_scan._INTERNAL_SUFFIXES))
+
+
 class StoreAndMatchTests(unittest.TestCase):
     def setUp(self):
         self.assertNotEqual(Path(store.DB_PATH).parent, Path(__file__).resolve().parents[1] / "data")
@@ -191,8 +232,26 @@ class StoreAndMatchTests(unittest.TestCase):
                 mock.patch.object(match, "_osv_package", side_effect=lambda product, ver: osv[ver]):
             item = match.report(days=7)["related"][0]
         self.assertEqual(item["priority"], "P2")                         # 本应 P1，仅 init 容器 → 降一级
-        self.assertIn("init 容器", item["exposure"])
+        self.assertIn("init 容器", item["runtime_note"])
         self.assertIn("降一级", item["priority_reason"])
+
+    def test_unexposed_assets_are_downgraded_public_kept(self):
+        def asset(ns, exposure, note):
+            return {"kind": "image", "component": "argocd", "version": "3.4.5", "image": "quay.io/argoproj/argocd:v3.4.5",
+                    "cluster": "upmore", "namespace": ns, "workload": f"Deployment/{ns} · 容器 c",
+                    "evidence": "pod 运行时镜像（含摘要）", "exposure": exposure, "exposure_note": note}
+        self.add_vuln("CVE-2026-55797", ["go:github.com/argoproj/argo-cd/v3"], "Argo CD command injection", epss=0.02)
+        osv = {"3.4.5": {"CVE-2026-55797": ["3.4.10"]}}
+        sev = {"severity": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"}
+        for exposure, expected in (("public", "P1"), ("lan", "P2"), ("cluster", "P2")):
+            assetstore.replace("cluster:upmore", [asset("argocd", exposure, f"note-{exposure}")])
+            with mock.patch.object(match, "_detail", return_value=sev), \
+                    mock.patch.object(match, "_osv_package", side_effect=lambda product, ver: osv[ver]):
+                item = match.report(days=7)["related"][0]
+            self.assertEqual(item["priority"], expected, exposure)
+            if expected == "P2":
+                self.assertIn("降一级", item["priority_reason"])
+        self.assertEqual(item["reachability"], "仅集群内部可达")
 
     def test_daily_mode_only_counts_newly_seen(self):
         assetstore.replace("gitlab", [{"kind": "component", "component": "gitlab", "version": "19.1.9"}])

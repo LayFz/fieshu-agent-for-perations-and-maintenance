@@ -25,7 +25,18 @@ with store._lock:
     """)
     store._conn.commit()
 
-FIELDS = ("kind", "component", "version", "image", "digest", "cluster", "namespace", "workload", "app", "evidence")
+FIELDS = ("kind", "component", "version", "image", "digest", "cluster", "namespace", "workload", "app", "evidence",
+          "exposure", "exposure_note")
+
+# 暴露面：public 公网域名入口 / lan 仅内网入口（内网域名 Ingress、LoadBalancer、NodePort）/
+# cluster 仅集群内 Service / none 没有 Service 选中 / unknown 无法判断（如只看到 ArgoCD 引用的远端集群）
+for _col in ("exposure", "exposure_note"):
+    try:
+        with store._lock:
+            store._conn.execute(f"ALTER TABLE assets ADD COLUMN {_col} TEXT NOT NULL DEFAULT ''")
+            store._conn.commit()
+    except Exception:
+        pass
 
 
 def _key(row):

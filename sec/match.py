@@ -180,6 +180,29 @@ def _priority(kev, verdicts, cvss, severity, epss, runtime):
 _DOWNGRADE = {"P0": "P1", "P1": "P2"}
 
 
+_REACH_RANK = {"public": 5, "indirect": 4, "lan": 3, "cluster": 2, "none": 1, "unknown": 0, "": 0}
+_REACH_TEXT = {"public": "公网可达", "indirect": "可能经公网入口间接到达", "lan": "仅内网可达",
+               "cluster": "仅集群内部可达", "none": "没有入口",
+               "unknown": "暴露面未知", "": "暴露面未知"}
+
+
+def reachability(assets):
+    """一组资产里暴露面最大的那一级及依据。"""
+    best = max((a.get("exposure") or "" for a in assets), key=lambda x: _REACH_RANK.get(x, 0), default="")
+    notes = []
+    for a in assets:
+        if (a.get("exposure") or "") == best and a.get("exposure_note") and a["exposure_note"] not in notes:
+            notes.append(a["exposure_note"])
+    return best or "unknown", "；".join(notes[:2])
+
+
+def _downgrade_unexposed(prio, reason, reach):
+    """不对公网开放（仅内网 / 仅集群内 / 无入口）：同样的漏洞被利用的前提是先进入内网，降一级。暴露面未知不降。"""
+    if reach in ("lan", "cluster", "none") and prio in _DOWNGRADE:
+        return _DOWNGRADE[prio], reason + f"；{_REACH_TEXT[reach]}，降一级"
+    return prio, reason
+
+
 def _is_init(asset):
     return "init 容器" in (asset.get("workload") or "")
 
@@ -210,6 +233,10 @@ def image_findings(assets, limit=20, kev=None):
         hit_kev = sorted({v["cve"] for v in vulns if v["cve"] in kev})
         crit_fix = sum(1 for v in fixable if v["severity"] == "Critical")
         prio = "P0" if hit_kev else "P1" if crit_fix else "P2" if fixable else "P3"
+        reason = ("含在野利用（KEV）漏洞" if hit_kev else "有可修复的严重漏洞" if crit_fix else
+                  "有可修复的高危漏洞" if fixable else "无可修复的高危/严重")
+        reach, reach_note = reachability(by_image[s["image"]])
+        prio, reason = _downgrade_unexposed(prio, reason, reach)
         pkgs = {}
         for v in sorted(fixable, key=lambda v: (_SEV_ORDER.get(v["severity"], 9), -(v["cvss"] or 0))):
             p = pkgs.setdefault(v["package"], {"package": v["package"], "version": v["version"], "fixed": v["fixed"],
@@ -219,14 +246,17 @@ def image_findings(assets, limit=20, kev=None):
         svc = mine[0]["component"]
         for v in fixable:
             f = fixes.setdefault(v["package"], {"package": v["package"], "fix_to": set(), "images": set(),
-                                                "critical": 0, "high": 0, "kev": set()})
+                                                "public": set(), "critical": 0, "high": 0, "kev": set()})
             f["fix_to"].add(v["fixed"])
             f["images"].add(svc)
+            if reach in ("public", "indirect"):
+                f["public"].add(svc)
             f["critical" if v["severity"] == "Critical" else "high"] += 1
             if v["cve"] in kev:
                 f["kev"].add(v["cve"])
         items.append({
-            "priority": prio, "image": s["image"], "service": mine[0]["component"],
+            "priority": prio, "priority_reason": reason, "reachability": _REACH_TEXT[reach],
+            "reachability_note": reach_note, "image": s["image"], "service": mine[0]["component"],
             "workloads": sorted({f"{a['cluster']}/{a['namespace']}/{a['workload'].split(' · ')[0]}" for a in mine})[:2],
             "counts": {k: v for k, v in (s["summary"] or {}).items() if v},
             "total": s["total"], "fixable_high_critical": len(fixable), "kev_cves": hit_kev,
@@ -241,9 +271,10 @@ def image_findings(assets, limit=20, kev=None):
     # 同一个包在多个镜像里重复出现（多为基础镜像里的 openssl/curl 等）：按「包 → 修复版本 → 涉及镜像数」汇总，
     # 修一次基础镜像就能清掉一批，比逐个镜像列 P1 更可执行
     common = sorted(({"package": f["package"], "fix_to": sorted(f["fix_to"])[:4], "images": len(f["images"]),
+                      "images_public": len(f["public"]), "public_names": sorted(f["public"])[:6],
                       "image_names": sorted(f["images"])[:8], "critical": f["critical"], "high": f["high"],
                       "kev": sorted(f["kev"])} for f in fixes.values()),
-                    key=lambda x: (-len(x["kev"]), -x["critical"], -x["images"], -x["high"]))
+                    key=lambda x: (-len(x["kev"]), -x["images_public"], -x["critical"], -x["images"], -x["high"]))
     return {"coverage": coverage, "fetched_at": _when(fetched), "items": items[:limit], "items_total": len(items),
             "common_fixes": common[:8],
             "by_priority": dict(Counter(x["priority"] for x in items))}
@@ -356,15 +387,18 @@ def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
         runtime = any("运行时" in a["evidence"] or a["kind"] == "component" for a in mine)
         prio, worst, reason = _priority(bool(v.get("kev")), [x["verdict"] for x in checks], cvss, severity, v.get("epss"), runtime)
         shown = affected_assets or mine
-        exposure = None
+        runtime_note = None
         if shown and all(_is_init(a) for a in shown):
             # 只出现在 init 容器里：通常只在启动时运行或为主进程提供程序文件，漏洞功能多半不会被执行
-            exposure = ("受影响版本只出现在 init 容器中（启动时运行，或为主容器提供程序文件）；"
-                        "需确认漏洞所在功能是否会被执行，确认前不按高优先级处理")
+            runtime_note = ("受影响版本只出现在 init 容器中（启动时运行，或为主容器提供程序文件）；"
+                            "需确认漏洞所在功能是否会被执行，确认前不按高优先级处理")
             if prio in _DOWNGRADE:
                 prio, reason = _DOWNGRADE[prio], reason + "；仅 init 容器，降一级"
+        reach, reach_note = reachability(shown)
+        prio, reason = _downgrade_unexposed(prio, reason, reach)
         related.append({
-            "priority": prio, "priority_reason": reason, "exposure": exposure,
+            "priority": prio, "priority_reason": reason, "runtime_note": runtime_note,
+            "reachability": _REACH_TEXT[reach], "reachability_note": reach_note,
             "cve": v["cve"], "title": v.get("title"), "component": comp,
             "summary": (v.get("description") or "")[:300],
             "kev": bool(v.get("kev")), "epss": v.get("epss"),
@@ -373,7 +407,8 @@ def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
             "confidence": ("高：按组件源码包精确匹配" if c["package"] else
                            "中：按产品名关键词匹配，需确认公告针对的子组件/功能（如插件、网关、Runner）在我们这里是否启用"),
             "fixed_versions": sorted(set(fixed))[:8], "version_checks": checks, "overall": worst,
-            "assets": [{k: a[k] for k in ("cluster", "namespace", "workload", "app", "image", "version", "evidence") if a[k]}
+            "assets": [{k: a[k] for k in ("cluster", "namespace", "workload", "app", "image", "version", "exposure_note")
+                        if a.get(k)}
                        for a in (affected_assets or mine)[:6]],
             "assets_affected": len(affected_assets),
             "assets_total": len(mine),
@@ -383,6 +418,20 @@ def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
     order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
     related.sort(key=lambda x: (order[x["priority"]], -(x["epss"] or 0)))
 
+    # 情报里的包（如 pip:Pillow）可能就在我们的镜像里：与 Harbor 扫描到的 CVE / 包名交叉，命中的不算「无关」
+    image_cves, image_pkgs = set(), set()
+    in_use = {a["image"] for a in assets}
+    for s in assetstore.list_scans():
+        if s["image"] in in_use and (s["status"] or "").lower() == "success":
+            for iv in assetstore.image_vulns(s["project"], s["repo"], s["reference"]):
+                image_cves.add(iv["cve"])
+                image_pkgs.add((iv["package"] or "").lower())
+    in_images, truly_unrelated = [], []
+    for v in unrelated:
+        prods = json.loads(v.get("products") or "[]")
+        pkgs = {p.split(":", 1)[1].lower() for p in prods if components.is_package(p)}
+        (in_images if v["cve"] in image_cves or pkgs & image_pkgs else truly_unrelated).append(v)
+    unrelated = truly_unrelated
     vendors = Counter()
     for v in unrelated:
         prods = json.loads(v.get("products") or "[]")
@@ -399,6 +448,9 @@ def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
         "related_by_priority": dict(Counter(x["priority"] for x in related)),
         "unrelated": {"count": len(unrelated), "kev": sum(1 for v in unrelated if v.get("kev")),
                       "top_products": vendors.most_common(8)},
+        "in_images": {"count": len(in_images),
+                      "note": "这些情报涉及的包出现在我们的镜像里，具体影响见 image_findings（按镜像扫描结果，不重复展开）",
+                      "examples": [{"cve": v["cve"], "products": json.loads(v.get("products") or "[]")[:2]} for v in in_images[:6]]},
         "self_built_images": {"count": len(own), "names": own[:20],
                               "note": ("自研镜像与经 Harbor 代理的公共镜像，扫描结果见 image_findings" if images else
                                        "自研镜像的依赖与基础镜像漏洞需要 Harbor 镜像扫描（未配置 Harbor 或尚无扫描结果），本报告未覆盖")},

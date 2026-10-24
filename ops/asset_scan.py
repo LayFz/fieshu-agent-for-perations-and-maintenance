@@ -55,13 +55,100 @@ def _app_of(pod):
     return tracking.split(":", 1)[0] if tracking else labels.get("app.kubernetes.io/instance") or ""
 
 
-def pods_to_assets(items, cluster, own):
+_INTERNAL_SUFFIXES = [".sslip.io", ".nip.io", ".local", ".internal", ".lan", ".svc", ".cluster.local", ".localhost"]
+_RANK = {"public": 5, "indirect": 4, "lan": 3, "cluster": 2, "none": 1, "unknown": 0}
+# 数据库、缓存、消息队列：只被同命名空间的应用访问，不会经前端转发到公网
+DATASTORES = {"postgresql", "mysql", "mariadb", "redis", "valkey", "rabbitmq", "minio", "mongodb", "elasticsearch",
+              "etcd", "kafka", "redpanda", "pgvector", "clickhouse", "memcached", "cloudnative-pg"}
+
+
+def _internal_suffixes():
+    try:
+        value = json.loads(store.get_setting("asset_internal_host_suffixes") or "null")
+        return value if isinstance(value, list) and value else _INTERNAL_SUFFIXES
+    except ValueError:
+        return _INTERNAL_SUFFIXES
+
+
+def is_public_host(host, internal=None):
+    """Ingress 域名是否公网可达：IP 或内网后缀（sslip.io 等指向内网 VIP 的域名）算内网，其余算公网。"""
+    host = (host or "").lower().strip(".")
+    if not host or re.fullmatch(r"[\d.]+|\[?[0-9a-f:]+\]?", host):
+        return False
+    return not any(host.endswith(s) for s in (internal or _internal_suffixes()))
+
+
+def service_exposure(services, ingresses, internal=None):
+    """{(ns, service): (级别, 说明)}：被公网域名 Ingress 引用 → public；内网域名 Ingress / LoadBalancer / NodePort → lan；
+    其余 → cluster（仅集群内）。"""
+    out = {}
+
+    def bump(key, level, note):
+        cur = out.get(key)
+        if not cur or _RANK[level] > _RANK[cur[0]]:
+            out[key] = (level, note)
+        elif cur[0] == level and note not in cur[1]:
+            out[key] = (level, (cur[1] + "、" + note)[:200])
+    for svc in services:
+        md, spec = _d(svc.get("metadata")), _d(svc.get("spec"))
+        key = (md.get("namespace"), md.get("name"))
+        kind = spec.get("type") or "ClusterIP"
+        if kind in ("LoadBalancer", "NodePort"):
+            ip = (_l(_d(_d(svc.get("status")).get("loadBalancer")).get("ingress")) or [{}])[0].get("ip") or ""
+            bump(key, "lan", f"{kind} 服务 {md.get('name')}" + (f"（{ip}）" if ip else ""))
+        else:
+            bump(key, "cluster", f"仅集群内 Service {md.get('name')}")
+    for ing in ingresses:
+        md, spec = _d(ing.get("metadata")), _d(ing.get("spec"))
+        backends = []
+        default = _d(_d(spec.get("defaultBackend")).get("service")).get("name")
+        for rule in _l(spec.get("rules")):
+            rule = _d(rule)
+            for path in _l(_d(rule.get("http")).get("paths")):
+                svc = _d(_d(_d(path).get("backend")).get("service")).get("name")
+                if svc:
+                    backends.append((rule.get("host") or "", svc))
+            if default:
+                backends.append((rule.get("host") or "", default))
+        for host, svc in backends:
+            key = (md.get("namespace"), svc)
+            if is_public_host(host, internal):
+                bump(key, "public", f"公网域名 {host}")
+            else:
+                bump(key, "lan", f"内网域名 {host or '（无域名）'}")
+    return out
+
+
+def pod_exposure(pod, services, svc_exposure):
+    """Pod 被哪些 Service 选中，取其中暴露面最大的；没有 Service 选中 → none。"""
+    md = _d(pod.get("metadata"))
+    ns, labels = md.get("namespace"), _d(md.get("labels"))
+    best = ("none", "没有 Service 指向它（后台任务或内部组件）")
+    for svc in services:
+        smd, sel = _d(svc.get("metadata")), _d(_d(svc.get("spec")).get("selector"))
+        if smd.get("namespace") != ns or not sel or any(labels.get(k) != v for k, v in sel.items()):
+            continue
+        level = svc_exposure.get((ns, smd.get("name")), ("cluster", f"仅集群内 Service {smd.get('name')}"))
+        if _RANK[level[0]] > _RANK[best[0]]:
+            best = level
+    return best
+
+
+def pods_to_assets(items, cluster, own, services=None, ingresses=None):
+    services = services or []
+    svc_exposure = service_exposure(services, ingresses or [])
+    # 有公网入口的命名空间：入口通常落在前端/网关，后端 API 经它转发，ClusterIP 不等于外部到不了
+    public_ns = {}
+    for (ns, _svc), (level, note) in svc_exposure.items():
+        if level == "public":
+            public_ns.setdefault(ns, note)
     rows = []
     for pod in items:
         st = _d(pod.get("status"))
         if st.get("phase") not in ("Running", "Pending"):
             continue
         md, spec = _d(pod.get("metadata")), _d(pod.get("spec"))
+        exposure, exposure_note = pod_exposure(pod, services, svc_exposure)
         digests = {}
         for cs in _l(st.get("containerStatuses")) + _l(st.get("initContainerStatuses")):
             cs = _d(cs)
@@ -74,10 +161,14 @@ def pods_to_assets(items, cluster, own):
                 continue
             comp, version, mine = components.component_of(image, own)
             role = f"init 容器 {c.get('name')}（启动时短暂运行）" if init else f"容器 {c.get('name')}"
+            exp, exp_note = exposure, exposure_note
+            if exp in ("cluster", "none") and md.get("namespace") in public_ns and comp not in DATASTORES:
+                exp, exp_note = "indirect", f"本身无公网入口，但同命名空间有{public_ns[md.get('namespace')]}，可能经前端/网关转发到达"
             rows.append({"kind": "service" if mine else "image", "component": comp, "version": version,
                          "image": image, "digest": digests.get(c.get("name"), ""), "cluster": cluster,
                          "namespace": md.get("namespace") or "", "workload": f"{_workload(pod)} · {role}",
-                         "app": _app_of(pod), "evidence": "pod 运行时镜像（含摘要）"})
+                         "app": _app_of(pod), "evidence": "pod 运行时镜像（含摘要）",
+                         "exposure": exp, "exposure_note": exp_note})
     return rows
 
 
@@ -87,7 +178,8 @@ def nodes_to_assets(items, cluster):
         info = _d(_d(node.get("status")).get("nodeInfo"))
         name = _d(node.get("metadata")).get("name") or ""
         kubelet = info.get("kubeletVersion") or ""
-        base = {"cluster": cluster, "workload": f"Node/{name}", "evidence": "node.status.nodeInfo"}
+        base = {"cluster": cluster, "workload": f"Node/{name}", "evidence": "node.status.nodeInfo",
+                "exposure": "lan", "exposure_note": "集群节点组件（内网）"}
         if kubelet:
             rows.append({**base, "kind": "component", "component": "kubernetes",
                          "version": components.version_of(kubelet.split("+")[0])})
@@ -115,6 +207,19 @@ def _cluster_label(target):
     return m.group(1) if m else target
 
 
+def _override(app, namespace):
+    """远端集群（只看到 ArgoCD 引用）读不到 Service/Ingress：用后台配置 kv asset_exposure_overrides
+    {"应用名或命名空间": "public|lan|cluster"} 补充，否则为 unknown。"""
+    try:
+        overrides = json.loads(store.get_setting("asset_exposure_overrides") or "{}")
+    except ValueError:
+        overrides = {}
+    for key in (app, namespace):
+        if isinstance(overrides, dict) and overrides.get(key) in _RANK:
+            return overrides[key], f"后台配置：{key} → {overrides[key]}"
+    return "unknown", "远端集群，未读取 Service/Ingress，暴露面未知"
+
+
 def applications_to_assets(items, cluster, own):
     """只取部署到「其他集群」的应用镜像：本集群的应用已经由 Pod 运行时事实覆盖。"""
     rows = []
@@ -125,12 +230,14 @@ def applications_to_assets(items, cluster, own):
         if target in ("in-cluster", "https://kubernetes.default.svc", ""):
             continue
         target = _cluster_label(target)
+        exposure, note = _override(md.get("name"), dest.get("namespace"))
         for image in _l(_d(st.get("summary")).get("images")):
             comp, version, mine = components.component_of(image, own)
             rows.append({"kind": "service" if mine else "image", "component": comp, "version": version,
                          "image": image, "cluster": target, "namespace": dest.get("namespace") or "",
                          "workload": "", "app": md.get("name") or "",
-                         "evidence": f"ArgoCD {md.get('name')} status.summary.images（资源引用，未核对运行时摘要）"})
+                         "evidence": f"ArgoCD {md.get('name')} status.summary.images（资源引用，未核对运行时摘要）",
+                         "exposure": exposure, "exposure_note": note})
     return rows
 
 
@@ -142,7 +249,12 @@ def collect_cluster(name):
             client = cluster_scan._Client(creds, directory)
             try:
                 own = own_registries()
-                rows = pods_to_assets(client.objects("/api/v1/pods"), name, own)
+                try:
+                    services = client.objects("/api/v1/services")
+                    ingresses = client.objects("/apis/networking.k8s.io/v1/ingresses")
+                except cluster_scan.ScanError:
+                    services, ingresses = [], []        # 读不到入口信息：暴露面按 none 处理
+                rows = pods_to_assets(client.objects("/api/v1/pods"), name, own, services, ingresses)
                 rows += nodes_to_assets(client.objects("/api/v1/nodes"), name)
                 try:
                     apps = client.objects("/apis/argoproj.io/v1alpha1/namespaces/argocd/applications")
@@ -176,8 +288,11 @@ def collect_gitlab():
         assetstore.mark_error("gitlab", err or "未取到 GitLab 版本（令牌可能无权限）")
         return {"source": "gitlab", "status": "error", "error": str(err or "未取到版本")}
     version = components.version_of(data["version"])
+    host = re.sub(r"^https?://", "", gitlab.config()["url"]).split("/")[0].split(":")[0]
+    exposure = "public" if is_public_host(host) else "lan"
     count = assetstore.replace("gitlab", [{"kind": "component", "component": "gitlab", "version": version,
-                                           "evidence": "GitLab /api/v4/version", "workload": "GitLab"}])
+                                           "evidence": "GitLab /api/v4/version", "workload": "GitLab",
+                                           "exposure": exposure, "exposure_note": f"{'公网' if exposure == 'public' else '内网'}域名 {host}"}])
     return {"source": "gitlab", "status": "ok", "assets": count}
 
 
