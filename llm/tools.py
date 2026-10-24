@@ -549,6 +549,16 @@ TOOLS += [
         }},
     }},
     {"type": "function", "function": {
+        "name": "vuln_fix_plan",
+        "description": "生成修复方案（只读，不改任何东西）：第三方镜像（redis、mysql、rabbitmq…）在 gitops 仓库的引用位置、"
+                       "建议升级到的 tag（同一版本线的最新版本）、能修掉的漏洞、停止维护提示、修改步骤；"
+                       "自研镜像列出需要开发升级的包。用户问「怎么修」「出修复方案」时调用。",
+        "parameters": {"type": "object", "properties": {
+            "q": {"type": "string", "description": "只看某个镜像/组件，如 redis、mysql；不填看全部"},
+            "limit": {"type": "integer", "description": "默认 10"},
+        }},
+    }},
+    {"type": "function", "function": {
         "name": "image_vulns",
         "description": "查某个镜像（自研服务或经 Harbor 代理的公共镜像）的 Harbor 扫描漏洞明细：包、版本、修复版本、严重度、CVSS。"
                        "用于报告里 image_findings 的下钻。",
@@ -632,6 +642,7 @@ _META = {
     "vuln_report": {"risk": "read", "external": True, "timeout": 90},
     "asset_list": {"risk": "read"},
     "image_vulns": {"risk": "read"},
+    "vuln_fix_plan": {"risk": "read", "external": True, "timeout": 120},
     "asset_refresh": {"risk": "read", "timeout": 150},
     "web_fetch": {"risk": "read", "external": True, "timeout": 60},
     # 离线容器里的计算：不触达任何外部系统，按 local；下载内容不可信 → external
@@ -813,6 +824,10 @@ def _asset_tool(name, args, app_id):
         result = asset_scan.refresh()
         result["assets_visible"] = sum(1 for a in assetstore.list_assets(limit=20000) if visible(a))
         return result
+    if name == "vuln_fix_plan":
+        from sec import fixplan
+        return fixplan.plan(visible=visible, allowed_project=lambda p: access.allowed(app, "gitlab_projects", p),
+                            q=args.get("q"), limit=max(1, min(int(args.get("limit") or 10), 30)))
     if name == "image_vulns":
         q = (args.get("q") or "").lower()
         images = {a["image"] for a in assetstore.list_assets(limit=20000) if visible(a)}
@@ -913,7 +928,7 @@ def execute(name, args, ctx=None):
                                  allow_host=lambda h: isinstance(allowed, list) and ops_web.domain_allowed(allowed, h))
         if name.startswith("box_"):
             return _box_tool(name, args)
-        if name in ("vuln_report", "asset_list", "asset_refresh", "image_vulns"):
+        if name in ("vuln_report", "asset_list", "asset_refresh", "image_vulns", "vuln_fix_plan"):
             return _asset_tool(name, args, app_id)
         if name == "sandbox_run":
             allowed = ((store.get_app(app_id) or {}).get("resources") or {}).get("web_domains") or []
