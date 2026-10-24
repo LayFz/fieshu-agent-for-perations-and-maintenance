@@ -1,5 +1,7 @@
 # 云端 harness 控制面 + 工作机常驻编码 agent
 
+> **已被替代（2026-10-24）**：方向收窄为安全修复，见 [security-remediation-design](security-remediation-design.md)。本文保留作历史参考；其中的工作机拉取协议与安全模型仍适用于能力层。
+
 状态：设计稿（2026-10-23），未实现。相关：[harness 设计](harness-design.md)、[服务端改造方案](server-harness-plan.md)、[浏览器实验](browser-spike.md)。
 
 ## 0. 一句话
