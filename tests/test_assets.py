@@ -177,6 +177,35 @@ class StoreAndMatchTests(unittest.TestCase):
         self.assertEqual([a["workload"] for a in by["CVE-2026-55797"]["assets"]], ["Deployment/argocd-3.4.5"])
         self.assertEqual({c["verdict"] for c in by["CVE-2026-113708"]["version_checks"]}, {"unknown"})
 
+    def test_init_container_only_is_downgraded_with_exposure_note(self):
+        assetstore.replace("cluster:upmore", [
+            {"kind": "image", "component": "argocd", "version": "3.4.5", "image": "quay.io/argoproj/argocd:v3.4.5",
+             "cluster": "upmore", "namespace": "argocd", "workload": "Deployment/argocd-redis · init 容器 secret-init（启动时短暂运行）",
+             "evidence": "pod 运行时镜像（含摘要）"},
+            {"kind": "image", "component": "argocd", "version": "3.4.12", "image": "quay.io/argoproj/argocd:v3.4.12",
+             "cluster": "upmore", "namespace": "argocd", "workload": "Deployment/argocd-server · 容器 argocd-server",
+             "evidence": "pod 运行时镜像（含摘要）"}])
+        self.add_vuln("CVE-2026-55797", ["go:github.com/argoproj/argo-cd/v3"], "Argo CD command injection", epss=0.02)
+        osv = {"3.4.5": {"CVE-2026-55797": ["3.4.10"]}, "3.4.12": {}}
+        with mock.patch.object(match, "_detail", return_value={"severity": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"}), \
+                mock.patch.object(match, "_osv_package", side_effect=lambda product, ver: osv[ver]):
+            item = match.report(days=7)["related"][0]
+        self.assertEqual(item["priority"], "P2")                         # 本应 P1，仅 init 容器 → 降一级
+        self.assertIn("init 容器", item["exposure"])
+        self.assertIn("降一级", item["priority_reason"])
+
+    def test_daily_mode_only_counts_newly_seen(self):
+        assetstore.replace("gitlab", [{"kind": "component", "component": "gitlab", "version": "19.1.9"}])
+        self.add_vuln("CVE-2026-7", [], "GitLab Critical Patch Release: 19.2.4", days_ago=0.2)
+        with taskstore.transaction() as conn:                             # 旧漏洞今天又被提到：last_seen 新、first_seen 旧
+            conn.execute("UPDATE vulns SET first_seen=? WHERE cve='CVE-2026-7'", (time.time() - 3 * 86400,))
+        self.add_vuln("CVE-2026-8", [], "GitLab Security Release: 19.2.5", days_ago=0.1)
+        with mock.patch.object(match, "_detail", return_value=None):
+            daily = match.report(days=1, new_only=True)
+            weekly = match.report(days=1)
+        self.assertEqual([x["cve"] for x in daily["related"]], ["CVE-2026-8"])
+        self.assertEqual(sorted(x["cve"] for x in weekly["related"]), ["CVE-2026-7", "CVE-2026-8"])
+
     def test_subproduct_advisory_goes_to_needs_confirmation(self):
         assetstore.replace("gitlab", [{"kind": "component", "component": "gitlab", "version": "19.1.9"}])
         self.add_vuln("CVE-2026-90970", [], "GitLab AI Gateway Critical Patch Release: 19.2.4, 19.3.2, and 19.4.1",

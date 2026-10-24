@@ -543,8 +543,9 @@ TOOLS += [
                        "（优先级 P0~P3、匹配依据、我们在跑的版本与修复版本对照、受影响的集群/命名空间/工作负载）、"
                        "与我们无关的数量统计。写漏洞报告、回答「我们受不受影响」时必须先调用它，不要自己从 vuln_list 猜相关性。",
         "parameters": {"type": "object", "properties": {
-            "days": {"type": "integer", "description": "最近多少天的情报，默认 7"},
+            "days": {"type": "integer", "description": "最近多少天的情报，默认 7；日报用 1"},
             "limit": {"type": "integer", "description": "最多返回多少条相关漏洞，默认 30"},
+            "new_only": {"type": "boolean", "description": "只看窗口内首次出现的漏洞（日报用，避免重复报告旧漏洞）"},
         }},
     }},
     {"type": "function", "function": {
@@ -808,7 +809,7 @@ def _asset_tool(name, args, app_id):
                 "sources": assetstore.sources(), "truncated": len(rows) > limit}
     days = max(1, min(int(args.get("days") or 7), 90))
     limit = max(1, min(int(args.get("limit") or 30), 60))
-    return match.report(days=days, visible=visible, limit=limit)
+    return match.report(days=days, visible=visible, limit=limit, new_only=bool(args.get("new_only")))
 
 
 def _box_tool(name, args):

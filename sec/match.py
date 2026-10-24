@@ -166,18 +166,27 @@ def _severity_rank(cvss, severity):
 
 
 def _priority(kev, verdicts, cvss, severity, epss, runtime):
+    """返回 (优先级, 最差判定, 依据)。"""
     worst = "affected" if "affected" in verdicts else "unknown" if "unknown" in verdicts else "fixed"
     if kev and runtime and worst != "fixed":
-        return "P0", worst
+        return "P0", worst, "在野利用（KEV）+ 线上在跑 + 版本受影响或无法确认"
     if worst == "affected" and (_severity_rank(cvss, severity) or (epss or 0) >= 0.1):
-        return "P1", worst
+        return "P1", worst, "版本确认受影响 + 高危/严重或利用概率≥10%"
     if worst != "fixed":
-        return "P2", worst
-    return "P3", worst
+        return "P2", worst, "版本受影响但危害较低，或版本无法确认"
+    return "P3", worst, "我们的版本不低于修复版本"
 
 
-def report(days=7, visible=None, enrich=True, limit=30):
-    """报告数据：资产清单状态、情报统计、相关条目（带证据）、无关条目统计。visible(asset)->bool 做权限过滤。"""
+_DOWNGRADE = {"P0": "P1", "P1": "P2"}
+
+
+def _is_init(asset):
+    return "init 容器" in (asset.get("workload") or "")
+
+
+def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
+    """报告数据：资产清单状态、情报统计、相关条目（带证据）、无关条目统计。visible(asset)->bool 做权限过滤。
+    new_only=True（日报）：只看窗口内首次出现的漏洞，不重复报告此前已报过的。"""
     assets = [a for a in assetstore.list_assets(limit=20000) if visible is None or visible(a)]
     srcs = assetstore.sources()
     inventory = {"sources": [{"source": s["source"], "status": s["status"], "assets": s["count"], "error": s["error"],
@@ -198,7 +207,8 @@ def report(days=7, visible=None, enrich=True, limit=30):
         if a["kind"] != "service":
             by_comp.setdefault(a["component"], []).append(a)
     since = time.time() - int(days) * 86400
-    rows = store._conn.execute("SELECT * FROM vulns WHERE last_seen>=? ORDER BY last_seen DESC", (since,)).fetchall()
+    column = "first_seen" if new_only else "last_seen"
+    rows = store._conn.execute(f"SELECT * FROM vulns WHERE {column}>=? ORDER BY {column} DESC", (since,)).fetchall()
 
     candidates, unrelated = [], []
     for r in rows:
@@ -279,9 +289,18 @@ def report(days=7, visible=None, enrich=True, limit=30):
         if vector:
             severity = None
         runtime = any("运行时" in a["evidence"] or a["kind"] == "component" for a in mine)
-        prio, worst = _priority(bool(v.get("kev")), [x["verdict"] for x in checks], cvss, severity, v.get("epss"), runtime)
+        prio, worst, reason = _priority(bool(v.get("kev")), [x["verdict"] for x in checks], cvss, severity, v.get("epss"), runtime)
+        shown = affected_assets or mine
+        exposure = None
+        if shown and all(_is_init(a) for a in shown):
+            # 只出现在 init 容器里：通常只在启动时运行或为主进程提供程序文件，漏洞功能多半不会被执行
+            exposure = ("受影响版本只出现在 init 容器中（启动时运行，或为主容器提供程序文件）；"
+                        "需确认漏洞所在功能是否会被执行，确认前不按高优先级处理")
+            if prio in _DOWNGRADE:
+                prio, reason = _DOWNGRADE[prio], reason + "；仅 init 容器，降一级"
         related.append({
-            "priority": prio, "cve": v["cve"], "title": v.get("title"), "component": comp,
+            "priority": prio, "priority_reason": reason, "exposure": exposure,
+            "cve": v["cve"], "title": v.get("title"), "component": comp,
             "summary": (v.get("description") or "")[:300],
             "kev": bool(v.get("kev")), "epss": v.get("epss"),
             "cvss_score": cvss, "cvss_vector": vector, "severity": severity or _label(cvss),
@@ -305,7 +324,8 @@ def report(days=7, visible=None, enrich=True, limit=30):
         vendors[prods[0] if prods else "（无产品信息）"] += 1
     own = sorted({a["component"] for a in assets if a["kind"] == "service"})
     return {
-        "window_days": int(days), "generated_at": _when(time.time()) + "（北京时间）", "inventory": inventory,
+        "window_days": int(days), "mode": "只含窗口内新出现的漏洞（日报）" if new_only else "窗口内出现过的漏洞",
+        "generated_at": _when(time.time()) + "（北京时间）", "inventory": inventory,
         "warnings": warnings,
         "intel": {"in_window": len(rows), "kev_in_window": sum(1 for r in rows if r["kev"])},
         "related": related[:limit], "related_total": len(related),
