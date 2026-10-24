@@ -43,6 +43,8 @@ harness/pipeline.py（准备/冻结 → 策略/guard → 持久审批 → 执行
 | `llm/tools.py` / `mcp.py` | 原生工具及元数据 / 同步远程 HTTP MCP |
 | `ops/web.py` / `ops/research.py` | 联网搜索与 SSRF 防护抓取（可选内网出境代理）/ 离线 Docker 研究沙箱 |
 | `harness/webhooks.py` | 外部系统 `POST /hooks/{id}` 触发任务：令牌哈希、去重、限流、模板渲染、污染 |
+| `core/assetstore.py` / `ops/asset_scan.py` / `sec/match.py` | 资产清单（集群运行时镜像、节点组件、ArgoCD 远端引用、GitLab）/ 采集 / 漏洞↔资产匹配与报告数据（P0~P3，OSV 按包版本判定） |
+| `ops/harbor.py` / `ops/image_scan.py` | Harbor 只读：制品扫描概览与漏洞明细；对在用的自家 Harbor 镜像采集扫描结果，并入 vuln_report |
 | `core/boxstore.py` / `harness/box.py` | 工作机操作队列与 runner 登记 / 工具侧入队并等待结果；runner 经 `/runner/v1/*` 长轮询领取 |
 | `worker/desktop/` | 工作机原型镜像：runner（shell/files/有头浏览器/桌面 AT-SPI）、noVNC、主动连 harness 的拉取循环 |
 | `feishu/` / `obs/` / `ops/` | 飞书入口、文档 / 只读监控 / SSH 与 K8s 连接 |

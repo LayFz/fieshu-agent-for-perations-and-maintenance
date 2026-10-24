@@ -24,6 +24,7 @@ from core import boxstore
 from ops import argocd as ops_argocd
 from ops import gitlab as ops_gitlab
 from ops import web as ops_web
+from ops import harbor as ops_harbor
 from sec import collector
 from llm import mcp as mcp_mod
 from llm.tools import all_tools, tool_list_for
@@ -661,9 +662,11 @@ def remove_skill(sid: int, request: Request):
 @app.get("/api/connections")
 def connections(request: Request):
     _auth(request)
-    a, g = ops_argocd.config(), ops_gitlab.config()
+    a, g, hc = ops_argocd.config(), ops_gitlab.config(), ops_harbor.config()
     return {"argocd": {"url": a["url"], "insecure": a["insecure"], "token_set": bool(a["token"]), "token_masked": _mask(a["token"])},
             "gitlab": {"url": g["url"], "token_set": bool(g["token"]), "token_masked": _mask(g["token"])},
+            "harbor": {"url": hc["url"], "username": hc["username"], "password_set": bool(hc["password"]),
+                       "trigger_scan": hc["trigger_scan"]},
             "web": {"provider": ops_web.config()["provider"], "searxng_url": ops_web.config()["searxng_url"],
                     "brave_key_set": bool(ops_web.config()["brave_key"]), "tavily_key_set": bool(ops_web.config()["tavily_key"]),
                     "proxy": _mask_proxy(store.get_setting("web_proxy") or ""),
@@ -703,6 +706,19 @@ async def save_connections(request: Request):
             store.set_setting(f"{kind}_token", "")
         if kind == "argocd" and "insecure" in c:
             store.set_setting("argocd_insecure", "1" if c["insecure"] else "0")
+    h = b.get("harbor")
+    if isinstance(h, dict):
+        if "url" in h:
+            u = (h.get("url") or "").strip().rstrip("/")
+            if u and not u.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail="Harbor 地址需为 http(s):// 开头")
+            store.set_setting("harbor_url", u)
+        if "username" in h:
+            store.set_setting("harbor_username", (h.get("username") or "").strip())
+        if h.get("password"):
+            store.set_setting("harbor_password", h["password"].strip())
+        if "trigger_scan" in h:
+            store.set_setting("harbor_trigger_scan", "1" if h["trigger_scan"] else "0")
     w = b.get("web")
     if isinstance(w, dict):
         if "provider" in w:
@@ -769,11 +785,13 @@ async def test_connection(request: Request):
         return ops_argocd.test()
     if kind == "gitlab":
         return ops_gitlab.test()
+    if kind == "harbor":
+        return ops_harbor.test()
     if kind == "web":
         r = ops_web.search("Kubernetes security advisory", limit=3)
         return {"ok": not r.get("error"), "provider": r.get("provider"), "error": r.get("error"),
                 "count": r.get("count"), "sample": [x.get("title") for x in r.get("results", [])][:3]}
-    raise HTTPException(status_code=400, detail="kind 只能是 argocd / gitlab / web")
+    raise HTTPException(status_code=400, detail="kind 只能是 argocd / gitlab / harbor / web")
 
 
 # ---------- 情报源与漏洞台账（sec） ----------

@@ -110,7 +110,7 @@ new → triaging → not_affected（附依据）
 |---|---|---|
 | S0 现在 | 用现有工具在飞书里按需出漏洞分析报告，观察质量与缺口 | 一份报告能区分「和我们相关 / 无关」，结论带证据 |
 | S1 资产与匹配 | 资产清单（ArgoCD 镜像、基础设施组件版本）落库并定时刷新；版本区间匹配；分诊打分；日报 | 台账中与资产相关的条目被自动标出，日报不出现无关的全球漏洞 |
-| S2 Harbor | 接入 Harbor 扫描结果作为镜像层面的漏洞来源；与情报交叉 | 每个线上镜像能看到其 CVE 列表与修复版本 |
+| S2 Harbor | 接入 Harbor 扫描结果作为镜像层面的漏洞来源；与情报交叉 | 每个线上镜像能看到其 CVE 列表与修复版本。**代码已完成**（ops/harbor、image_scan、vuln_report.image_findings、image_vulns）；待 Harbor 启用 Trivy 并提供只读 robot 后实测 |
 | S3 修复 | 依赖文件改写器（npm/pnpm、Go、pip/poetry、Maven/Gradle、Dockerfile、chart）、锁文件重新生成、自审、测试、MR | 3 个真实补丁级升级从发现到 MR 无人工改代码，diff 只含依赖变化 |
 | S4 闭环 | CI 回写、复扫、ArgoCD 线上核对、台账状态机、周报 | 一个漏洞从入台账到 fixed 全程留痕，fixed 由程序核对写入 |
 

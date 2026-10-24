@@ -549,6 +549,16 @@ TOOLS += [
         }},
     }},
     {"type": "function", "function": {
+        "name": "image_vulns",
+        "description": "查某个镜像（自研服务或经 Harbor 代理的公共镜像）的 Harbor 扫描漏洞明细：包、版本、修复版本、严重度、CVSS。"
+                       "用于报告里 image_findings 的下钻。",
+        "parameters": {"type": "object", "properties": {
+            "q": {"type": "string", "description": "服务名或镜像关键字，如 upmore-api、up-oa/web"},
+            "severity": {"type": "string", "enum": ["Critical", "High", "Medium", "Low"], "description": "只看某个严重度"},
+            "fixable_only": {"type": "boolean", "description": "只看有修复版本的"},
+        }, "required": ["q"]},
+    }},
+    {"type": "function", "function": {
         "name": "asset_list",
         "description": "查资产清单：线上在跑的镜像与组件版本（集群、命名空间、工作负载、ArgoCD 应用、证据来源）。",
         "parameters": {"type": "object", "properties": {
@@ -621,6 +631,7 @@ _META = {
     "web_search": {"risk": "read", "external": True, "timeout": 40},
     "vuln_report": {"risk": "read", "external": True, "timeout": 90},
     "asset_list": {"risk": "read"},
+    "image_vulns": {"risk": "read"},
     "asset_refresh": {"risk": "read", "timeout": 150},
     "web_fetch": {"risk": "read", "external": True, "timeout": 60},
     # 离线容器里的计算：不触达任何外部系统，按 local；下载内容不可信 → external
@@ -772,6 +783,7 @@ def _code_tool(name, args, ctx):
 _NET_ERROR = re.compile(r"ConnectionError|ConnectTimeout|ReadTimeout|RemoteDisconnected|Connection aborted|Connection refused|"
                         r"Max retries exceeded|Name or service not known|nodename nor servname|连不上|连接失败|执行超时", re.I)
 _INTERNAL = ("server_stats", "service_status", "query_logs", "list_log_streams", "kubectl", "argocd_apps", "argocd_app",
+             "image_vulns",
              "gitlab_project", "gitlab_pipelines", "gitlab_tree", "gitlab_read", "asset_refresh", "ssh_exec")
 
 
@@ -801,6 +813,23 @@ def _asset_tool(name, args, app_id):
         result = asset_scan.refresh()
         result["assets_visible"] = sum(1 for a in assetstore.list_assets(limit=20000) if visible(a))
         return result
+    if name == "image_vulns":
+        q = (args.get("q") or "").lower()
+        images = {a["image"] for a in assetstore.list_assets(limit=20000) if visible(a)}
+        scans = [s for s in assetstore.list_scans() if s["image"] in images and q and (q in s["image"].lower() or q in s["repo"].lower())]
+        if not scans:
+            return {"error": f"没有找到匹配「{args.get('q')}」且已扫描的镜像（Harbor 未配置、镜像不在自家 Harbor，或尚未扫描）"}
+        out = []
+        for s in scans[:5]:
+            vulns = assetstore.image_vulns(s["project"], s["repo"], s["reference"])
+            if args.get("severity"):
+                vulns = [v for v in vulns if v["severity"] == args["severity"]]
+            if args.get("fixable_only"):
+                vulns = [v for v in vulns if v["fixed"]]
+            out.append({"image": s["image"], "status": s["status"], "summary": s["summary"], "total": len(vulns),
+                        "vulns": [{k: v[k] for k in ("cve", "package", "version", "fixed", "severity", "cvss")} for v in vulns[:60]],
+                        "truncated": len(vulns) > 60})
+        return {"images": out}
     if name == "asset_list":
         rows = [a for a in assetstore.list_assets(q=args.get("q"), kind=args.get("kind"), limit=20000) if visible(a)]
         limit = max(1, min(int(args.get("limit") or 100), 300))
@@ -884,7 +913,7 @@ def execute(name, args, ctx=None):
                                  allow_host=lambda h: isinstance(allowed, list) and ops_web.domain_allowed(allowed, h))
         if name.startswith("box_"):
             return _box_tool(name, args)
-        if name in ("vuln_report", "asset_list", "asset_refresh"):
+        if name in ("vuln_report", "asset_list", "asset_refresh", "image_vulns"):
             return _asset_tool(name, args, app_id)
         if name == "sandbox_run":
             allowed = ((store.get_app(app_id) or {}).get("resources") or {}).get("web_domains") or []

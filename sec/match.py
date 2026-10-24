@@ -184,6 +184,53 @@ def _is_init(asset):
     return "init 容器" in (asset.get("workload") or "")
 
 
+_SEV_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+
+
+def image_findings(assets, limit=20, kev=None):
+    """Harbor 扫描结果（只含 assets 里在跑的镜像）：每个镜像的严重度统计、可修复的高危/严重、命中 KEV 的 CVE。"""
+    by_image = {}
+    for a in assets:
+        by_image.setdefault(a["image"], []).append(a)
+    scans = [s for s in assetstore.list_scans() if s["image"] in by_image]
+    kev = kev if kev is not None else {r[0] for r in store._conn.execute("SELECT cve FROM vulns WHERE kev=1")}
+    coverage = {"images": len(scans), "scanned": 0, "not_scanned": [], "errors": []}
+    items = []
+    for s in scans:
+        status = (s["status"] or "").lower()
+        name = f"{s['project']}/{s['repo']}"
+        if status != "success":
+            (coverage["errors"] if status == "error" else coverage["not_scanned"]).append(
+                name + (f"（{s['error']}）" if s["error"] else f"（{s['status']}）"))
+            continue
+        coverage["scanned"] += 1
+        vulns = assetstore.image_vulns(s["project"], s["repo"], s["reference"])
+        fixable = [v for v in vulns if v["fixed"] and v["severity"] in ("Critical", "High")]
+        hit_kev = sorted({v["cve"] for v in vulns if v["cve"] in kev})
+        crit_fix = sum(1 for v in fixable if v["severity"] == "Critical")
+        prio = "P0" if hit_kev else "P1" if crit_fix else "P2" if fixable else "P3"
+        pkgs = {}
+        for v in sorted(fixable, key=lambda v: (_SEV_ORDER.get(v["severity"], 9), -(v["cvss"] or 0))):
+            p = pkgs.setdefault(v["package"], {"package": v["package"], "version": v["version"], "fixed": v["fixed"],
+                                                "severity": v["severity"], "cves": []})
+            p["cves"].append(v["cve"])
+        mine = by_image[s["image"]]
+        items.append({
+            "priority": prio, "image": s["image"], "service": mine[0]["component"],
+            "workloads": sorted({f"{a['cluster']}/{a['namespace']}/{a['workload'].split(' · ')[0]}" for a in mine})[:4],
+            "counts": {k: v for k, v in (s["summary"] or {}).items() if v},
+            "total": s["total"], "fixable_high_critical": len(fixable), "kev_cves": hit_kev,
+            "fix_packages": list(pkgs.values())[:6],
+            "advice": ("先升级上面列出的包或基础镜像到修复版本，重新构建；" if fixable else "无可修复的高危/严重；")
+                      + ("其中有在野利用漏洞，优先处理。" if hit_kev else ""),
+        })
+    order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+    items.sort(key=lambda x: (order[x["priority"]], -x["fixable_high_critical"]))
+    fetched = max([s["fetched"] for s in scans] or [0])
+    return {"coverage": coverage, "fetched_at": _when(fetched), "items": items[:limit],
+            "by_priority": dict(Counter(x["priority"] for x in items))}
+
+
 def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
     """报告数据：资产清单状态、情报统计、相关条目（带证据）、无关条目统计。visible(asset)->bool 做权限过滤。
     new_only=True（日报）：只看窗口内首次出现的漏洞，不重复报告此前已报过的。"""
@@ -323,6 +370,7 @@ def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
         prods = json.loads(v.get("products") or "[]")
         vendors[prods[0] if prods else "（无产品信息）"] += 1
     own = sorted({a["component"] for a in assets if a["kind"] == "service"})
+    images = image_findings(assets, limit=limit) if assetstore.list_scans() else None
     return {
         "window_days": int(days), "mode": "只含窗口内新出现的漏洞（日报）" if new_only else "窗口内出现过的漏洞",
         "generated_at": _when(time.time()) + "（北京时间）", "inventory": inventory,
@@ -334,6 +382,8 @@ def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
         "unrelated": {"count": len(unrelated), "kev": sum(1 for v in unrelated if v.get("kev")),
                       "top_products": vendors.most_common(8)},
         "self_built_images": {"count": len(own), "names": own[:20],
-                              "note": "自研镜像的依赖与基础镜像漏洞需要 Harbor 镜像扫描（S2，尚未接入），本报告未覆盖"},
+                              "note": ("自研镜像与经 Harbor 代理的公共镜像，扫描结果见 image_findings" if images else
+                                       "自研镜像的依赖与基础镜像漏洞需要 Harbor 镜像扫描（未配置 Harbor 或尚无扫描结果），本报告未覆盖")},
+        "image_findings": images,
         "method": "确定性匹配：带包名的情报按组件源码包精确匹配，其余按组件关键词；版本按 OSV 修复版本推断（无引入版本信息）。",
     }

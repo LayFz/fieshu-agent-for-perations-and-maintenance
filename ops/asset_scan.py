@@ -201,6 +201,12 @@ def refresh():
         if g:
             results.append(g)
         results.append(collect_extra())
+        from . import image_scan
+        scan = image_scan.collect()
+        if scan.get("status") != "skipped":
+            results.append({"source": "harbor-scan", "status": "ok" if scan.get("status") == "ok" else "error",
+                            "assets": scan.get("scanned"), "error": scan.get("error") or
+                            (f"{scan.get('errors')} 个镜像读取失败" if scan.get("errors") else None)})
         now = time.time()
         store.set_setting("asset_attempted_at", str(now))
         if all(r.get("status") == "ok" for r in results):

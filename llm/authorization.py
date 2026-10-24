@@ -97,7 +97,7 @@ def prepare(name, args, ctx):
         allowed = (app.get("resources") or {}).get("web_domains") or []
         if not (isinstance(allowed, list) and web.domain_allowed(allowed, host)):
             raise PermissionError(f"应用未获授权访问网站 {host}，请在应用资源权限 web_domains 中配置")
-    elif name in ("vuln_report", "asset_list", "asset_refresh"):
+    elif name in ("vuln_report", "asset_list", "asset_refresh", "image_vulns"):
         # 资产清单来自集群：至少要有一个集群授权；具体条目在执行时按集群/命名空间过滤
         if not (app.get("resources") or {}).get("k8s_clusters"):
             raise PermissionError("资产清单与漏洞报告需要应用至少被授权一个集群（资源权限 k8s_clusters）")

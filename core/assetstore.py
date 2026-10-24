@@ -101,3 +101,58 @@ def extra_assets():
         return value if isinstance(value, list) else []
     except ValueError:
         return []
+
+
+# ---------- 镜像扫描结果（Harbor） ----------
+with store._lock:
+    store._conn.executescript("""
+    CREATE TABLE IF NOT EXISTS image_scans(
+        project TEXT NOT NULL, repo TEXT NOT NULL, reference TEXT NOT NULL, image TEXT NOT NULL,
+        status TEXT NOT NULL, scanner TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '{}',
+        total INTEGER, fixable INTEGER, error TEXT NOT NULL DEFAULT '', fetched REAL NOT NULL,
+        PRIMARY KEY(project, repo, reference));
+    CREATE TABLE IF NOT EXISTS image_vulns(
+        project TEXT NOT NULL, repo TEXT NOT NULL, reference TEXT NOT NULL, cve TEXT NOT NULL,
+        package TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '', fixed TEXT NOT NULL DEFAULT '',
+        severity TEXT NOT NULL DEFAULT '', cvss REAL, vector TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '');
+    CREATE INDEX IF NOT EXISTS idx_image_vulns_ref ON image_vulns(project, repo, reference);
+    CREATE INDEX IF NOT EXISTS idx_image_vulns_cve ON image_vulns(cve);
+    """)
+    store._conn.commit()
+
+
+def replace_scans(scans):
+    """整体替换镜像扫描结果：scans = [{project, repo, reference, image, status, scanner, summary, total, fixable,
+    error, vulns:[...]}]。只保留本次仍在跑的镜像。"""
+    now = time.time()
+    with transaction() as conn:
+        conn.execute("DELETE FROM image_scans")
+        conn.execute("DELETE FROM image_vulns")
+        for s in scans:
+            key = (s["project"], s["repo"], s["reference"])
+            conn.execute("INSERT OR REPLACE INTO image_scans(project,repo,reference,image,status,scanner,summary,total,"
+                         "fixable,error,fetched) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         key + (s.get("image") or "", s.get("status") or "", s.get("scanner") or "",
+                                json.dumps(s.get("summary") or {}), s.get("total"), s.get("fixable"),
+                                str(s.get("error") or "")[:300], now))
+            for v in s.get("vulns") or []:
+                conn.execute("INSERT INTO image_vulns(project,repo,reference,cve,package,version,fixed,severity,cvss,vector,title)"
+                             " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                             key + (v.get("cve") or "", v.get("package") or "", v.get("version") or "", v.get("fixed") or "",
+                                    v.get("severity") or "", v.get("cvss"), v.get("vector") or "", v.get("title") or ""))
+
+
+def list_scans():
+    rows = [dict(r) for r in store._conn.execute("SELECT * FROM image_scans ORDER BY project, repo")]
+    for r in rows:
+        r["summary"] = json.loads(r["summary"] or "{}")
+    return rows
+
+
+def image_vulns(project=None, repo=None, reference=None):
+    sql, args = "SELECT * FROM image_vulns WHERE 1=1", []
+    for col, val in (("project", project), ("repo", repo), ("reference", reference)):
+        if val:
+            sql += f" AND {col}=?"
+            args.append(val)
+    return [dict(r) for r in store._conn.execute(sql + " ORDER BY cvss DESC", args)]
