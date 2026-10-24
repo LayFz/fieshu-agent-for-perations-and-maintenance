@@ -67,16 +67,17 @@ def pods_to_assets(items, cluster, own):
             cs = _d(cs)
             image_id = cs.get("imageID") or ""
             digests[cs.get("name")] = image_id.rsplit("@", 1)[-1] if "@" in image_id else ""
-        for c in _l(spec.get("containers")) + _l(spec.get("initContainers")):
+        for init, c in [(False, x) for x in _l(spec.get("containers"))] + [(True, x) for x in _l(spec.get("initContainers"))]:
             c = _d(c)
             image = c.get("image") or ""
             if not image:
                 continue
             comp, version, mine = components.component_of(image, own)
+            role = f"init 容器 {c.get('name')}（启动时短暂运行）" if init else f"容器 {c.get('name')}"
             rows.append({"kind": "service" if mine else "image", "component": comp, "version": version,
                          "image": image, "digest": digests.get(c.get("name"), ""), "cluster": cluster,
-                         "namespace": md.get("namespace") or "", "workload": _workload(pod), "app": _app_of(pod),
-                         "evidence": "pod.status.containerStatuses（运行时）"})
+                         "namespace": md.get("namespace") or "", "workload": f"{_workload(pod)} · {role}",
+                         "app": _app_of(pod), "evidence": "pod 运行时镜像（含摘要）"})
     return rows
 
 
@@ -102,6 +103,18 @@ def nodes_to_assets(items, cluster):
     return rows
 
 
+def _cluster_label(target):
+    """ArgoCD 目标集群：优先后台配置的友好名（kv asset_cluster_names：{server 或名称: 显示名}），否则用 API 主机名。"""
+    try:
+        names = json.loads(store.get_setting("asset_cluster_names") or "{}")
+    except ValueError:
+        names = {}
+    if isinstance(names, dict) and names.get(target):
+        return str(names[target])
+    m = re.match(r"https?://([^/:]+)", target)
+    return m.group(1) if m else target
+
+
 def applications_to_assets(items, cluster, own):
     """只取部署到「其他集群」的应用镜像：本集群的应用已经由 Pod 运行时事实覆盖。"""
     rows = []
@@ -111,6 +124,7 @@ def applications_to_assets(items, cluster, own):
         target = dest.get("name") or dest.get("server") or ""
         if target in ("in-cluster", "https://kubernetes.default.svc", ""):
             continue
+        target = _cluster_label(target)
         for image in _l(_d(st.get("summary")).get("images")):
             comp, version, mine = components.component_of(image, own)
             rows.append({"kind": "service" if mine else "image", "component": comp, "version": version,

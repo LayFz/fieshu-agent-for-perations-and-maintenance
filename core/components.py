@@ -97,9 +97,18 @@ def version_of(tag):
     return m.group(1) if m else ""
 
 
-def component_of(ref, own_registries=()):
-    """返回 (组件, 版本, 是否自研)。自研镜像（自家 Harbor 项目）组件名用镜像名，依赖漏洞要靠镜像扫描。"""
+PROXY_PROJECTS = ("dockerhub", "docker.io", "ghcr", "quay", "gcr", "k8s", "registry.k8s.io", "proxy", "mirror",
+                  "cache", "infra")
+
+
+def component_of(ref, own_registries=(), proxy_projects=PROXY_PROJECTS):
+    """返回 (组件, 版本, 是否自研)。自研镜像（自家 Harbor 项目）组件名用镜像名，依赖漏洞要靠镜像扫描。
+    自家 Harbor 的代理缓存/镜像项目（如 harbor/dockerhub/library/mysql）按它代理的公共镜像处理。"""
     registry, path, tag, _ = parse_image(ref)
+    if registry and any(registry == r or registry.endswith("." + r) for r in own_registries):
+        project, _, rest = path.partition("/")
+        if project.lower() in proxy_projects and rest:
+            registry, path = "", rest[len("library/"):] if rest.startswith("library/") else rest
     low = path.lower()
     for pattern, name in _IMAGE_RULES:
         if re.search(pattern, low):

@@ -55,6 +55,38 @@ def _detail(cve):
     return None
 
 
+_ECOSYSTEMS = {"go": "Go", "npm": "npm", "pip": "PyPI", "pypi": "PyPI", "maven": "Maven", "rust": "crates.io",
+               "crates.io": "crates.io", "composer": "Packagist", "rubygems": "RubyGems", "gem": "RubyGems",
+               "nuget": "NuGet", "hex": "Hex", "pub": "Pub", "swift": "SwiftURL"}
+
+
+def _osv_package(product, version):
+    """OSV「这个包的这个版本受哪些漏洞影响」（含引入/修复区间，缓存半天）→ {CVE: [修复版本]}；查询失败返回 None。"""
+    eco, _, pkg = product.partition(":")
+    eco = _ECOSYSTEMS.get(eco.lower())
+    if not (eco and pkg and version):
+        return None
+    key = f"osvq:{eco}:{pkg}:{version}"
+    try:
+        cached = json.loads(store.get_setting(key) or "null")
+        if cached and time.time() - cached.get("_at", 0) < _CACHE_TTL / 2:
+            return cached["hits"]
+    except ValueError:
+        pass
+    try:
+        r = feeds.osv_query(eco, pkg, version)
+    except Exception:
+        return None
+    if not isinstance(r, dict) or r.get("error"):
+        return None
+    hits = {}
+    for v in r.get("vulns") or []:
+        for cve in v.get("cves") or []:
+            hits.setdefault(cve, sorted(set(hits.get(cve, []) + list(v.get("fixed_in") or []))))
+    store.set_setting(key, json.dumps({"_at": time.time(), "hits": hits}))
+    return hits
+
+
 def verdict(ours, fixed):
     """我们的版本对照修复版本列表 → (affected / fixed / unknown, 说明)。"""
     o = components.parse_version(ours)
@@ -215,9 +247,32 @@ def report(days=7, visible=None, enrich=True, limit=30):
                                   "why": f"公告针对「{comp} {sub}」，资产清单里没有发现该子产品；如未部署可判为不受影响",
                                   "sources": json.loads(v.get("sources") or "[]")[:3]})
             continue
-        versions = sorted({a["version"] for a in mine if a["version"]}) or [""]
-        checks = [{"version": ver or "（未知）", "verdict": verdict(ver, fixed)[0], "why": verdict(ver, fixed)[1]}
-                  for ver in versions]
+        versions = sorted({a["version"] for a in mine if a["version"]},
+                          key=lambda x: components.parse_version(x) or ()) or [""]
+        hits_by = {ver: (_osv_package(c["package"], ver) if c["package"] and ver else None) for ver in versions}
+        known = any(h and v["cve"] in h for h in hits_by.values())       # OSV 收录了该漏洞对这个包的影响区间
+        for h in hits_by.values():
+            if h and v["cve"] in h:
+                fixed = sorted(set(fixed + [f for f in h[v["cve"]] if _REAL_VERSION.fullmatch(str(f))]))
+        checks = []
+        for ver in versions:
+            hits = hits_by.get(ver)
+            if hits is not None and v["cve"] in hits:
+                fix = [f for f in hits[v["cve"]] if _REAL_VERSION.fullmatch(str(f))]
+                same = verdict(ver, fix)[1] if fix else "OSV 未给出修复版本"
+                checks.append({"version": ver, "verdict": "affected", "why": f"OSV 确认该版本受影响；{same}"})
+            elif hits is not None and known:
+                checks.append({"version": ver, "verdict": "fixed",
+                               "why": "OSV 按包版本查询：该版本不在受影响区间" + (f"（修复版本 {', '.join(fixed[:4])}）" if fixed else "")})
+            elif hits is not None and fixed:
+                checks.append({"version": ver, "verdict": verdict(ver, fixed)[0] if verdict(ver, fixed)[0] != "affected" else "unknown",
+                               "why": "OSV 按包版本查询未命中该漏洞；" + verdict(ver, fixed)[1]})
+            elif hits is not None:
+                checks.append({"version": ver, "verdict": "unknown",
+                               "why": "OSV 尚未收录该漏洞对这个包的影响范围（新漏洞常见），需看原始公告"})
+            else:
+                checks.append({"version": ver or "（未知）", "verdict": verdict(ver, fixed)[0], "why": verdict(ver, fixed)[1]})
+        affected_assets = [a for a in mine if any(ch["verdict"] == "affected" and ch["version"] == a["version"] for ch in checks)]
         severity = v.get("severity") or (d or {}).get("severity")
         vector = severity if isinstance(severity, str) and severity.startswith("CVSS:") else None
         cvss = v.get("cvss") if isinstance(v.get("cvss"), (int, float)) else cvss3_score(vector)
@@ -235,7 +290,8 @@ def report(days=7, visible=None, enrich=True, limit=30):
                            "中：按产品名关键词匹配，需确认公告针对的子组件/功能（如插件、网关、Runner）在我们这里是否启用"),
             "fixed_versions": sorted(set(fixed))[:8], "version_checks": checks, "overall": worst,
             "assets": [{k: a[k] for k in ("cluster", "namespace", "workload", "app", "image", "version", "evidence") if a[k]}
-                       for a in mine[:6]],
+                       for a in (affected_assets or mine)[:6]],
+            "assets_affected": len(affected_assets),
             "assets_total": len(mine),
             "sources": json.loads(v.get("sources") or "[]")[:4],
             "ledger_status": v.get("status"),

@@ -56,7 +56,12 @@ class CollectorTests(unittest.TestCase):
             pod("old", "done-1", "busybox:1.36", phase="Succeeded"),
         ], "upmore", OWN)
         self.assertEqual([(r["component"], r["kind"], r["workload"]) for r in rows],
-                         [("argocd", "image", "Deployment/api"), ("upmore-api", "service", "Deployment/api")])
+                         [("argocd", "image", "Deployment/api · 容器 c"), ("upmore-api", "service", "Deployment/api · 容器 c")])
+        init = asset_scan.pods_to_assets([{"metadata": {"namespace": "argocd", "name": "redis-1"},
+            "spec": {"containers": [{"name": "redis", "image": "redis:7.2"}],
+                     "initContainers": [{"name": "secret-init", "image": "quay.io/argoproj/argocd:v3.4.5"}]},
+            "status": {"phase": "Running"}}], "upmore", OWN)
+        self.assertIn("init 容器 secret-init", init[1]["workload"])
         self.assertEqual(rows[0]["digest"], "sha256:abc")
         self.assertEqual(rows[0]["app"], "argocd")
         nodes = asset_scan.nodes_to_assets([{"metadata": {"name": "n1"}, "status": {"nodeInfo": {
@@ -135,12 +140,16 @@ class StoreAndMatchTests(unittest.TestCase):
         details = {"CVE-2026-1": {"affected": [{"package": "github.com/argoproj/argo-cd/v3", "fixed_in": ["3.0.19", "3.1.8"]}],
                                   "severity": "HIGH"},
                    "CVE-2026-2": {"affected": [], "severity": None}}
-        with mock.patch.object(match, "_detail", side_effect=lambda cve: details.get(cve)):
+        osv = {"3.1.5": {"CVE-2026-1": ["3.0.19", "3.1.8"]}}          # OSV 按包版本查询：3.1.5 受 CVE-2026-1 影响
+        with mock.patch.object(match, "_detail", side_effect=lambda cve: details.get(cve)), \
+                mock.patch.object(match, "_osv_package", side_effect=lambda product, ver: osv.get(ver, {})):
             r = match.report(days=7)
         by = {x["cve"]: x for x in r["related"]}
         self.assertEqual(set(by), {"CVE-2026-1", "CVE-2026-2"})
         self.assertEqual(by["CVE-2026-1"]["priority"], "P1")
         self.assertEqual(by["CVE-2026-1"]["version_checks"][0]["verdict"], "affected")
+        self.assertIn("OSV 确认", by["CVE-2026-1"]["version_checks"][0]["why"])
+        self.assertEqual(by["CVE-2026-1"]["assets_affected"], 1)
         self.assertIn("源码包", by["CVE-2026-1"]["matched_by"])
         self.assertEqual(by["CVE-2026-2"]["component"], "ingress-nginx")
         self.assertEqual(by["CVE-2026-2"]["priority"], "P0")                       # KEV + 在跑 + 无法确认版本
@@ -150,6 +159,23 @@ class StoreAndMatchTests(unittest.TestCase):
         self.assertEqual(r["intel"]["in_window"], 4)
         self.assertEqual(r["self_built_images"]["names"], ["upmore-api"])
         self.assertEqual(r["related"][0]["cve"], "CVE-2026-2")                     # P0 排最前
+
+    def test_osv_version_query_separates_affected_and_fixed_workloads(self):
+        rows = [{"kind": "image", "component": "argocd", "version": ver, "image": f"quay.io/argoproj/argocd:v{ver}",
+                 "cluster": "upmore", "namespace": "argocd", "workload": f"Deployment/argocd-{ver}", "evidence": "pod（运行时）"}
+                for ver in ("3.4.5", "3.4.12")]
+        assetstore.replace("cluster:upmore", rows)
+        self.add_vuln("CVE-2026-55797", ["go:github.com/argoproj/argo-cd/v3"], "Argo CD command injection")
+        self.add_vuln("CVE-2026-113708", ["go:github.com/argoproj/argo-cd/v3"], "Argo CD kustomize RCE")   # OSV 未收录
+        osv = {"3.4.5": {"CVE-2026-55797": ["3.3.15", "3.4.10"]}, "3.4.12": {}}
+        with mock.patch.object(match, "_detail", return_value=None), \
+                mock.patch.object(match, "_osv_package", side_effect=lambda product, ver: osv[ver]):
+            r = match.report(days=7)
+        by = {x["cve"]: x for x in r["related"]}
+        checks = {c["version"]: c["verdict"] for c in by["CVE-2026-55797"]["version_checks"]}
+        self.assertEqual(checks, {"3.4.12": "fixed", "3.4.5": "affected"})
+        self.assertEqual([a["workload"] for a in by["CVE-2026-55797"]["assets"]], ["Deployment/argocd-3.4.5"])
+        self.assertEqual({c["verdict"] for c in by["CVE-2026-113708"]["version_checks"]}, {"unknown"})
 
     def test_subproduct_advisory_goes_to_needs_confirmation(self):
         assetstore.replace("gitlab", [{"kind": "component", "component": "gitlab", "version": "19.1.9"}])
