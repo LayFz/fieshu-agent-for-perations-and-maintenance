@@ -43,7 +43,9 @@ def _loop():
                 tasks.enqueue_schedule(sc, now)
             if now - last_skill_check >= 60:              # 技能源 / 情报源到期就同步（另起线程，不挡定时任务）
                 last_skill_check = now
-                for name, fn in (("skill-sync", skills.sync_due), ("intel-sync", collector.sync_due)):
+                from ops import asset_scan
+                for name, fn in (("skill-sync", skills.sync_due), ("intel-sync", collector.sync_due),
+                                 ("asset-sync", asset_scan.sync_due)):
                     if name not in _jobs or not _jobs[name].is_alive():
                         _jobs[name] = threading.Thread(target=fn, name=name, daemon=True)
                         _jobs[name].start()

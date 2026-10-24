@@ -8,6 +8,10 @@ systems.info 直接带实时快照：cpu(CPU%)、mp(内存%)、dp(磁盘%)、la(
 """
 import requests
 
+# 内网监控服务：不继承 HTTP(S)_PROXY / 系统代理（否则 TUN/代理会把内网请求带走）
+_http = requests.Session()
+_http.trust_env = False
+
 from core import store
 
 
@@ -23,7 +27,7 @@ def configured():
     return bool(url and u and p)
 
 def _token(url, u, p):
-    r = requests.post(f"{url}/api/collections/users/auth-with-password",
+    r = _http.post(f"{url}/api/collections/users/auth-with-password",
                       json={"identity": u, "password": p}, timeout=10)
     if r.status_code != 200:
         raise RuntimeError(f"Beszel 登录失败 HTTP {r.status_code}: {r.text[:160]}")
@@ -37,7 +41,7 @@ def servers(name=None):
         return {"error": "Beszel 未配置：请在后台「可观测」里填 URL / 账号 / 密码。"}
     try:
         tok = _token(url, u, p)
-        r = requests.get(f"{url}/api/collections/systems/records?perPage=100",
+        r = _http.get(f"{url}/api/collections/systems/records?perPage=100",
                          headers={"Authorization": tok}, timeout=10)
         if r.status_code != 200:
             return {"error": f"读取服务器列表失败 HTTP {r.status_code}"}
@@ -73,7 +77,7 @@ def containers(server=None, name=None, sort="cpu", top=None):
     try:
         tok = _token(url, u, p)
         H = {"Authorization": tok}
-        sys = requests.get(f"{url}/api/collections/systems/records?perPage=100",
+        sys = _http.get(f"{url}/api/collections/systems/records?perPage=100",
                            headers=H, timeout=10)
         if sys.status_code != 200:
             return {"error": f"读取服务器列表失败 HTTP {sys.status_code}"}
@@ -83,7 +87,7 @@ def containers(server=None, name=None, sort="cpu", top=None):
             if server and server.lower() not in snm.lower():
                 continue
             # 取这台机最新一条容器快照（每分钟一条，最新即当前）
-            r = requests.get(
+            r = _http.get(
                 f"{url}/api/collections/container_stats/records",
                 headers=H, timeout=10,
                 params={"perPage": 1, "sort": "-created",

@@ -78,8 +78,13 @@ class HarnessIntegrationTests(unittest.TestCase):
     def submit(self, text, **kwargs):
         return tasks.submit(self.app, "chat-test", text, speaker_open_id="requester", **kwargs)[0]
 
-    def respond(self, name, args, answer="已查询，证据见结果。"):
-        self.model.side_effect = [("", [tool(name, args)], None), (answer, [], None)]
+    def respond(self, name, args, answer="已查询，证据见结果。", retries=0):
+        # retries：宿主验收未通过时会再给模型两次补证据的机会；这里模拟模型仍只给文字答复
+        self.model.side_effect = [("", [tool(name, args)], None)] + [(answer, [], None)] * (1 + retries)
+
+    def nudged(self):
+        last = self.model.call_args.args[2] if self.model.call_args.args else self.model.call_args.kwargs.get("messages", [])
+        return any("宿主验收未通过" in (m.get("content") or "") for m in last if isinstance(m, dict))
 
     @staticmethod
     def message(text, message_id="feishu-message-1"):
@@ -123,7 +128,8 @@ class HarnessIntegrationTests(unittest.TestCase):
                  ("get events -n test-ns", "completed"))
         for command, expected in cases:
             with self.subTest(command=command):
-                self.respond("kubectl", {"target": "test-cluster", "command": command})
+                self.respond("kubectl", {"target": "test-cluster", "command": command},
+                             retries=2 if expected == "needs_attention" else 0)
                 task = self.submit("排查服务问题日志", workflow="logs")
                 tasks.tick()
                 row = tasks.get(task["id"])
@@ -171,11 +177,12 @@ class HarnessIntegrationTests(unittest.TestCase):
         tasks.tick()
         self.assertEqual(tasks.get(analysis["id"])["status"], "completed")
         self.assertTrue(tasks.get(analysis["id"])["checkpoint"]["tainted"])
-        self.respond("cve_detail", {"id": "CVE-2026-12345"}, "漏洞已经修复。")
+        self.respond("cve_detail", {"id": "CVE-2026-12345"}, "漏洞已经修复。", retries=2)
         repair = self.submit("修复漏洞 CVE-2026-12345")
         tasks.tick()
         row = tasks.get(repair["id"])
         self.assertEqual(row["status"], "needs_attention")
+        self.assertTrue(self.nudged())
         self.assertIn("隔离测试", row["error"])
         self.assertEqual(self.cve.call_count, 2)
 

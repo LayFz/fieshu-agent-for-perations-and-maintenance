@@ -8,6 +8,10 @@ import re
 
 import requests
 
+# 内网监控服务：不继承 HTTP(S)_PROXY / 系统代理（否则 TUN/代理会把内网请求带走）
+_http = requests.Session()
+_http.trust_env = False
+
 from core import store
 
 _LINE = re.compile(r'^(\w+)\{([^}]*)\}\s+([0-9.eE+-]+)')
@@ -29,7 +33,7 @@ def status():
     if not (url and key):
         return {"error": "Uptime Kuma 未配置：请在后台「可观测」里填 URL 和 API Key。"}
     try:
-        r = requests.get(f"{url}/metrics", auth=("", key), timeout=10)
+        r = _http.get(f"{url}/metrics", auth=("", key), timeout=10)
         if r.status_code != 200:
             return {"error": f"读取 /metrics 失败 HTTP {r.status_code}（确认 API Key 正确）"}
         mon = {}

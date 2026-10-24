@@ -110,3 +110,15 @@ def kubectl_scope(app, command):
     if not namespaces and not all_namespaces:
         argv.append("--namespace=default")
     return shlex.join(argv)
+
+
+def asset_visible(app, asset):
+    """资产清单按「采集来源集群 + 命名空间」授权：能读这个集群这个命名空间的应用才看得到。
+    集群外来源（gitlab、extra）对任何有集群授权的应用可见。"""
+    source = asset.get("source") or ""
+    if source.startswith("cluster:"):
+        if not allowed(app, "k8s_clusters", source.split(":", 1)[1]):
+            return False
+        ns = asset.get("namespace") or ""
+        return not ns or allowed(app, "namespaces", ns)
+    return bool((app.get("resources") or {}).get("k8s_clusters"))

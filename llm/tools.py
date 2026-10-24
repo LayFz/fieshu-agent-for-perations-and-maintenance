@@ -4,6 +4,7 @@
   tools_for(names) -> 只把该应用勾选的工具暴露给模型（能力隔离，防越权）
   execute(name, args, ctx) -> 真正干活；ctx 携带 app_id（记忆/长期笔记按应用隔离）
 """
+import re
 from datetime import datetime
 
 from core import store
@@ -537,6 +538,31 @@ TOOLS += [
         }, "required": ["q"]},
     }},
     {"type": "function", "function": {
+        "name": "vuln_report",
+        "description": "漏洞分析报告的数据（已由程序对照资产清单算好）：资产清单状态、情报统计、与我们资产相关的漏洞"
+                       "（优先级 P0~P3、匹配依据、我们在跑的版本与修复版本对照、受影响的集群/命名空间/工作负载）、"
+                       "与我们无关的数量统计。写漏洞报告、回答「我们受不受影响」时必须先调用它，不要自己从 vuln_list 猜相关性。",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "最近多少天的情报，默认 7"},
+            "limit": {"type": "integer", "description": "最多返回多少条相关漏洞，默认 30"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "asset_list",
+        "description": "查资产清单：线上在跑的镜像与组件版本（集群、命名空间、工作负载、ArgoCD 应用、证据来源）。",
+        "parameters": {"type": "object", "properties": {
+            "q": {"type": "string", "description": "关键字：组件名、镜像、工作负载、命名空间"},
+            "kind": {"type": "string", "enum": ["image", "component", "service"],
+                     "description": "image 第三方镜像 / component 平台组件（Kubernetes、内核、GitLab 等）/ service 自研服务"},
+            "limit": {"type": "integer", "description": "默认 100"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "asset_refresh",
+        "description": "立即重新采集资产清单（读取集群 Pod/节点/ArgoCD 应用、GitLab 版本）。清单过期或为空时用。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
         "name": "vuln_update",
         "description": "研判后更新台账：状态（affected 受影响 / not_affected 不受影响 / fixed 已修复 / ignored 忽略 / triaging 研判中）"
                        "与备注（写清依据：哪个服务、什么版本、怎么查到的）。会写入共享台账，请确认后再调用。",
@@ -592,6 +618,9 @@ _META = {
     "code_close": {"risk": "local"},
     "cve_kev": {"risk": "read", "external": True, "timeout": 60},
     "web_search": {"risk": "read", "external": True, "timeout": 40},
+    "vuln_report": {"risk": "read", "external": True, "timeout": 90},
+    "asset_list": {"risk": "read"},
+    "asset_refresh": {"risk": "read", "timeout": 150},
     "web_fetch": {"risk": "read", "external": True, "timeout": 60},
     # 离线容器里的计算：不触达任何外部系统，按 local；下载内容不可信 → external
     "sandbox_run": {"risk": "local", "external": True, "timeout": 420},
@@ -739,6 +768,49 @@ def _code_tool(name, args, ctx):
         return {"error": str(e)}
 
 
+_NET_ERROR = re.compile(r"ConnectionError|ConnectTimeout|ReadTimeout|RemoteDisconnected|Connection aborted|Connection refused|"
+                        r"Max retries exceeded|Name or service not known|nodename nor servname|连不上|连接失败|执行超时", re.I)
+_INTERNAL = ("server_stats", "service_status", "query_logs", "list_log_streams", "kubectl", "argocd_apps", "argocd_app",
+             "gitlab_project", "gitlab_pipelines", "gitlab_tree", "gitlab_read", "asset_refresh", "ssh_exec")
+
+
+def explain_errors(name, result):
+    """内部系统的网络类错误补一句人能处理的原因，避免把底层异常原样交给模型和用户。"""
+    if name in _INTERNAL and isinstance(result, dict) and isinstance(result.get("error"), str) \
+            and _NET_ERROR.search(result["error"]) and "hint" not in result:
+        result["hint"] = ("这是网络连通性问题，不是业务数据问题：harness 所在机器连不上该内网服务。"
+                          "请检查 VPN（NetBird）是否已登录、代理/TUN 是否劫持了内网网段，或目标服务是否在运行。"
+                          "向用户说明原因，不要把它写成业务结论。")
+    if name == "asset_refresh" and isinstance(result, dict):
+        for r in result.get("results") or []:
+            if r.get("status") == "error" and _NET_ERROR.search(str(r.get("error"))):
+                result["hint"] = "部分来源因网络不可达未采集：检查 VPN（NetBird）与代理设置。"
+    return result
+
+
+def _asset_tool(name, args, app_id):
+    """资产清单与漏洞报告：按应用的集群/命名空间权限过滤资产。"""
+    from core import assetstore
+    from harness import access
+    from ops import asset_scan
+    from sec import match
+    app = store.get_app(app_id) or {}
+    visible = lambda a: access.asset_visible(app, a)
+    if name == "asset_refresh":
+        result = asset_scan.refresh()
+        result["assets_visible"] = sum(1 for a in assetstore.list_assets(limit=20000) if visible(a))
+        return result
+    if name == "asset_list":
+        rows = [a for a in assetstore.list_assets(q=args.get("q"), kind=args.get("kind"), limit=20000) if visible(a)]
+        limit = max(1, min(int(args.get("limit") or 100), 300))
+        keep = ("component", "version", "kind", "cluster", "namespace", "workload", "app", "image", "evidence")
+        return {"total": len(rows), "assets": [{k: a[k] for k in keep if a[k]} for a in rows[:limit]],
+                "sources": assetstore.sources(), "truncated": len(rows) > limit}
+    days = max(1, min(int(args.get("days") or 7), 90))
+    limit = max(1, min(int(args.get("limit") or 30), 60))
+    return match.report(days=days, visible=visible, limit=limit)
+
+
 def _box_tool(name, args):
     """把 box_* 工具翻译成工作机操作；工作机离线或出错时返回可读的错误。"""
     from harness import box
@@ -811,6 +883,8 @@ def execute(name, args, ctx=None):
                                  allow_host=lambda h: isinstance(allowed, list) and ops_web.domain_allowed(allowed, h))
         if name.startswith("box_"):
             return _box_tool(name, args)
+        if name in ("vuln_report", "asset_list", "asset_refresh"):
+            return _asset_tool(name, args, app_id)
         if name == "sandbox_run":
             allowed = ((store.get_app(app_id) or {}).get("resources") or {}).get("web_domains") or []
             try:

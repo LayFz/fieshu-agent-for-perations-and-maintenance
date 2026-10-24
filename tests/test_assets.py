@@ -1,0 +1,177 @@
+"""资产清单、漏洞匹配与报告：组件归一、采集解析、快照语义、版本判断、误报规避、权限与验收。不访问集群或外网。"""
+import json
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+_test_dir = tempfile.TemporaryDirectory(prefix="feishu-assets-test-")
+os.environ.setdefault("FEISHU_AGENT_DATA_DIR", _test_dir.name)
+os.environ.setdefault("FEISHU_AGENT_CONFIG", "")
+
+from core import assetstore, components, store, taskstore
+from harness import access, workflows
+from llm import authorization, tools
+from ops import asset_scan
+from sec import match
+
+OWN = ("harbor.upmore.net", "10.10.0.1")
+
+
+def pod(ns, name, image, owner=("ReplicaSet", "api-7c9f8d6b5d"), phase="Running", digest="sha256:abc", tracking=None):
+    md = {"namespace": ns, "name": name, "ownerReferences": [{"kind": owner[0], "name": owner[1]}]}
+    if tracking:
+        md["annotations"] = {"argocd.argoproj.io/tracking-id": tracking}
+    return {"metadata": md, "spec": {"containers": [{"name": "c", "image": image}]},
+            "status": {"phase": phase, "containerStatuses": [{"name": "c", "imageID": f"docker.io/x@{digest}"}]}}
+
+
+class ComponentTests(unittest.TestCase):
+    def test_image_to_component_and_version(self):
+        cases = {"quay.io/argoproj/argocd:v3.1.5": ("argocd", "3.1.5", False),
+                 "registry.k8s.io/ingress-nginx/controller:v1.11.3@sha256:abc": ("ingress-nginx", "1.11.3", False),
+                 "rancher/mirrored-coredns-coredns:1.12.0": ("coredns", "1.12.0", False),
+                 "redis:7-alpine": ("redis", "7", False),
+                 "harbor.upmore.net/upmore/upmore-api:1a2b3c4d": ("upmore-api", "", True)}
+        for ref, expected in cases.items():
+            self.assertEqual(components.component_of(ref, OWN), expected, ref)
+
+    def test_specific_component_supersedes_generic(self):
+        self.assertEqual(components.mentioned(components.CATALOG, "Kubernetes ingress-nginx"), {"ingress-nginx": "ingress-nginx"})
+        self.assertNotIn("redis", components.mentioned(["redis"], "a redistributable library"))
+
+    def test_package_matching_is_exact(self):
+        self.assertEqual(components.package_component("go:github.com/argoproj/argo-cd/v3", ["argocd", "redis"]), "argocd")
+        self.assertIsNone(components.package_component("pip:redis", ["argocd", "redis"]))   # Python 客户端不是 Redis 服务
+        self.assertTrue(components.is_package("npm:next"))
+
+
+class CollectorTests(unittest.TestCase):
+    def test_pods_nodes_and_remote_apps(self):
+        rows = asset_scan.pods_to_assets([
+            pod("argocd", "argocd-server-1", "quay.io/argoproj/argocd:v3.1.5", tracking="argocd:apps/Deployment"),
+            pod("upmore-api", "api-1", "harbor.upmore.net/upmore/upmore-api:1a2b3c4d"),
+            pod("old", "done-1", "busybox:1.36", phase="Succeeded"),
+        ], "upmore", OWN)
+        self.assertEqual([(r["component"], r["kind"], r["workload"]) for r in rows],
+                         [("argocd", "image", "Deployment/api"), ("upmore-api", "service", "Deployment/api")])
+        self.assertEqual(rows[0]["digest"], "sha256:abc")
+        self.assertEqual(rows[0]["app"], "argocd")
+        nodes = asset_scan.nodes_to_assets([{"metadata": {"name": "n1"}, "status": {"nodeInfo": {
+            "kubeletVersion": "v1.36.2+k3s1", "containerRuntimeVersion": "containerd://2.0.5-k3s1", "kernelVersion": "6.8.0-45-generic"}}}], "upmore")
+        self.assertEqual({(r["component"], r["version"]) for r in nodes},
+                         {("kubernetes", "1.36.2"), ("k3s", "1.36.2+k3s1"), ("containerd", "2.0.5"), ("linux-kernel", "6.8.0")})
+        apps = asset_scan.applications_to_assets([
+            {"metadata": {"name": "upmore-api-vke"}, "spec": {"destination": {"name": "vke-cn-shanghai", "namespace": "upmore-api"}},
+             "status": {"summary": {"images": ["redis:7.2.4"]}}},
+            {"metadata": {"name": "local"}, "spec": {"destination": {"server": "https://kubernetes.default.svc"}},
+             "status": {"summary": {"images": ["redis:7.2.4"]}}}], "upmore", OWN)
+        self.assertEqual([(r["cluster"], r["component"], r["version"]) for r in apps], [("vke-cn-shanghai", "redis", "7.2.4")])
+
+
+class StoreAndMatchTests(unittest.TestCase):
+    def setUp(self):
+        self.assertNotEqual(Path(store.DB_PATH).parent, Path(__file__).resolve().parents[1] / "data")
+        with taskstore.transaction() as conn:
+            for table in ("assets", "asset_sources", "vulns", "apps"):
+                conn.execute("DELETE FROM " + table)
+
+    def add_vuln(self, cve, products, title="", description="", kev=0, epss=0.01, days_ago=1):
+        now = time.time() - days_ago * 86400
+        with taskstore.transaction() as conn:
+            conn.execute("INSERT INTO vulns(cve,title,description,kev,epss,products,sources,first_seen,last_seen,status) "
+                         "VALUES(?,?,?,?,?,?,?,?,?,'new')",
+                         (cve, title, description, kev, epss, json.dumps(products), json.dumps(["https://example/" + cve]), now, now))
+
+    def test_snapshot_replace_keeps_first_seen_and_error_keeps_rows(self):
+        row = {"kind": "image", "component": "argocd", "version": "3.1.5", "image": "a", "cluster": "upmore",
+               "namespace": "argocd", "workload": "Deployment/argocd-server"}
+        assetstore.replace("cluster:upmore", [row])
+        first = assetstore.list_assets()[0]["first_seen"]
+        time.sleep(0.01)
+        assetstore.replace("cluster:upmore", [row, dict(row, workload="Deployment/argocd-repo-server")])
+        rows = assetstore.list_assets()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(next(r for r in rows if r["workload"] == "Deployment/argocd-server")["first_seen"], first)
+        assetstore.mark_error("cluster:upmore", "Kubernetes 连接失败")
+        self.assertEqual(len(assetstore.list_assets()), 2)
+        self.assertEqual(assetstore.sources()[0]["status"], "error")
+
+    def test_verdict(self):
+        self.assertEqual(match.verdict("3.1.5", ["2.14.20", "3.0.19", "3.1.8"])[0], "affected")
+        self.assertEqual(match.verdict("3.1.9", ["2.14.20", "3.1.8"])[0], "fixed")
+        self.assertEqual(match.verdict("3.2.0", ["3.1.8"])[0], "fixed")
+        self.assertEqual(match.verdict("1.10.0", ["1.11.5", "1.12.1"])[0], "affected")
+        self.assertEqual(match.verdict("", ["1.0.0"])[0], "unknown")
+        self.assertEqual(match.verdict("7", [])[0], "unknown")
+        self.assertEqual(match.verdict("19.1.9", ["0141f228c05216d97eae940261c824e64c73255a"])[0], "unknown")  # 提交哈希不是版本
+        groups = match._RELEASE.findall("GitLab Critical Patch Release: 19.2.4, 19.3.2, and 19.4.1")
+        self.assertEqual(groups and __import__("re").findall(r"\d+\.\d+(?:\.\d+)*", groups[0]), ["19.2.4", "19.3.2", "19.4.1"])
+
+    def test_report_matches_only_our_components_with_evidence(self):
+        assetstore.replace("cluster:upmore", [
+            {"kind": "image", "component": "argocd", "version": "3.1.5", "image": "quay.io/argoproj/argocd:v3.1.5",
+             "cluster": "upmore", "namespace": "argocd", "workload": "Deployment/argocd-server", "evidence": "pod（运行时）"},
+            {"kind": "image", "component": "ingress-nginx", "version": "1.11.3", "image": "ingress-nginx/controller:v1.11.3",
+             "cluster": "upmore", "namespace": "ingress-nginx", "workload": "Deployment/ingress-nginx-controller", "evidence": "pod（运行时）"},
+            {"kind": "image", "component": "redis", "version": "7", "image": "redis:7-alpine",
+             "cluster": "upmore", "namespace": "flowlab", "workload": "StatefulSet/redis", "evidence": "pod（运行时）"},
+            {"kind": "service", "component": "upmore-api", "image": "harbor.upmore.net/upmore/upmore-api:1a2b3c4d",
+             "cluster": "upmore", "namespace": "upmore-api", "workload": "Deployment/api", "evidence": "pod（运行时）"},
+        ])
+        self.add_vuln("CVE-2026-1", ["go:github.com/argoproj/argo-cd/v3"], "Argo CD repo-server SSRF", epss=0.02)
+        self.add_vuln("CVE-2026-2", ["Kubernetes ingress-nginx"], "ingress-nginx admission RCE", kev=1, epss=0.9)
+        self.add_vuln("CVE-2026-3", ["pip:redis"], "redis-py leaks credentials")            # 不是 Redis 服务
+        self.add_vuln("CVE-2026-4", ["Citrix NetScaler"], "NetScaler memory overread", kev=1)
+        self.add_vuln("CVE-2026-5", ["go:github.com/argoproj/argo-cd/v3"], "old", days_ago=30)  # 窗口外
+        details = {"CVE-2026-1": {"affected": [{"package": "github.com/argoproj/argo-cd/v3", "fixed_in": ["3.0.19", "3.1.8"]}],
+                                  "severity": "HIGH"},
+                   "CVE-2026-2": {"affected": [], "severity": None}}
+        with mock.patch.object(match, "_detail", side_effect=lambda cve: details.get(cve)):
+            r = match.report(days=7)
+        by = {x["cve"]: x for x in r["related"]}
+        self.assertEqual(set(by), {"CVE-2026-1", "CVE-2026-2"})
+        self.assertEqual(by["CVE-2026-1"]["priority"], "P1")
+        self.assertEqual(by["CVE-2026-1"]["version_checks"][0]["verdict"], "affected")
+        self.assertIn("源码包", by["CVE-2026-1"]["matched_by"])
+        self.assertEqual(by["CVE-2026-2"]["component"], "ingress-nginx")
+        self.assertEqual(by["CVE-2026-2"]["priority"], "P0")                       # KEV + 在跑 + 无法确认版本
+        self.assertEqual(by["CVE-2026-2"]["assets"][0]["workload"], "Deployment/ingress-nginx-controller")
+        self.assertEqual(r["unrelated"]["count"], 2)
+        self.assertEqual(r["unrelated"]["kev"], 1)
+        self.assertEqual(r["intel"]["in_window"], 4)
+        self.assertEqual(r["self_built_images"]["names"], ["upmore-api"])
+        self.assertEqual(r["related"][0]["cve"], "CVE-2026-2")                     # P0 排最前
+
+    def test_visibility_and_authorization(self):
+        assetstore.replace("cluster:upmore", [{"kind": "image", "component": "argocd", "namespace": "argocd", "cluster": "upmore"},
+                                              {"kind": "image", "component": "redis", "namespace": "flowlab", "cluster": "upmore"}])
+        app_id = store.create_app("资产权限")
+        store.update_app(app_id, resources={"k8s_clusters": ["upmore"], "namespaces": ["argocd"]})
+        out = tools._asset_tool("asset_list", {}, app_id)
+        self.assertEqual([a["component"] for a in out["assets"]], ["argocd"])
+        store.update_app(app_id, resources={"repos": ["x"]})
+        with self.assertRaises(PermissionError):
+            authorization.prepare("vuln_report", {}, {"app_id": app_id, "chat_id": "c"})
+        self.assertFalse(access.asset_visible(store.get_app(app_id), {"source": "cluster:upmore", "namespace": "argocd"}))
+
+
+class WorkflowAndHintTests(unittest.TestCase):
+    def test_report_requests_need_vuln_report_evidence(self):
+        ev = [{"tool": "vuln_list", "result": {"items": []}}]
+        self.assertEqual(workflows.resolve("auto", "发送漏洞报告"), "vulnerability")
+        self.assertIn("vuln_report", workflows.verify("auto", "发送漏洞报告", ev))
+        self.assertIsNone(workflows.verify("auto", "发送漏洞报告", ev + [{"tool": "vuln_report", "result": {"related": []}}]))
+        self.assertIsNone(workflows.verify("auto", "查一下漏洞 CVE-2026-1 详情", [{"tool": "cve_detail", "result": {"id": "x"}}]))
+
+    def test_network_errors_get_actionable_hint(self):
+        out = tools.explain_errors("server_stats", {"error": "('Connection aborted.', RemoteDisconnected('Remote end closed'))"})
+        self.assertIn("NetBird", out["hint"])
+        self.assertNotIn("hint", tools.explain_errors("vuln_list", {"error": "ConnectionError"}))
+        self.assertNotIn("hint", tools.explain_errors("kubectl", {"error": "Forbidden"}))
+
+
+if __name__ == "__main__":
+    unittest.main()

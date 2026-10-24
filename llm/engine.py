@@ -17,7 +17,7 @@ from feishu import auth
 from harness import pipeline, policy, runs, tasks, workflows
 from . import authorization
 from . import mcp as mcp_mod
-from .tools import tools_for, execute, meta_for, approval_preview, MCP_META, SKILL_TOOL
+from .tools import tools_for, execute, meta_for, approval_preview, explain_errors, MCP_META, SKILL_TOOL
 
 _MAX_TOOL_LOOPS = 40
 
@@ -281,6 +281,14 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                 if proactive and (answer == "(无输出)" or "__SILENT__" in answer):
                     return None, "silent"
                 reason = workflows.verify(task.get("workflow", "auto"), user_text, state.get("evidence", []))
+                if task and reason and state.get("verify_retries", 0) < 2:
+                    # 先让模型补证据（最多两次），仍不满足再判定未完成；提示写进检查点，重启后不重复
+                    state["verify_retries"] = state.get("verify_retries", 0) + 1
+                    msgs.append({"role": "assistant", "content": answer})
+                    msgs.append({"role": "user", "content": f"【宿主验收未通过】{reason}。请补充所需的工具调用后，再给出最终答复。"})
+                    state.update(done=False, final_answer=None)
+                    tasks.checkpoint(state)
+                    continue
                 if task and reason:
                     raise tasks.TaskIncomplete(f"验收待完成：{reason}")
                 store.save(aid, chat_id, "assistant", answer, task_id=task.get("id"), context_key=context_key)
@@ -326,7 +334,7 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                     executor = (lambda a, _r=mcp_routes[name]: mcp_mod.call(_r, a))
                 else:
                     meta = meta_for(name, args)
-                    executor = (lambda a, _n=name: execute(_n, a, ctx))
+                    executor = (lambda a, _n=name: explain_errors(_n, execute(_n, a, ctx)))
                 call = pipeline.ToolCall(id=t["id"], tool=name, args=args, raw_args=raw,
                                          exposed=name in exposed, trigger=rec.trigger, app_id=aid, **meta)
                 # 需要审批时才算的卡片预览（如提 MR 的 diff），让审批人看到真正要批的内容
