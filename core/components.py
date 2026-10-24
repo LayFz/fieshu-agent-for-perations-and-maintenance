@@ -113,6 +113,26 @@ def component_of(ref, own_registries=()):
     return name, version_of(tag), own
 
 
+# 同一厂商名下单独安装的子产品：公告针对它们时，版本号不属于组件本体（"GitLab AI Gateway 19.2.4" ≠ GitLab 19.2.4）
+SUBPRODUCTS = {
+    "gitlab": ["ai gateway", "runner", "pages", "workhorse", "agent server", "kas", "duo", "omnibus"],
+    "argocd": ["image updater", "rollouts", "workflows", "events"],
+    "kubernetes": ["dashboard", "csi", "ingress", "gateway api"],
+    "redis": ["insight", "enterprise", "stack"],
+    "grafana": ["agent", "loki", "tempo", "mimir", "oncall"],
+}
+
+
+def subproduct(component, text):
+    """公告文本是否针对该组件的子产品；返回子产品名或 None。只看「关键词 + 子产品」紧邻出现。"""
+    low = (text or "").lower()
+    for kw in keywords(component):
+        for sub in SUBPRODUCTS.get(component, []):
+            if re.search(r"(?<![a-z0-9])" + re.escape(kw) + r"[\s-]+(self-hosted\s+)?" + re.escape(sub) + r"(?![a-z0-9])", low):
+                return sub
+    return None
+
+
 def keywords(component):
     return CATALOG.get(component, [component])
 

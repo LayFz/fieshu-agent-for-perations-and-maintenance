@@ -20,6 +20,14 @@ from core import assetstore, components, store
 from . import feeds
 
 _CACHE_TTL = 86400
+
+
+def _when(ts):
+    """时间戳 → 北京时间文本（给模型直接引用，避免它自己换算出错）。"""
+    if not ts:
+        return None
+    from datetime import datetime, timedelta, timezone
+    return datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
 _RANGE = re.compile(r"(?:before|prior to|earlier than|<)\s*v?(\d+(?:\.\d+){1,3})", re.I)
 # 厂商补丁公告标题常直接列出修复版本，如 "Patch Release: 19.2.4, 19.3.2, 19.1.10"
 _RELEASE = re.compile(r"(?:patch release|security release|fixed in|upgrade to|update to)[:：]?\s*"
@@ -85,6 +93,40 @@ def _fixed_for(detail, component, package_product):
     return out
 
 
+_CVSS_W = {"AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}, "AC": {"L": 0.77, "H": 0.44},
+           "UI": {"N": 0.85, "R": 0.62}, "C": {"H": 0.56, "L": 0.22, "N": 0}, "I": {"H": 0.56, "L": 0.22, "N": 0},
+           "A": {"H": 0.56, "L": 0.22, "N": 0}}
+
+
+def _roundup(x):
+    i = round(x * 100000)
+    return i / 100000.0 if i % 10000 == 0 else (int(i / 10000) + 1) / 10.0
+
+
+def cvss3_score(vector):
+    """CVSS v3.0/3.1 基础分（规范公式）；不是合法 v3 向量时返回 None。"""
+    if not isinstance(vector, str) or not vector.startswith("CVSS:3"):
+        return None
+    try:
+        m = dict(part.split(":", 1) for part in vector.split("/")[1:])
+        scope_changed = m["S"] == "C"
+        pr = {"N": 0.85, "L": 0.68 if scope_changed else 0.62, "H": 0.5 if scope_changed else 0.27}[m["PR"]]
+        iss = 1 - (1 - _CVSS_W["C"][m["C"]]) * (1 - _CVSS_W["I"][m["I"]]) * (1 - _CVSS_W["A"][m["A"]])
+        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15 if scope_changed else 6.42 * iss
+        exploit = 8.22 * _CVSS_W["AV"][m["AV"]] * _CVSS_W["AC"][m["AC"]] * pr * _CVSS_W["UI"][m["UI"]]
+        if impact <= 0:
+            return 0.0
+        return _roundup(min(1.08 * (impact + exploit), 10)) if scope_changed else _roundup(min(impact + exploit, 10))
+    except (KeyError, ValueError):
+        return None
+
+
+def _label(score):
+    if score is None:
+        return None
+    return "严重" if score >= 9 else "高危" if score >= 7 else "中危" if score >= 4 else "低危" if score > 0 else "无"
+
+
 def _severity_rank(cvss, severity):
     if isinstance(cvss, (int, float)) and cvss >= 7:
         return True
@@ -107,7 +149,7 @@ def report(days=7, visible=None, enrich=True, limit=30):
     assets = [a for a in assetstore.list_assets(limit=20000) if visible is None or visible(a)]
     srcs = assetstore.sources()
     inventory = {"sources": [{"source": s["source"], "status": s["status"], "assets": s["count"], "error": s["error"],
-                              "refreshed": s["refreshed"], "ok_at": s["ok_at"]} for s in srcs],
+                              "last_attempt": _when(s["refreshed"]), "last_success": _when(s["ok_at"])} for s in srcs],
                  "assets": len(assets)}
     oldest_ok = min([s["ok_at"] for s in srcs if s["ok_at"]] or [0])
     warnings = []
@@ -153,7 +195,7 @@ def report(days=7, visible=None, enrich=True, limit=30):
             for cve, d in zip(cves, pool.map(_detail, cves)):
                 details[cve] = d
 
-    related = []
+    related, needs_confirm = [], []
     for c in candidates:
         v, comp = c["v"], c["component"]
         d = details.get(v["cve"])
@@ -165,17 +207,32 @@ def report(days=7, visible=None, enrich=True, limit=30):
             for group in _RELEASE.findall(text):
                 fixed += re.findall(r"\d+\.\d+(?:\.\d+)*", group)
         mine = by_comp[comp]
+        sub = None if c["package"] else components.subproduct(comp, f"{v.get('title') or ''} {(v.get('description') or '')[:400]}")
+        if sub and not any(sub.replace(" ", "-") in a["component"] or sub in (a["image"] or "").lower() for a in mine):
+            # 公告针对子产品，而资产里没有它：版本号不适用于组件本体，放进「需确认」而不是「相关」
+            needs_confirm.append({"cve": v["cve"], "title": v.get("title"), "component": comp, "subproduct": sub,
+                                  "kev": bool(v.get("kev")), "summary": (v.get("description") or "")[:240],
+                                  "why": f"公告针对「{comp} {sub}」，资产清单里没有发现该子产品；如未部署可判为不受影响",
+                                  "sources": json.loads(v.get("sources") or "[]")[:3]})
+            continue
         versions = sorted({a["version"] for a in mine if a["version"]}) or [""]
         checks = [{"version": ver or "（未知）", "verdict": verdict(ver, fixed)[0], "why": verdict(ver, fixed)[1]}
                   for ver in versions]
-        cvss = v.get("cvss")
         severity = v.get("severity") or (d or {}).get("severity")
+        vector = severity if isinstance(severity, str) and severity.startswith("CVSS:") else None
+        cvss = v.get("cvss") if isinstance(v.get("cvss"), (int, float)) else cvss3_score(vector)
+        if vector:
+            severity = None
         runtime = any("运行时" in a["evidence"] or a["kind"] == "component" for a in mine)
         prio, worst = _priority(bool(v.get("kev")), [x["verdict"] for x in checks], cvss, severity, v.get("epss"), runtime)
         related.append({
             "priority": prio, "cve": v["cve"], "title": v.get("title"), "component": comp,
-            "kev": bool(v.get("kev")), "epss": v.get("epss"), "cvss": cvss, "severity": severity,
+            "summary": (v.get("description") or "")[:300],
+            "kev": bool(v.get("kev")), "epss": v.get("epss"),
+            "cvss_score": cvss, "cvss_vector": vector, "severity": severity or _label(cvss),
             "matched_by": ("源码包 " if c["package"] else "关键词 ") + c["via"],
+            "confidence": ("高：按组件源码包精确匹配" if c["package"] else
+                           "中：按产品名关键词匹配，需确认公告针对的子组件/功能（如插件、网关、Runner）在我们这里是否启用"),
             "fixed_versions": sorted(set(fixed))[:8], "version_checks": checks, "overall": worst,
             "assets": [{k: a[k] for k in ("cluster", "namespace", "workload", "app", "image", "version", "evidence") if a[k]}
                        for a in mine[:6]],
@@ -192,9 +249,11 @@ def report(days=7, visible=None, enrich=True, limit=30):
         vendors[prods[0] if prods else "（无产品信息）"] += 1
     own = sorted({a["component"] for a in assets if a["kind"] == "service"})
     return {
-        "window_days": int(days), "generated_at": time.time(), "inventory": inventory, "warnings": warnings,
+        "window_days": int(days), "generated_at": _when(time.time()) + "（北京时间）", "inventory": inventory,
+        "warnings": warnings,
         "intel": {"in_window": len(rows), "kev_in_window": sum(1 for r in rows if r["kev"])},
         "related": related[:limit], "related_total": len(related),
+        "needs_confirmation": needs_confirm[:limit],
         "related_by_priority": dict(Counter(x["priority"] for x in related)),
         "unrelated": {"count": len(unrelated), "kev": sum(1 for v in unrelated if v.get("kev")),
                       "top_products": vendors.most_common(8)},

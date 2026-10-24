@@ -99,6 +99,12 @@ class StoreAndMatchTests(unittest.TestCase):
         self.assertEqual(len(assetstore.list_assets()), 2)
         self.assertEqual(assetstore.sources()[0]["status"], "error")
 
+    def test_cvss_vector_score(self):
+        self.assertEqual(match.cvss3_score("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H"), 9.9)
+        self.assertEqual(match.cvss3_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"), 9.8)
+        self.assertEqual(match.cvss3_score("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N"), 1.8)
+        self.assertIsNone(match.cvss3_score("HIGH"))
+
     def test_verdict(self):
         self.assertEqual(match.verdict("3.1.5", ["2.14.20", "3.0.19", "3.1.8"])[0], "affected")
         self.assertEqual(match.verdict("3.1.9", ["2.14.20", "3.1.8"])[0], "fixed")
@@ -144,6 +150,18 @@ class StoreAndMatchTests(unittest.TestCase):
         self.assertEqual(r["intel"]["in_window"], 4)
         self.assertEqual(r["self_built_images"]["names"], ["upmore-api"])
         self.assertEqual(r["related"][0]["cve"], "CVE-2026-2")                     # P0 排最前
+
+    def test_subproduct_advisory_goes_to_needs_confirmation(self):
+        assetstore.replace("gitlab", [{"kind": "component", "component": "gitlab", "version": "19.1.9"}])
+        self.add_vuln("CVE-2026-90970", [], "GitLab AI Gateway Critical Patch Release: 19.2.4, 19.3.2, and 19.4.1",
+                      "We have released versions 19.2.4 of the GitLab AI Gateway.")
+        self.add_vuln("CVE-2026-90971", [], "GitLab Critical Patch Release: 19.2.4, 19.3.2", "GitLab CE/EE fixes")
+        with mock.patch.object(match, "_detail", return_value=None):
+            r = match.report(days=7)
+        self.assertEqual([x["cve"] for x in r["needs_confirmation"]], ["CVE-2026-90970"])
+        self.assertEqual(r["needs_confirmation"][0]["subproduct"], "ai gateway")
+        self.assertEqual([x["cve"] for x in r["related"]], ["CVE-2026-90971"])
+        self.assertEqual(r["related"][0]["version_checks"][0]["verdict"], "affected")
 
     def test_visibility_and_authorization(self):
         assetstore.replace("cluster:upmore", [{"kind": "image", "component": "argocd", "namespace": "argocd", "cluster": "upmore"},
