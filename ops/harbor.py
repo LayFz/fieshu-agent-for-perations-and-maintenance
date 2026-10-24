@@ -42,7 +42,7 @@ def _request(method, path, params=None, accept=None):
     if r.status_code in (401, 403):
         return None, {"error": f"Harbor 拒绝访问（{r.status_code}），robot 账号可能失效或缺少读取权限"}
     if r.status_code == 404:
-        return None, {"error": "Harbor 上找不到该项目/仓库/制品"}
+        return None, {"error": "Harbor 上找不到该项目/仓库/制品", "not_found": True}
     if r.status_code >= 300:
         return None, {"error": f"Harbor 返回 HTTP {r.status_code}"}
     if not r.content:

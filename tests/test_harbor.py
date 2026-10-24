@@ -104,6 +104,28 @@ class CollectAndReportTests(unittest.TestCase):
         self.assertEqual(statuses, {"web": "Success", "library/mysql": "not_scanned"})
         self.assertEqual(len(assetstore.image_vulns("up-oa", "web", "sha256:aaa")), 4)
 
+    def test_proxy_images_fall_back_to_tag_or_report_missing(self):
+        assetstore.replace("cluster:upmore", [
+            {"kind": "image", "component": "python", "version": "3.12", "image": "harbor.upmore.net/dockerhub/library/python:3.12-alpine",
+             "digest": "sha256:old", "cluster": "upmore", "namespace": "ci", "workload": "Deployment/notify · 容器 c"},
+            {"kind": "image", "component": "redis", "version": "7", "image": "harbor.upmore.net/dockerhub/library/redis:7-alpine",
+             "cluster": "upmore", "namespace": "crm", "workload": "StatefulSet/redis · 容器 r"}])
+        def artifact(project, repo, ref):
+            if repo == "library/python" and ref == "3.12-alpine":
+                return art()
+            return {"error": "Harbor 上找不到该项目/仓库/制品", "not_found": True}
+        with mock.patch.object(harbor, "artifact", side_effect=artifact), \
+                mock.patch.object(harbor, "vulnerabilities", return_value={"vulnerabilities": harbor_vulns()}), \
+                mock.patch.object(image_scan.asset_scan, "own_registries", return_value=["harbor.upmore.net"]):
+            out = image_scan.collect()
+        scans = {s["repo"]: s for s in assetstore.list_scans()}
+        self.assertEqual(scans["library/python"]["reference"], "3.12-alpine")
+        self.assertIn("按 tag 匹配", scans["library/python"]["error"])
+        self.assertEqual(scans["library/redis"]["status"], "not_in_harbor")
+        self.assertEqual(out["errors"], 0)
+        cov = match.image_findings(assetstore.list_assets(), kev=set())["coverage"]
+        self.assertEqual(cov["not_in_harbor"], ["dockerhub/library/redis"])
+
     def test_image_priority_kev_and_fixable(self):
         self.collect()
         assets = assetstore.list_assets()
@@ -116,6 +138,8 @@ class CollectAndReportTests(unittest.TestCase):
         self.assertEqual(r["coverage"]["scanned"], 1)
         self.assertEqual(len(r["coverage"]["not_scanned"]), 1)
         self.assertEqual(match.image_findings(assets, kev={"CVE-2026-0002"})["items"][0]["priority"], "P0")
+        common = {c["package"]: c for c in r["common_fixes"]}
+        self.assertEqual((common["openssl"]["fix_to"], common["openssl"]["images"], common["openssl"]["critical"]), (["3.0.15"], 1, 1))
 
     def test_report_and_tool_respect_visibility(self):
         self.collect()

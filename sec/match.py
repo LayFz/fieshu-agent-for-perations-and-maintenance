@@ -194,14 +194,15 @@ def image_findings(assets, limit=20, kev=None):
         by_image.setdefault(a["image"], []).append(a)
     scans = [s for s in assetstore.list_scans() if s["image"] in by_image]
     kev = kev if kev is not None else {r[0] for r in store._conn.execute("SELECT cve FROM vulns WHERE kev=1")}
-    coverage = {"images": len(scans), "scanned": 0, "not_scanned": [], "errors": []}
-    items = []
+    coverage = {"images": len(scans), "scanned": 0, "scanning": [], "not_scanned": [], "not_in_harbor": [], "errors": []}
+    items, fixes = [], {}
     for s in scans:
         status = (s["status"] or "").lower()
         name = f"{s['project']}/{s['repo']}"
         if status != "success":
-            (coverage["errors"] if status == "error" else coverage["not_scanned"]).append(
-                name + (f"（{s['error']}）" if s["error"] else f"（{s['status']}）"))
+            bucket = {"error": "errors", "not_in_harbor": "not_in_harbor", "pending": "scanning",
+                      "running": "scanning", "scheduled": "scanning"}.get(status, "not_scanned")
+            coverage[bucket].append(name if bucket != "errors" else f"{name}（{s['error']}）")
             continue
         coverage["scanned"] += 1
         vulns = assetstore.image_vulns(s["project"], s["repo"], s["reference"])
@@ -215,19 +216,36 @@ def image_findings(assets, limit=20, kev=None):
                                                 "severity": v["severity"], "cves": []})
             p["cves"].append(v["cve"])
         mine = by_image[s["image"]]
+        svc = mine[0]["component"]
+        for v in fixable:
+            f = fixes.setdefault(v["package"], {"package": v["package"], "fix_to": set(), "images": set(),
+                                                "critical": 0, "high": 0, "kev": set()})
+            f["fix_to"].add(v["fixed"])
+            f["images"].add(svc)
+            f["critical" if v["severity"] == "Critical" else "high"] += 1
+            if v["cve"] in kev:
+                f["kev"].add(v["cve"])
         items.append({
             "priority": prio, "image": s["image"], "service": mine[0]["component"],
-            "workloads": sorted({f"{a['cluster']}/{a['namespace']}/{a['workload'].split(' · ')[0]}" for a in mine})[:4],
+            "workloads": sorted({f"{a['cluster']}/{a['namespace']}/{a['workload'].split(' · ')[0]}" for a in mine})[:2],
             "counts": {k: v for k, v in (s["summary"] or {}).items() if v},
             "total": s["total"], "fixable_high_critical": len(fixable), "kev_cves": hit_kev,
-            "fix_packages": list(pkgs.values())[:6],
+            "fix_packages": [dict(p, cves=p["cves"][:3], more_cves=max(0, len(p["cves"]) - 3)) for p in list(pkgs.values())[:4]],
+            "match_note": s["error"] or None,
             "advice": ("先升级上面列出的包或基础镜像到修复版本，重新构建；" if fixable else "无可修复的高危/严重；")
                       + ("其中有在野利用漏洞，优先处理。" if hit_kev else ""),
         })
     order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
     items.sort(key=lambda x: (order[x["priority"]], -x["fixable_high_critical"]))
     fetched = max([s["fetched"] for s in scans] or [0])
-    return {"coverage": coverage, "fetched_at": _when(fetched), "items": items[:limit],
+    # 同一个包在多个镜像里重复出现（多为基础镜像里的 openssl/curl 等）：按「包 → 修复版本 → 涉及镜像数」汇总，
+    # 修一次基础镜像就能清掉一批，比逐个镜像列 P1 更可执行
+    common = sorted(({"package": f["package"], "fix_to": sorted(f["fix_to"])[:4], "images": len(f["images"]),
+                      "image_names": sorted(f["images"])[:8], "critical": f["critical"], "high": f["high"],
+                      "kev": sorted(f["kev"])} for f in fixes.values()),
+                    key=lambda x: (-len(x["kev"]), -x["critical"], -x["images"], -x["high"]))
+    return {"coverage": coverage, "fetched_at": _when(fetched), "items": items[:limit], "items_total": len(items),
+            "common_fixes": common[:8],
             "by_priority": dict(Counter(x["priority"] for x in items))}
 
 
@@ -370,7 +388,7 @@ def report(days=7, visible=None, enrich=True, limit=30, new_only=False):
         prods = json.loads(v.get("products") or "[]")
         vendors[prods[0] if prods else "（无产品信息）"] += 1
     own = sorted({a["component"] for a in assets if a["kind"] == "service"})
-    images = image_findings(assets, limit=limit) if assetstore.list_scans() else None
+    images = image_findings(assets, limit=min(limit, 10)) if assetstore.list_scans() else None
     return {
         "window_days": int(days), "mode": "只含窗口内新出现的漏洞（日报）" if new_only else "窗口内出现过的漏洞",
         "generated_at": _when(time.time()) + "（北京时间）", "inventory": inventory,
