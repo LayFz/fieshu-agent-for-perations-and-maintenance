@@ -208,8 +208,7 @@ def _cluster_label(target):
 
 
 def _override(app, namespace):
-    """远端集群（只看到 ArgoCD 引用）读不到 Service/Ingress：用后台配置 kv asset_exposure_overrides
-    {"应用名或命名空间": "public|lan|cluster"} 补充，否则为 unknown。"""
+    """可选的人工覆盖（kv asset_exposure_overrides：{"应用名或命名空间": "public|lan|cluster"}），一般不需要。"""
     try:
         overrides = json.loads(store.get_setting("asset_exposure_overrides") or "{}")
     except ValueError:
@@ -217,7 +216,18 @@ def _override(app, namespace):
     for key in (app, namespace):
         if isinstance(overrides, dict) and overrides.get(key) in _RANK:
             return overrides[key], f"后台配置：{key} → {overrides[key]}"
-    return "unknown", "远端集群，未读取 Service/Ingress，暴露面未知"
+    return None
+
+
+def _remote_exposure(app_name, resources, component):
+    """远端集群读不到 Service/Ingress 本身，但 ArgoCD 记录了应用管理的资源：
+    应用里有 Ingress → 业务服务按公网处理（远端入口如 VKE 走 ALB），数据库/缓存仍算仅集群内；没有 Ingress → 仅集群内。"""
+    ingresses = [r.get("name") for r in resources if _d(r).get("kind") == "Ingress"]
+    if component in DATASTORES:
+        return "cluster", f"ArgoCD 应用 {app_name} 中的数据存储，仅供集群内使用"
+    if ingresses:
+        return "public", f"ArgoCD 应用 {app_name} 管理 Ingress {', '.join(ingresses[:3])}（远端集群对外入口）"
+    return "cluster", f"ArgoCD 应用 {app_name} 没有 Ingress，仅集群内"
 
 
 def applications_to_assets(items, cluster, own):
@@ -230,9 +240,11 @@ def applications_to_assets(items, cluster, own):
         if target in ("in-cluster", "https://kubernetes.default.svc", ""):
             continue
         target = _cluster_label(target)
-        exposure, note = _override(md.get("name"), dest.get("namespace"))
+        override = _override(md.get("name"), dest.get("namespace"))
+        resources = _l(st.get("resources"))
         for image in _l(_d(st.get("summary")).get("images")):
             comp, version, mine = components.component_of(image, own)
+            exposure, note = override or _remote_exposure(md.get("name"), resources, comp)
             rows.append({"kind": "service" if mine else "image", "component": comp, "version": version,
                          "image": image, "cluster": target, "namespace": dest.get("namespace") or "",
                          "workload": "", "app": md.get("name") or "",

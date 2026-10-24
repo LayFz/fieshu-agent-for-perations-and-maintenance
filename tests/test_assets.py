@@ -74,6 +74,18 @@ class CollectorTests(unittest.TestCase):
             {"metadata": {"name": "local"}, "spec": {"destination": {"server": "https://kubernetes.default.svc"}},
              "status": {"summary": {"images": ["redis:7.2.4"]}}}], "upmore", OWN)
         self.assertEqual([(r["cluster"], r["component"], r["version"]) for r in apps], [("vke-cn-shanghai", "redis", "7.2.4")])
+        self.assertEqual(apps[0]["exposure"], "cluster")                     # 数据存储
+        vke = asset_scan.applications_to_assets([
+            {"metadata": {"name": "flowlab-vke"}, "spec": {"destination": {"server": "https://118.196.63.20:6443", "namespace": "flowlab"}},
+             "status": {"summary": {"images": ["harbor.upmore.net/flowlab/web:1a2b3c4d", "redis:7.2"]},
+                        "resources": [{"kind": "Ingress", "name": "flowlab"}, {"kind": "Service", "name": "web"}]}},
+            {"metadata": {"name": "platform-vke"}, "spec": {"destination": {"server": "https://118.196.63.20:6443", "namespace": "platform"}},
+             "status": {"summary": {"images": ["kube-state-metrics:2.13.0"]}, "resources": [{"kind": "Service", "name": "ksm"}]}}],
+            "upmore", OWN)
+        self.assertEqual([(r["app"], r["component"], r["exposure"]) for r in vke],
+                         [("flowlab-vke", "flowlab", "public"), ("flowlab-vke", "redis", "cluster"),
+                          ("platform-vke", "kube-state-metrics", "cluster")])
+        self.assertIn("Ingress flowlab", vke[0]["exposure_note"])
 
 
 class ExposureTests(unittest.TestCase):
