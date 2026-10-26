@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
+import re
 import time
 import uuid
 
@@ -183,13 +184,68 @@ def issue_ref(monitor_id, key):
     return hashlib.sha256(f"{monitor_id}:{key}".encode()).hexdigest()[:12]
 
 
+_POD_SUFFIX = re.compile(r"-(?:[a-z0-9]{8,10}-[a-z0-9]{5}|[0-9]{8,}-[a-z0-9]{5}|[a-z0-9]{5})$")
+_EVIDENCE_KEYS = ("waiting_reasons", "reasons", "reason", "phase", "exit_code", "restarts", "count", "last_operation_phase")
+
+
+def _loads(value):
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _workload(resource):
+    """Pod/命名空间/名称 → 命名空间/工作负载名（去掉 ReplicaSet 哈希与 Pod 随机后缀），换代前后的 Pod 归为同一个。"""
+    parts = str(resource or "").split("/")
+    if len(parts) >= 3 and parts[0] == "Pod":
+        return f"{parts[1]}/{_POD_SUFFIX.sub('', parts[2])}"
+    return None
+
+
+def _describe(item):
+    """通知里的一行对象 + 关键证据：看消息就知道是哪个 Pod/应用、因为什么。"""
+    resource = _loads(item.get("resource"))
+    evidence = _loads(item.get("evidence"))
+    line = f"对象：{resource}" if resource else ""
+    if isinstance(evidence, dict):
+        bits = []
+        for k in _EVIDENCE_KEYS:
+            v = evidence.get(k)
+            if v in (None, "", []):
+                continue
+            bits.append(f"{k}={'/'.join(map(str, v)) if isinstance(v, list) else v}")
+        if bits:
+            line += ("；" if line else "") + "，".join(bits)[:200]
+    return line
+
+
 def _notification(monitor, changes):
-    labels = {"new": "新增", "changed": "变化", "resolved": "恢复"}
+    labels = {"new": "新增", "changed": "变化", "resolved": "恢复", "rolled": "换代"}
+    # 同一工作负载换代：旧 Pod「恢复」+ 新 Pod「新增」同一问题，合并成一条，说明问题仍在
+    merged, used = [], set()
+    for i, c in enumerate(changes):
+        if i in used or c["change"] != "new" or not _workload(_loads(c.get("resource"))):
+            continue
+        for j, o in enumerate(changes):
+            if (j not in used and o["change"] == "resolved" and o["title"] == c["title"]
+                    and _workload(_loads(o.get("resource"))) == _workload(_loads(c.get("resource")))):
+                used.update((i, j))
+                merged.append(dict(c, change="rolled", previous=_loads(o.get("resource"))))
+                break
+    changes = merged + [c for i, c in enumerate(changes) if i not in used]
     counts = {kind: sum(c["change"] == kind for c in changes) for kind in labels}
     text = f"巡检 · {monitor['name']}\n" + "，".join(f"{labels[k]} {v}" for k, v in counts.items() if v)
     for change in changes[:30]:
         text += (f"\n\n#{issue_ref(monitor['id'], change['key'])} "
                  f"[{labels[change['change']]}][{change['severity']}] {change['title'][:250]}")
+        described = _describe(change)
+        if described:
+            text += "\n" + described
+        if change["change"] == "rolled":
+            text += f"\n问题仍在：Pod 已换代（原 {change['previous']}），新 Pod 同样异常"
         if change.get("detail"):
             text += "\n" + change["detail"][:500]
     if len(changes) > 30:
@@ -205,6 +261,9 @@ def _baseline_notification(monitor, snapshot, issues):
         text += "\n采集：" + statuses[:3000]
     for issue in issues[:30]:
         text += f"\n\n#{issue_ref(monitor['id'], issue['key'])} [{issue['severity']}] {issue['title'][:250]}"
+        described = _describe(dict(issue))
+        if described:
+            text += "\n" + described
         if issue["detail"]:
             text += "\n" + issue["detail"][:500]
     if len(issues) > 30:
@@ -234,6 +293,8 @@ def save_scan(monitor, snapshot, scope_key):
             incoming.add(key)
             old = conn.execute("SELECT * FROM patrol_issues WHERE monitor_id=? AND key=?", (row["id"], key)).fetchone()
             change = "new" if not old or not old["active"] else "changed" if old["fingerprint"] != fingerprint else None
+            if change == "changed" and key.startswith("__source__:") and old["severity"] == finding["severity"]:
+                change = None
             generation = (old["generation"] + (0 if old["active"] else 1)) if old else 1
             conn.execute("""INSERT INTO patrol_issues
               (monitor_id,key,source,severity,title,detail,resource,evidence,fingerprint,active,first_seen,last_seen,resolved_at,generation,last_scan_id)
@@ -255,7 +316,7 @@ def save_scan(monitor, snapshot, scope_key):
         conn.execute("UPDATE patrol_monitors SET lease_owner=NULL,lease_until=NULL,baseline_pending=0,next_run=?,updated=?,last_scan_id=?,last_error=? WHERE id=?",
                      (now if row["requested"] else now + row["interval_seconds"], now, sid, "; ".join(errors), row["id"]))
         if row["chat_id"] and (changes or row["baseline_pending"]):
-            active = conn.execute("SELECT key,severity,title,detail FROM patrol_issues WHERE monitor_id=? AND active=1 "
+            active = conn.execute("SELECT key,severity,title,detail,resource,evidence FROM patrol_issues WHERE monitor_id=? AND active=1 "
                                   "ORDER BY last_seen DESC,key", (row["id"],)).fetchall()
             message = (_baseline_notification(row, snapshot, active) if row["baseline_pending"]
                        else _notification(row, changes))

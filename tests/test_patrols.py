@@ -132,6 +132,41 @@ class PatrolTests(unittest.TestCase):
         self.assertEqual(patrols.list_issues(m["id"], active=True), [])
         self.assertEqual(self.sender.call_count, 2)
 
+    def test_notification_names_object_and_evidence(self):
+        self.monitor()
+        patrols.tick()
+        text = self.sender.call_args.args[2]
+        self.assertIn("对象：", text)
+        self.assertIn("api", text)
+        self.assertIn("phase=Pending", text)
+
+    def test_pod_rollover_merges_into_one_still_failing_line(self):
+        def pod(name):
+            return {"key": "pod-not-ready:Pod/team/" + name, "source": "cluster:fixture:pods:team", "severity": "high",
+                    "title": "Pod 未就绪", "detail": "", "resource": "Pod/team/" + name,
+                    "evidence": {"phase": "Running", "waiting_reasons": ["CrashLoopBackOff"]}}
+        self.scanner.return_value = snapshot([pod("topic-market-bf9df859f-xmmfs")])
+        m = self.monitor()
+        patrols.tick()
+        self.scanner.return_value = snapshot([pod("topic-market-b554454d4-htvsc")])
+        self.again(m)
+        text = self.sender.call_args.args[2]
+        self.assertIn("换代 1", text)
+        self.assertNotIn("恢复", text)
+        self.assertIn("问题仍在", text)
+        self.assertIn("waiting_reasons=CrashLoopBackOff", text)
+
+    def test_source_error_type_flapping_is_silent(self):
+        def failing(error):
+            return snapshot(sources=[{"name": "cluster:fixture:pods:team", "status": "error", "error": error}])
+        self.scanner.return_value = failing("Kubernetes 连接失败：ReadTimeout")
+        m = self.monitor()
+        patrols.tick()
+        self.scanner.return_value = failing("Kubernetes 连接失败：SSLError")
+        self.again(m)
+        self.assertEqual(self.sender.call_count, 1)
+        self.assertIn("SSLError", patrols.list_issues(m["id"], active=True)[0]["detail"])
+
     def test_no_chat_persists_snapshot_without_notifications(self):
         m = self.monitor(chat=None)
         patrols.tick()
