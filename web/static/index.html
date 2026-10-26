@@ -5,88 +5,154 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>数字员工平台 管理后台</title>
 <style>
-  :root{ --bg:#f4f5f7; --card:#fff; --line:#e6e8eb; --ink:#1f2329; --sub:#646a73;
-         --pri:#3370ff; --pri-d:#1f5eff; --ok:#3bb346; --warn:#ff8800; --err:#f5222d; }
+  :root{
+    --bg:#f5f6f8; --card:#fff; --line:#e7e9ee; --line2:#f0f1f4; --ink:#111827; --sub:#6b7280; --sub2:#9ca3af;
+    --pri:#3b5bdb; --pri-d:#2f4ac0; --pri-soft:#eef2ff;
+    --ok:#16a34a; --ok-soft:#ecfdf3; --warn:#d97706; --warn-soft:#fffbeb; --err:#dc2626; --err-soft:#fef2f2;
+    --nav:#0f172a; --nav-2:#1e293b; --nav-ink:#94a3b8; --nav-label:#64748b;
+    --radius:12px; --shadow:0 1px 2px rgba(16,24,40,.04),0 1px 3px rgba(16,24,40,.06);
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
   *{ box-sizing:border-box; }
-  body{ margin:0; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-        color:var(--ink); background:var(--bg); }
-  a{ color:var(--pri); text-decoration:none; }
+  body{ margin:0; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+        color:var(--ink); background:var(--bg); -webkit-font-smoothing:antialiased; }
+  a{ color:var(--pri); text-decoration:none; } a:hover{ text-decoration:underline; }
   button{ font:inherit; cursor:pointer; }
-  .btn{ background:var(--pri); color:#fff; border:0; border-radius:6px; padding:8px 16px; }
-  .btn:hover{ background:var(--pri-d); }
-  .btn.ghost{ background:#fff; color:var(--ink); border:1px solid var(--line); }
-  .btn.danger{ background:#fff; color:var(--err); border:1px solid #ffd6d6; padding:4px 10px; font-size:13px; }
+  .btn{ background:var(--pri); color:#fff; border:1px solid var(--pri); border-radius:8px; padding:7px 16px; font-weight:500;
+        transition:background .15s,border-color .15s,box-shadow .15s; }
+  .btn:hover{ background:var(--pri-d); border-color:var(--pri-d); }
+  .btn:disabled{ opacity:.55; cursor:not-allowed; }
+  .btn.ghost{ background:#fff; color:var(--ink); border:1px solid var(--line); font-weight:400; }
+  .btn.ghost:hover{ background:#f9fafb; border-color:#d1d5db; }
+  .btn.danger{ background:#fff; color:var(--err); border:1px solid #fecaca; padding:4px 10px; font-size:13px; font-weight:400; }
+  .btn.danger:hover{ background:var(--err-soft); }
   .btn.sm{ padding:4px 12px; font-size:13px; }
-  input,textarea,select{ font:inherit; width:100%; padding:8px 10px; border:1px solid var(--line);
-        border-radius:6px; background:#fff; color:var(--ink); }
+  input,textarea,select{ font:inherit; width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px;
+        background:#fff; color:var(--ink); transition:border-color .15s,box-shadow .15s; }
+  input:focus,textarea:focus,select:focus{ outline:none; border-color:var(--pri); box-shadow:0 0 0 3px rgba(59,91,219,.12); }
   textarea{ resize:vertical; min-height:100px; font-family:inherit; }
-  label{ display:block; font-size:13px; color:var(--sub); margin:14px 0 6px; }
+  label{ display:block; font-size:13px; color:var(--sub); margin:14px 0 6px; font-weight:500; }
 
-  #login{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:var(--bg); z-index:50; }
-  #login .box{ width:340px; background:#fff; border:1px solid var(--line); border-radius:12px; padding:28px; box-shadow:0 8px 30px rgba(0,0,0,.06); }
-  #login h1{ font-size:18px; margin:0 0 4px; } #login p{ color:var(--sub); margin:0 0 18px; font-size:13px; }
+  /* 登录 */
+  #login{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:50;
+          background:radial-gradient(1200px 600px at 20% 10%,#e0e7ff 0,transparent 60%),var(--bg); }
+  #login .box{ width:360px; background:#fff; border:1px solid var(--line); border-radius:16px; padding:32px; box-shadow:0 12px 40px rgba(15,23,42,.08); }
+  #login h1{ font-size:20px; margin:0 0 4px; } #login p{ color:var(--sub); margin:0 0 18px; font-size:13px; }
   #login .err{ color:var(--err); font-size:13px; min-height:18px; margin-top:10px; }
 
+  /* 骨架：深色侧边栏 + 右侧内容 */
   #app{ display:none; }
-  header{ height:54px; background:#fff; border-bottom:1px solid var(--line); display:flex; align-items:center;
-          padding:0 20px; position:sticky; top:0; z-index:10; }
-  header .logo{ font-weight:600; } header .logo b{ color:var(--pri); }
-  header .right{ margin-left:auto; color:var(--sub); display:flex; align-items:center; gap:14px; }
-  .layout{ display:flex; min-height:calc(100vh - 54px); }
-  nav{ width:180px; background:#fff; border-right:1px solid var(--line); padding:12px 0; flex:0 0 auto; }
-  nav a{ display:block; padding:10px 20px; color:var(--ink); font-size:14px; border-left:3px solid transparent; }
-  nav a:hover{ background:#f7f8fa; } nav a.on{ color:var(--pri); border-left-color:var(--pri); background:#f0f5ff; font-weight:500; }
-  main{ flex:1; padding:24px 28px; max-width:1040px; }
-  h2{ font-size:18px; margin:0 0 4px; } .desc{ color:var(--sub); margin:0 0 20px; font-size:13px; }
-  .head{ display:flex; align-items:center; margin-bottom:20px; } .head .desc{ margin:0; } .head .btn{ margin-left:auto; }
+  .layout{ display:flex; min-height:100vh; }
+  nav{ width:224px; flex:0 0 224px; background:var(--nav); color:var(--nav-ink); position:sticky; top:0; height:100vh;
+       overflow-y:auto; padding:0 10px 20px; }
+  nav .brand{ display:flex; align-items:center; gap:10px; padding:18px 10px 14px; color:#fff; font-weight:600; font-size:15px; }
+  nav .brand .mark{ width:28px; height:28px; border-radius:8px; background:linear-gradient(135deg,#6366f1,#3b82f6);
+       display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; }
+  nav .brand small{ display:block; color:var(--nav-label); font-weight:400; font-size:11px; margin-top:-2px; }
+  nav .nlabel{ font-size:11px; letter-spacing:.06em; color:var(--nav-label); padding:16px 12px 6px; font-weight:600; }
+  nav a{ display:flex; align-items:center; gap:10px; padding:7px 12px; margin:1px 0; color:var(--nav-ink); font-size:13.5px;
+         border-radius:8px; transition:background .12s,color .12s; }
+  nav a:hover{ background:var(--nav-2); color:#e2e8f0; text-decoration:none; }
+  nav a.on{ background:rgba(99,102,241,.18); color:#fff; font-weight:500; }
+  nav a.on .ic{ color:#a5b4fc; }
+  nav .ic{ width:16px; height:16px; flex:0 0 16px; color:#64748b; }
+  nav .badge{ margin-left:auto; background:#ef4444; color:#fff; font-size:11px; border-radius:10px; padding:0 7px; line-height:18px; }
+  .main{ flex:1; min-width:0; display:flex; flex-direction:column; }
+  header{ height:56px; background:rgba(255,255,255,.85); backdrop-filter:saturate(180%) blur(8px); border-bottom:1px solid var(--line);
+          display:flex; align-items:center; padding:0 28px; position:sticky; top:0; z-index:10; }
+  header .crumb{ color:var(--sub); font-size:13px; } header .crumb b{ color:var(--ink); font-weight:600; }
+  header .right{ margin-left:auto; color:var(--sub); display:flex; align-items:center; gap:14px; font-size:13px; }
+  main{ padding:24px 28px 48px; max-width:1240px; width:100%; }
+  h2{ font-size:20px; margin:0 0 4px; letter-spacing:-.01em; } .desc{ color:var(--sub); margin:0 0 20px; font-size:13px; }
+  .head{ display:flex; align-items:flex-start; gap:16px; margin-bottom:20px; } .head .desc{ margin:0; } .head .btn{ margin-left:auto; white-space:nowrap; }
 
-  .card{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:16px; }
-  .grid{ display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); }
-  .stat{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px; }
-  .stat .k{ color:var(--sub); font-size:13px; } .stat .v{ font-size:26px; font-weight:600; margin-top:4px; }
+  /* 卡片与统计 */
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:18px 20px; margin-bottom:16px; box-shadow:var(--shadow); }
+  .card-title{ display:flex; align-items:center; gap:8px; font-weight:600; margin-bottom:12px; }
+  .card-title .muted{ font-weight:400; font-size:12px; } .card-title .btn{ margin-left:auto; }
+  .grid{ display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); }
+  .stat{ background:#fff; border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; box-shadow:var(--shadow); }
+  .stat .k{ color:var(--sub); font-size:12.5px; } .stat .v{ font-size:28px; font-weight:650; margin-top:2px; letter-spacing:-.02em; }
+  .stat .s{ color:var(--sub2); font-size:12px; }
+  .stat.alert{ border-color:#fecaca; background:linear-gradient(180deg,#fff,var(--err-soft)); } .stat.alert .v{ color:var(--err); }
+  .stat.warn .v{ color:var(--warn); } .stat.good .v{ color:var(--ok); }
   .chips{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:18px; }
-  .chip{ padding:5px 12px; border-radius:20px; font-size:13px; border:1px solid var(--line); background:#fff;
+  .chip{ padding:3px 10px; border-radius:20px; font-size:12.5px; border:1px solid var(--line); background:#fff;
          white-space:nowrap; display:inline-flex; align-items:center; }
-  .chip .dot{ display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
-  .dot.g{ background:var(--ok); } .dot.r{ background:var(--err); } .dot.y{ background:var(--warn); }
+  .chip .dot{ display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; }
+  .dot.g{ background:var(--ok); } .dot.r{ background:var(--err); } .dot.y{ background:var(--warn); } .dot:not(.g):not(.r):not(.y){ background:#cbd5e1; }
 
   .cards{ display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); }
-  .appcard{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
-  .appcard h3{ margin:0 0 2px; font-size:16px; display:flex; align-items:center; gap:8px; }
-  .appcard .meta{ color:var(--sub); font-size:13px; margin:8px 0; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .appcard{ background:#fff; border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; box-shadow:var(--shadow); }
+  .appcard h3{ margin:0 0 2px; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .appcard .meta{ color:var(--sub); font-size:13px; margin:8px 0; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
   .appcard .acts{ display:flex; gap:8px; margin-top:12px; }
-  .tag{ display:inline-block; font-size:12px; padding:1px 8px; border-radius:10px; background:#f0f5ff; color:var(--pri); }
-  .tag.off{ background:#f2f3f5; color:var(--sub); }
+  .tag{ display:inline-block; font-size:12px; padding:1px 8px; border-radius:6px; background:var(--pri-soft); color:var(--pri); }
+  .tag.off{ background:#f3f4f6; color:var(--sub); }
 
-  table{ width:100%; border-collapse:collapse; font-size:13px; }
-  th,td{ text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); }
-  th{ color:var(--sub); font-weight:500; background:#fafbfc; }
+  /* 严重度 / 状态徽章 */
+  .sev{ display:inline-block; font-size:11.5px; font-weight:600; padding:1px 8px; border-radius:6px; white-space:nowrap; }
+  .sev.critical{ background:#7f1d1d; color:#fff; } .sev.high{ background:var(--err-soft); color:var(--err); }
+  .sev.medium,.sev.moderate{ background:var(--warn-soft); color:var(--warn); } .sev.low{ background:#f3f4f6; color:var(--sub); }
+  .sev.kev{ background:#dc2626; color:#fff; }
+  .st{ display:inline-block; font-size:12px; padding:1px 8px; border-radius:6px; background:#f3f4f6; color:var(--sub); white-space:nowrap; }
+  .st.new{ background:var(--pri-soft); color:var(--pri); } .st.triaging{ background:var(--warn-soft); color:var(--warn); }
+  .st.affected{ background:var(--err-soft); color:var(--err); } .st.fixed{ background:var(--ok-soft); color:var(--ok); }
+  .bar{ height:6px; background:#f1f5f9; border-radius:4px; overflow:hidden; min-width:50px; }
+  .bar i{ display:block; height:100%; background:linear-gradient(90deg,#f59e0b,#dc2626); }
+
+  /* 表格 */
+  table{ width:100%; border-collapse:separate; border-spacing:0; font-size:13px; }
+  th,td{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line2); vertical-align:middle; }
+  th{ color:var(--sub); font-weight:500; font-size:12.5px; background:#fafbfc; position:sticky; top:56px; z-index:1; }
+  thead th:first-child{ border-top-left-radius:8px; } thead th:last-child{ border-top-right-radius:8px; }
+  tbody tr:hover td{ background:#fafbff; } tbody tr:last-child td{ border-bottom:0; }
   td.num,th.num{ text-align:right; font-variant-numeric:tabular-nums; }
-  .muted{ color:var(--sub); } .mono{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
-  .tabs{ display:flex; gap:6px; margin-bottom:14px; }
-  .tabs button{ background:#fff; border:1px solid var(--line); border-radius:6px; padding:6px 14px; color:var(--ink); }
-  .tabs button.on{ background:var(--pri); color:#fff; border-color:var(--pri); }
+  .muted{ color:var(--sub); } .mono{ font-family:var(--mono); font-size:12px; }
+  .clip{ max-width:0; width:100%; } .clip > *{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tabs{ display:inline-flex; gap:2px; margin-bottom:14px; background:#eef0f4; padding:3px; border-radius:9px; }
+  .tabs button{ background:transparent; border:0; border-radius:7px; padding:5px 14px; color:var(--sub); }
+  .tabs button.on{ background:#fff; color:var(--ink); box-shadow:var(--shadow); font-weight:500; }
+  .toolbar{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .toolbar input,.toolbar select{ width:auto; min-width:120px; padding:6px 10px; }
+  .toolbar .grow{ flex:1; min-width:200px; }
+  .pager{ display:flex; align-items:center; gap:10px; justify-content:flex-end; margin-top:12px; color:var(--sub); font-size:13px; }
   .row{ display:flex; gap:14px; } .row>div{ flex:1; }
   .save-bar{ margin-top:18px; display:flex; align-items:center; gap:12px; }
   .hint{ color:var(--sub); font-size:12px; margin-top:4px; }
-  .empty{ color:var(--sub); padding:30px; text-align:center; }
-  .bubble{ padding:8px 12px; border-radius:8px; margin:6px 0; max-width:80%; white-space:pre-wrap; word-break:break-word; }
-  .bubble.user{ background:#e8f0ff; } .bubble.assistant{ background:#f2f3f5; }
+  .empty{ color:var(--sub); padding:36px; text-align:center; }
+  .notice{ border:1px solid #fde68a; background:var(--warn-soft); color:#92400e; border-radius:10px; padding:10px 14px; font-size:13px; margin-bottom:16px; }
+  .bubble{ padding:8px 12px; border-radius:10px; margin:6px 0; max-width:80%; white-space:pre-wrap; word-break:break-word; }
+  .bubble.user{ background:var(--pri-soft); } .bubble.assistant{ background:#f3f4f6; }
   .bubble .who{ font-size:11px; color:var(--sub); margin-bottom:2px; }
+  .ev{ display:flex; gap:12px; padding:10px 0; border-bottom:1px solid var(--line2); }
+  .ev:last-child{ border-bottom:0; }
+  .ev .t{ flex:0 0 64px; color:var(--sub); font-size:12px; font-variant-numeric:tabular-nums; padding-top:2px; }
+  .ev .b{ flex:1; min-width:0; }
+  .ev .txt{ white-space:pre-wrap; word-break:break-word; margin-top:4px; }
+  .ev pre, pre.box{ background:#f8fafc; border:1px solid var(--line2); border-radius:8px; padding:8px 10px; margin:6px 0 0; white-space:pre-wrap;
+    word-break:break-all; font-size:12px; max-height:360px; overflow:auto; font-family:var(--mono); }
+  .ev details summary{ cursor:pointer; color:var(--sub); font-size:12px; margin-top:4px; }
+  .etype{ font-family:var(--mono); font-size:11.5px; padding:1px 8px; border-radius:6px; background:#f3f4f6; color:var(--sub); margin-right:8px; }
+  .etype.tool{ background:#fff7ed; color:#c2410c; } .etype.asst{ background:var(--pri-soft); color:var(--pri); }
   .toolpick{ display:grid; gap:8px; grid-template-columns:1fr 1fr; }
   .toolpick label{ display:flex; gap:8px; align-items:flex-start; margin:0; padding:8px 10px; border:1px solid var(--line);
-        border-radius:8px; cursor:pointer; color:var(--ink); font-size:13px; }
+        border-radius:8px; cursor:pointer; color:var(--ink); font-size:13px; font-weight:400; }
+  .toolpick label:hover{ border-color:#c7d2fe; background:#fafbff; }
   .toolpick input{ width:auto; margin-top:3px; }
-  .toolpick .tn{ font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .toolpick .tn{ font-family:var(--mono); font-size:12px; }
   .toolpick .td{ color:var(--sub); font-size:12px; }
+  .kv{ display:grid; grid-template-columns:120px 1fr; gap:6px 14px; font-size:13px; } .kv dt{ color:var(--sub); } .kv dd{ margin:0; }
 
-  #modal{ position:fixed; inset:0; background:rgba(0,0,0,.35); display:none; align-items:flex-start;
-          justify-content:center; z-index:40; overflow:auto; padding:40px 16px; }
-  #modal .dlg{ width:640px; max-width:100%; background:#fff; border-radius:12px; padding:24px 26px; box-shadow:0 12px 40px rgba(0,0,0,.18); }
+  #modal{ position:fixed; inset:0; background:rgba(15,23,42,.45); display:none; align-items:flex-start;
+          justify-content:center; z-index:40; overflow:auto; padding:48px 16px; }
+  #modal .dlg{ width:680px; max-width:100%; background:#fff; border-radius:16px; padding:24px 26px; box-shadow:0 20px 50px rgba(15,23,42,.25); }
   #modal h3{ margin:0 0 4px; font-size:17px; }
-  #toast{ position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#1f2329; color:#fff;
-          padding:10px 18px; border-radius:8px; font-size:13px; opacity:0; transition:.25s; pointer-events:none; z-index:60; }
+  #toast{ position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#111827; color:#fff;
+          padding:10px 18px; border-radius:10px; font-size:13px; opacity:0; transition:.25s; pointer-events:none; z-index:60; box-shadow:0 8px 24px rgba(0,0,0,.2); }
   #toast.show{ opacity:1; }
+  @media (max-width:860px){ nav{ width:64px; flex-basis:64px; padding:0 6px; } nav .nlabel, nav a span.t, nav .brand .bt{ display:none; }
+    nav a{ justify-content:center; } main{ padding:16px; } header{ padding:0 16px; } .row{ flex-direction:column; } .toolpick{ grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -103,26 +169,44 @@
 </div>
 
 <div id="app">
-  <header>
-    <div class="logo">数字员工 <b>平台</b> 控制台</div>
-    <div class="right"><span id="who"></span><button class="btn ghost" onclick="doLogout()">退出</button></div>
-  </header>
   <div class="layout">
     <nav>
-      <a data-page="overview" class="on">概览</a>
-      <a data-page="apps">应用</a>
-      <a data-page="providers">AI 供应商</a>
-      <a data-page="skills">技能</a>
-      <a data-page="mcp">MCP 工具</a>
-      <a data-page="schedules">定时任务</a>
-      <a data-page="memory">记忆系统</a>
-      <a data-page="usage">Token 用量</a>
-      <a data-page="obs">可观测(日志)</a>
-      <a data-page="ssh">SSH 运维</a>
-      <a data-page="k8s">K8s 运维</a>
-      <a data-page="account">账号</a>
+      <div class="brand"><div class="mark">AI</div><div class="bt">数字员工平台<small>harness 控制台</small></div></div>
+      <a data-page="overview" data-ic="home" class="on"><span class="t">概览</span></a>
+      <div class="nlabel">数字员工</div>
+      <a data-page="apps" data-ic="bot"><span class="t">应用</span></a>
+      <a data-page="providers" data-ic="cpu"><span class="t">AI 供应商</span></a>
+      <a data-page="skills" data-ic="book"><span class="t">技能</span></a>
+      <a data-page="mcp" data-ic="plug"><span class="t">MCP 工具</span></a>
+      <a data-page="schedules" data-ic="clock"><span class="t">定时任务</span></a>
+      <a data-page="hooks" data-ic="plug"><span class="t">Webhook 触发</span></a>
+      <div class="nlabel">安全</div>
+      <a data-page="security" data-ic="shield"><span class="t">安全概览</span></a>
+      <a data-page="vulns" data-ic="shield"><span class="t">漏洞台账</span><span class="badge" id="nav-vuln-badge" style="display:none"></span></a>
+      <a data-page="intel" data-ic="radar"><span class="t">情报源</span></a>
+      <div class="nlabel">工程</div>
+      <a data-page="code" data-ic="branch"><span class="t">代码仓库</span></a>
+      <a data-page="tasks" data-ic="activity"><span class="t">任务中心</span></a>
+      <a data-page="patrols" data-ic="activity"><span class="t">持续巡检</span></a>
+      <a data-page="runs" data-ic="activity"><span class="t">运行记录</span></a>
+      <div class="nlabel">运维集成</div>
+      <a data-page="connections" data-ic="key"><span class="t">连接凭证</span></a>
+      <a data-page="obs" data-ic="chart"><span class="t">可观测(日志)</span></a>
+      <a data-page="ssh" data-ic="terminal"><span class="t">SSH 运维</span></a>
+      <a data-page="k8s" data-ic="boxes"><span class="t">K8s 运维</span></a>
+      <div class="nlabel">数据</div>
+      <a data-page="memory" data-ic="db"><span class="t">记忆系统</span></a>
+      <a data-page="usage" data-ic="bars"><span class="t">Token 用量</span></a>
+      <div class="nlabel">系统</div>
+      <a data-page="account" data-ic="user"><span class="t">账号</span></a>
     </nav>
-    <main id="content"></main>
+    <div class="main">
+      <header>
+        <div class="crumb" id="crumb"></div>
+        <div class="right"><span id="who"></span><button class="btn ghost sm" onclick="doLogout()">退出</button></div>
+      </header>
+      <main id="content"></main>
+    </div>
   </div>
 </div>
 
@@ -157,19 +241,138 @@ async function doLogin(){
   catch(e){ $('#lg-err').textContent=e.message; }
 }
 async function doLogout(){ try{ await api('POST','/api/logout'); }catch(e){} showLogin(); }
-function enterApp(username){ $('#login').style.display='none'; $('#app').style.display='block'; $('#who').textContent='👤 '+username; go('overview'); }
+function enterApp(username){ $('#login').style.display='none'; $('#app').style.display='block'; $('#who').textContent=username; go(location.hash.slice(1)||'overview'); refreshNavBadge();
+  api('GET','/api/me').then(m=>{ if(m.stale) showStale(); }).catch(()=>{}); }
 $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
-const PAGES = { overview, apps, providers, skills, mcp, schedules, memory, usage, obs, ssh, k8s, account };
-function go(page){ document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on', a.dataset.page===page)); PAGES[page](); }
-document.querySelectorAll('nav a').forEach(a=> a.onclick=()=>go(a.dataset.page));
+const PAGES = { patrols: patrolsPage, tasks: tasksPage, overview, apps, providers, skills, mcp, code: codePage, schedules, memory, runs: runsPage, usage, obs, ssh, k8s, account,
+  security: securityPage, vulns: vulnsPage, intel: intelPage, connections: connectionsPage, hooks: hooksPage };
+function go(page){
+  if(!PAGES[page]) page='overview';
+  let group='';
+  document.querySelectorAll('nav > *').forEach(el=>{
+    if(el.classList.contains('nlabel')) group=el.textContent;
+    if(el.tagName==='A'){ const on=el.dataset.page===page; el.classList.toggle('on',on);
+      if(on) $('#crumb').innerHTML=(group?esc(group)+' / ':'')+'<b>'+esc(el.querySelector('.t').textContent)+'</b>'; }
+  });
+  if(location.hash.slice(1)!==page) history.replaceState(null,'','#'+page);
+  PAGES[page]();
+}
+/* 菜单图标（线框，24 视框） */
+const ICONS={
+  home:'<path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
+  bot:'<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9 17h6"/>',
+  cpu:'<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+  book:'<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 19V5M8 7h7"/>',
+  plug:'<path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0zM12 17v5"/>',
+  clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  shield:'<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="M12 8v5M12 16h.01"/>',
+  radar:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><path d="M12 12 18 6"/>',
+  branch:'<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-11 7"/>',
+  activity:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  key:'<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3M14 9l2 2"/>',
+  chart:'<path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-6"/>',
+  terminal:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+  boxes:'<path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/>',
+  db:'<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+  bars:'<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  user:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/>',
+};
+document.querySelectorAll('nav a').forEach(a=>{
+  a.insertAdjacentHTML('afterbegin',`<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[a.dataset.ic]||''}</svg>`);
+  a.onclick=()=>go(a.dataset.page);
+});
+async function refreshNavBadge(){
+  try{ const {total}=await api('GET','/api/vulns?kev=1&status=new&limit=1'); const b=$('#nav-vuln-badge');
+    b.textContent=total; b.style.display=total?'inline-block':'none'; b.title='在野利用(KEV)且未研判'; }catch(e){}
+}
+
+/* ---------- 持久任务中心 ---------- */
+async function patrolsPage(){
+  $('#content').innerHTML='<h2>持续巡检</h2><p class="desc">feishu-agent 自主读取真实环境，持续记录问题。新问题、恢复与采集失败才通知；没有汇报群时仍保存结果。</p><div class="toolbar"><button class="btn" onclick="newPatrol()">配置巡检</button><button class="btn ghost" onclick="patrolRepositories()">GitOps 仓库连接</button><button class="btn ghost" onclick="patrolProjectTokens()">GitLab 项目 API 凭据</button><button class="btn ghost" onclick="patrolsPage()">刷新</button></div><div id="patrol-body">加载中…</div>';
+  try{
+    const r=await api('GET','/api/patrols');
+    $('#patrol-body').innerHTML=`<div class="card"><b>运行状态</b><p>飞书守护：${r.feishu.supervisor_running?'运行':'未运行'} · 定时调度：${r.scheduler.running?'运行':'未运行'}</p>${(r.feishu.apps||[]).map(a=>`<p>应用 ${a.app_id}：${esc(a.state)}${a.connected?' · 已连接':''}${a.last_error?' · '+esc(a.last_error):''}</p>`).join('')}<details><summary>巡检与通知状态</summary><pre>${esc(JSON.stringify(r.runtime,null,2))}</pre></details></div>`+(r.monitors.length?`<table><thead><tr><th>巡检</th><th>范围</th><th>周期</th><th>汇报目标</th><th>操作</th></tr></thead><tbody>${r.monitors.map(m=>`<tr><td>${esc(m.name)}<div class="muted">${m.enabled?'已启用':'已暂停'}</div></td><td>${esc(m.cluster||'—')}<div>${esc((m.git_projects||[]).join(', '))}</div><div>${esc((m.log_targets||[]).map(t=>t.org+'/'+t.stream).join(', '))}</div></td><td>${m.interval_seconds} 秒</td><td>${esc(m.chat_id||'未绑定，结果仅保存本地')}</td><td><button class="btn sm ghost" onclick="patrolDetail('${m.id}')">报告 / 问题</button> <button class="btn sm" onclick="patrolNow('${m.id}')">立即扫描</button> <button class="btn sm ghost" onclick="patrolEdit('${m.id}')">编辑范围</button> <button class="btn sm ghost" onclick="patrolBind('${m.id}',${m.app_id})">绑定会话</button> <button class="btn sm ghost" onclick="patrolToggle('${m.id}',${!m.enabled})">${m.enabled?'暂停':'启用'}</button></td></tr>`).join('')}</tbody></table>`:'<div class="empty">尚未配置巡检。先给应用授权资源，再添加巡检。</div>');
+  }catch(e){$('#patrol-body').textContent=e.message;}
+}
+async function patrolDetail(id){
+  const r=await api('GET','/api/patrols/'+id);
+  openModal(`<h2>${esc(r.monitor.name)}</h2><h3>问题台账</h3>${r.issues.length?r.issues.map(i=>`<div class="card"><b>${esc(i.title||i.key)}</b><p>${esc(i.severity||'')} · ${i.active?'待处理':'已恢复'}</p><p>${esc(i.detail||'')}</p><div class="mono">${esc(typeof i.resource==='string'?i.resource:JSON.stringify(i.resource||''))}</div></div>`).join(''):'<p>尚无问题记录；请检查采集是否已经成功。</p>'}<h3>最近扫描</h3>${r.scans.map(s=>`<details><summary>${esc(s.id)} · ${dt(s.created)}</summary><pre style="white-space:pre-wrap;max-height:440px;overflow:auto">${esc(JSON.stringify(s.snapshot||s,null,2))}</pre></details>`).join('')||'<p>尚未扫描</p>'}<div class="save-bar"><button class="btn ghost" onclick="patrolDetail('${id}')">刷新</button><button class="btn" onclick="closeModal()">关闭</button></div>`);
+}
+async function patrolNow(id){try{await api('POST','/api/patrols/'+id+'/scan',{});toast('已排队，由应用执行');}catch(e){toast(e.message);}}
+async function patrolToggle(id,enabled){try{await api('PATCH','/api/patrols/'+id,{enabled});await patrolsPage();}catch(e){toast(e.message);}}
+async function patrolEdit(id){
+  try{
+    const {monitor:m}=await api('GET','/api/patrols/'+id);
+    openModal(`<h2>编辑巡检范围</h2><label>集群</label><input id="patrol-edit-cluster" value="${esc(m.cluster||'')}"><label>GitLab 项目（逗号分隔）</label><input id="patrol-edit-projects" value="${esc((m.git_projects||[]).join(', '))}"><label>日志目标（每行 org/stream）</label><textarea id="patrol-edit-logs">${esc((m.log_targets||[]).map(t=>t.org+'/'+t.stream).join('\n'))}</textarea><label>间隔秒数</label><input id="patrol-edit-interval" type="number" min="60" value="${m.interval_seconds}"><div class="save-bar"><button class="btn" onclick="savePatrolEdit('${id}')">保存并重新扫描</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+  }catch(e){toast(e.message);}
+}
+async function savePatrolEdit(id){
+  try{
+    const log_targets=$('#patrol-edit-logs').value.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>{const at=x.indexOf('/');if(at<=0||at===x.length-1)throw new Error('日志目标请按 org/stream 每行填写');return {org:x.slice(0,at),stream:x.slice(at+1)};});
+    await api('PATCH','/api/patrols/'+id,{cluster:$('#patrol-edit-cluster').value.trim()||null,git_projects:$('#patrol-edit-projects').value.split(',').map(x=>x.trim()).filter(Boolean),log_targets,interval_seconds:Number($('#patrol-edit-interval').value)});
+    closeModal();await patrolsPage();
+  }catch(e){toast(e.message);}
+}
+async function patrolBind(id,appId){
+  const r=await api('GET','/api/feishu/chats/'+appId);
+  const observed=r.observed||[];
+  openModal(`<h2>绑定汇报会话</h2><p class="desc">绑定后，应用会重新扫描并发送首次报告。请选择目标群或单聊；最近交互记录只证明机器人收到过消息，不保证当前仍在群内。</p>${r.error?`<p class="hint">${esc(r.error)}。在目标群 @机器人发送“我的身份”，即可留下 chat_id 和 open_id 供后台选择。</p>`:''}<label>可读取的群</label><select id="patrol-chat-select" onchange="$('#patrol-chat').value=this.value"><option value="">选择群</option>${r.chats.map(c=>`<option value="${esc(c.chat_id)}">${esc(c.name)} · ${esc(c.chat_id)}</option>`).join('')}</select><label>最近交互的会话</label><select id="patrol-observed-select" onchange="$('#patrol-chat').value=this.value"><option value="">选择会话</option>${observed.map(c=>`<option value="${esc(c.chat_id)}">${c.chat_type==='group'?'群':'单聊'} · ${esc(c.chat_id)}</option>`).join('')}</select>${observed.length?`<details><summary>最近交互的发言人 open_id（配置应用审批人时使用）</summary><pre>${esc(observed.map(c=>c.chat_id+'：'+(c.sender_open_ids||[]).join(', ')).join('\n'))}</pre></details>`:''}<label>chat_id</label><input id="patrol-chat" placeholder="oc_..."><div class="save-bar"><button class="btn" onclick="savePatrolChat('${id}')">保存汇报目标</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+}
+async function savePatrolChat(id){try{const chat_id=$('#patrol-chat').value.trim();if(!chat_id)throw new Error('请输入目标会话');await api('PATCH','/api/patrols/'+id,{chat_id});closeModal();await patrolsPage();}catch(e){toast(e.message);}}
+async function newPatrol(){
+  const r=await api('GET','/api/apps');
+  openModal(`<h2>配置持续巡检</h2><label>应用</label><select id="patrol-app">${r.apps.filter(a=>a.enabled).map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select><label>名称</label><input id="patrol-name" value="环境巡检"><label>已授权集群名称</label><input id="patrol-cluster"><label>已授权 GitLab 项目（逗号分隔）</label><input id="patrol-projects"><label>日志组织</label><input id="patrol-log-org" value="default"><label>已授权日志流（逗号分隔）</label><input id="patrol-log-streams" placeholder="k8s_upmore_api, k8s_argocd"><label>间隔秒数（至少 60）</label><input id="patrol-interval" type="number" value="300" min="60"><p class="desc">集群使用应用已配置的 namespace 权限。首次可不指定群，先在本页查看真实扫描结果。</p><div class="save-bar"><button class="btn" onclick="saveNewPatrol()">启用巡检</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+}
+async function saveNewPatrol(){try{const org=$('#patrol-log-org').value.trim(), streams=$('#patrol-log-streams').value.split(',').map(x=>x.trim()).filter(Boolean);await api('POST','/api/patrols',{app_id:Number($('#patrol-app').value),name:$('#patrol-name').value,cluster:$('#patrol-cluster').value.trim()||null,git_projects:$('#patrol-projects').value.split(',').map(x=>x.trim()).filter(Boolean),log_targets:streams.map(stream=>({org,stream})),interval_seconds:Number($('#patrol-interval').value)});closeModal();await patrolsPage();}catch(e){toast(e.message);}}
+async function patrolRepositories(){
+  try{
+    const r=await api('GET','/api/patrols/repositories');
+    openModal(`<h2>GitOps 仓库连接</h2><p class="desc">每个项目配置只读 SSH 地址和分支；使用服务进程现有 SSH 身份及 known_hosts。不要在 URL 中填口令。</p><textarea id="patrol-repositories" style="min-height:220px">${esc(JSON.stringify(r.repositories,null,2))}</textarea><div class="save-bar"><button class="btn" onclick="savePatrolRepositories()">保存并重新扫描</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+  }catch(e){toast(e.message);}
+}
+async function savePatrolRepositories(){
+  try{const repositories=JSON.parse($('#patrol-repositories').value);await api('PUT','/api/patrols/repositories',{repositories});closeModal();await patrolsPage();}catch(e){toast(e.message);}
+}
+async function patrolProjectTokens(){
+  try{
+    const r=await api('GET','/api/connections/gitlab-project-tokens');
+    openModal(`<h2>GitLab 项目 API 凭据</h2><p class="desc">每个项目单独使用项目访问令牌。仅巡检可用 Reporter + read_api；若还需审批后提修复 MR，可用 Developer + api。此处只用于只读项目与流水线查询；保存后令牌不再回显。</p><label>项目</label><select id="patrol-token-project">${r.projects.map(p=>`<option value="${esc(p.project)}">${esc(p.project)} · ${p.token_set?'已配置':'未配置'}</option>`).join('')}</select><label>项目访问令牌</label><input id="patrol-token-value" type="password" autocomplete="off"><div class="save-bar"><button class="btn" onclick="savePatrolProjectToken()">保存并重新扫描</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+  }catch(e){toast(e.message);}
+}
+async function savePatrolProjectToken(){
+  try{await api('PUT','/api/connections/gitlab-project-tokens',{project:$('#patrol-token-project').value,token:$('#patrol-token-value').value.trim()});closeModal();await patrolsPage();}catch(e){toast(e.message);}
+}
+
+const TASK_ST={queued:'排队中',running:'执行中',waiting_approval:'等待审批',waiting_input:'等待补充',needs_attention:'待核对',completed:'已交付',failed:'失败',cancelling:'取消中',cancelled:'已取消'};
+async function tasksPage(){
+  const c=$('#content');
+  c.innerHTML='<h2>任务中心</h2><p class="desc">集群排查、问题日志和漏洞修复共享持久任务；进度和结果通过飞书送达。</p><div class="toolbar"><button class="btn" onclick="newTask()">新建任务</button><button class="btn ghost" onclick="tasksPage()">刷新</button></div><div id="tasks-body">加载中…</div>';
+  const r=await api('GET','/api/tasks');
+  if(!$('#tasks-body')) return;
+  $('#tasks-body').innerHTML='<div class="hint">在线 worker：'+r.runtime.workers+'</div>'+(r.tasks.length?`<table><thead><tr><th>任务</th><th>工作流</th><th>状态</th><th>进度</th><th>更新时间</th></tr></thead><tbody>${r.tasks.map(t=>`<tr><td><a href="#tasks" onclick="taskDetail('${t.id}');return false">${esc(t.instruction.slice(0,80))}</a><div class="mono muted">${t.id}</div></td><td>${esc(r.workflows[t.workflow]||t.workflow)}</td><td>${esc(TASK_ST[t.status]||t.status)}</td><td>${esc(t.progress||'—')}</td><td>${dt(t.updated)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">还没有任务。在飞书 @ 助手，或点击新建任务。</div>');
+}
+async function newTask(){
+  const r=await api('GET','/api/apps');
+  openModal(`<h2>新建任务</h2><label>执行应用</label><select id="task-app">${r.apps.filter(a=>a.enabled).map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select><label>飞书 chat_id（结果发送到此群/单聊）</label><input id="task-chat" placeholder="oc_xxx"><label>工作流</label><select id="task-flow"><option value="auto">自动选择</option><option value="cluster">集群排障</option><option value="logs">问题日志</option><option value="vulnerability">漏洞分析与修复</option><option value="development">研发修复</option></select><label>任务目标与验收要求</label><textarea id="task-input" placeholder="排查 upmore-api 近 15 分钟的错误日志，给出根因证据和修复建议"></textarea><div class="save-bar"><button class="btn" onclick="submitTask()">提交</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+}
+async function submitTask(){
+  try{ const r=await api('POST','/api/tasks',{app_id:Number($('#task-app').value),chat_id:$('#task-chat').value.trim(),workflow:$('#task-flow').value,instruction:$('#task-input').value,request_id:window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`}); closeModal(); toast('任务已保存'); await tasksPage(); await taskDetail(r.task.id); }catch(e){toast(e.message);}
+}
+async function taskDetail(id){
+  const t=await api('GET','/api/tasks/'+id);
+  openModal(`<h2>任务详情</h2><div class="mono">${t.id}</div><p>${esc(t.instruction)}</p><p>状态：${esc(TASK_ST[t.status]||t.status)} · 模型轮数 ${t.steps} · token ${t.tokens}</p><p>${esc(t.progress||'')}</p><pre style="white-space:pre-wrap">${esc([t.result,t.error].filter(Boolean).join('\n\n')||'执行中，稍后刷新查看进度')}</pre><h3>执行证据</h3><pre style="white-space:pre-wrap;max-height:300px;overflow:auto">${esc(JSON.stringify(t.evidence,null,2))}</pre><h3>工具与审批</h3><pre style="white-space:pre-wrap;max-height:200px;overflow:auto">${esc(JSON.stringify(t.actions,null,2))}</pre><div class="save-bar"><button class="btn ghost" onclick="taskDetail('${id}')">刷新</button>${['failed','needs_attention','waiting_input'].includes(t.status)?`<button class="btn" onclick="resumeTask('${id}')">继续任务</button>`:''}${!['completed','cancelled','failed'].includes(t.status)?`<button class="btn danger" onclick="cancelTask('${id}')">取消任务</button>`:''}<button class="btn ghost" onclick="closeModal()">关闭</button></div>`);
+}
+async function cancelTask(id){try{await api('POST','/api/tasks/'+id+'/cancel',{});toast('已请求取消');await taskDetail(id);}catch(e){toast(e.message);}}
+async function resumeTask(id){const instruction=prompt('可补充任务信息；未决变更必须先核对，不能直接重试。');if(instruction===null)return;try{await api('POST','/api/tasks/'+id+'/resume',{instruction});toast('已排队');await taskDetail(id);}catch(e){toast(e.message);}}
 
 /* ---------- 概览 ---------- */
 async function overview(){
   const c=$('#content'); c.innerHTML='<h2>概览</h2><p class="desc">加载中…</p>';
   const o=await api('GET','/api/overview');
   const chip=(ok,t,y)=>`<span class="chip"><span class="dot ${ok?'g':(y?'y':'r')}"></span>${t}</span>`;
+  const v=o.vulns||{}, is=o.intel_sources||{};
   const appsHtml = o.apps.length ? o.apps.map(a=>{
     const ready = a.feishu_set && a.provider_ready && a.enabled;
     return `<div class="appcard">
@@ -178,13 +381,28 @@ async function overview(){
         ${chip(a.running, a.running?'长连接在线':'长连接离线')}
         ${chip(a.provider_ready, 'AI '+(a.provider?esc(a.provider):'未绑定'), !a.provider_ready)}
         ${chip(a.feishu_set, '飞书凭证 '+(a.feishu_set?'已配':'缺失'), !a.feishu_set)}
-        <span class="chip">工具 ${a.tools_count}</span>
+        <span class="chip">工具 ${a.tools_count}</span><span class="chip">技能 ${a.skills_count}</span>
       </div>
-      ${ready?'':'<div class="hint" style="color:var(--warn)">⚠ 需配齐：飞书凭证 + 绑定可用 AI + 启用，长连接才会上线（改完点「应用」页里的重启服务）。</div>'}
+      ${ready?'':'<div class="hint" style="color:var(--warn)">需配齐：飞书凭证 + 绑定可用 AI + 启用，长连接才会上线（改完到「应用」页点重启服务）。</div>'}
     </div>`;
   }).join('') : '<div class="empty">还没有应用。去「应用」页新建一个数字员工。</div>';
+  const top=(o.top_vulns||[]).map(x=>`<tr style="cursor:pointer" onclick="go('vulns');setTimeout(()=>viewVuln('${esc(x.cve)}'),300)">
+      <td class="mono">${esc(x.cve)}</td><td class="clip"><div>${esc(x.title||'')}</div></td>
+      <td>${sevBadge(x.severity)}</td><td><span class="st ${esc(x.status)}">${esc(VULN_ST[x.status]||x.status)}</span></td></tr>`).join('');
   c.innerHTML=`
-    <div class="head"><div><h2>概览</h2><p class="desc">各数字员工(应用)的运行状态与平台累计用量。</p></div></div>
+    <div class="head"><div><h2>概览</h2><p class="desc">数字员工运行状态、安全态势与平台用量。</p></div></div>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="stat ${v.kev?'alert':''}"><div class="k">在野利用（KEV）</div><div class="v">${fmt(v.kev)}</div><div class="s">台账中被 CISA 确认在野利用的</div></div>
+      <div class="stat warn"><div class="k">待研判</div><div class="v">${fmt(v.triage)}</div><div class="s">新发现 + 研判中</div></div>
+      <div class="stat ${v.affected?'alert':'good'}"><div class="k">确认受影响</div><div class="v">${fmt(v.affected)}</div><div class="s">需要修复</div></div>
+      <div class="stat"><div class="k">近 7 天新增漏洞</div><div class="v">${fmt(v.new_7d)}</div><div class="s">台账共 ${fmt(v.total)} 条</div></div>
+      <div class="stat ${is.errors?'warn':''}"><div class="k">情报源</div><div class="v">${fmt(is.total)}</div><div class="s">${is.errors?is.errors+' 个抓取失败':'全部正常'}</div></div>
+    </div>
+    <div class="card"><div class="card-title">最新在野利用漏洞 <span class="muted">CISA KEV · 点击查看</span>
+        <button class="btn ghost sm" onclick="go('vulns')">打开漏洞台账</button></div>
+      ${top?`<table><thead><tr><th style="width:160px">CVE</th><th>标题</th><th style="width:90px">严重度</th><th style="width:90px">状态</th></tr></thead><tbody>${top}</tbody></table>`
+        :'<div class="empty">台账里还没有 KEV 条目。情报源首次抓取后会出现（「情报源」页可立即抓取）。</div>'}</div>
+    <div class="card-title" style="margin-top:8px">数字员工</div>
     <div class="cards" style="margin-bottom:18px">${appsHtml}</div>
     <div class="grid">
       <div class="stat"><div class="k">应用数</div><div class="v">${fmt(o.counts.apps)}</div></div>
@@ -195,14 +413,404 @@ async function overview(){
     </div>`;
 }
 
+/* ---------- 漏洞台账 ---------- */
+const VULN_ST={new:'新发现',triaging:'研判中',affected:'受影响',not_affected:'不受影响',fixed:'已修复',ignored:'忽略'};
+const sevBadge=s=>{ if(!s) return '<span class="muted">—</span>'; const k=String(s).toLowerCase(); return `<span class="sev ${esc(k)}">${esc(String(s).toUpperCase())}</span>`; };
+const epssBar=e=> e==null?'<span class="muted">—</span>':`<div style="display:flex;align-items:center;gap:6px"><div class="bar" style="width:60px"><i style="width:${Math.max(2,Math.round(e*100))}%"></i></div><span class="mono">${(e*100).toFixed(1)}%</span></div>`;
+let _vf={status:'',kev:false,q:'',sort:'last_seen',days:'',offset:0}; const _VLIMIT=50;
+/* ---------- 安全概览：我们在跑镜像的 Harbor 扫描（与漏洞日报同一份数据） ---------- */
+let _secShow=['P0','P1'];
+const PRIO_CLS={P0:'kev',P1:'critical',P2:'high',P3:'low'};
+async function securityPage(){
+  const c=$('#content');
+  c.innerHTML=`<div class="head"><div><h2>安全概览</h2><p class="desc">线上在跑的镜像 × Harbor（Trivy）扫描结果：按 P0~P3 排列、能一次清掉一批的通用修复、还没覆盖到的镜像。
+      优先级已结合暴露面（公网 / 内网 / 仅集群内），漏洞数按去重 CVE 计。与飞书漏洞日报同一份数据。</p></div>
+      <button class="btn ghost" onclick="go('vulns')">外部情报台账</button></div>
+    <div id="sec-body">加载中…</div>`;
+  let r, m; try{ [r,m]=await Promise.all([api('GET','/api/security/overview'),api('GET','/api/security/marks')]); }
+  catch(e){ $('#sec-body').innerHTML=`<div class="empty">读取失败：${esc(e.message)}</div>`; return; }
+  _secData=r; _secMarks=m; renderSecurity();
+}
+let _secData=null, _secMarks={marks:[],status:{}};
+const _markLink=(svc,pkg)=>`<a class="muted" style="cursor:pointer;font-size:11.5px;margin-left:6px" data-svc="${esc(svc)}" data-pkg="${esc(pkg)}" onclick="markDlg(this.dataset.svc,this.dataset.pkg)">标记</a>`;
+function markDlg(svc,pkg){
+  const st=_secMarks.status||{}, soon=new Date(Date.now()+14*864e5+8*36e5).toISOString().slice(0,10);
+  openModal(`<h2>标记漏洞</h2><p class="desc">标记后不再计入优先级、日报不再重复提醒。计划修复到期仍未修好会重新出现并标「逾期」；接受风险/误报默认 90 天后复核。</p>
+    <label>包</label><input id="mk-pkg" class="mono" value="${esc(pkg)}">
+    <label>范围</label><select id="mk-svc"><option value="${esc(svc)}">${svc==='*'?'所有服务里的这个包':'只针对 '+esc(svc)}</option>${svc!=='*'?'<option value="*">所有服务里的这个包</option>':''}</select>
+    <label>结论</label><select id="mk-st">${Object.entries(st).map(([k,t])=>`<option value="${k}">${t}</option>`).join('')}</select>
+    <label>到期 / 复核日期</label><input id="mk-until" type="date" value="${soon}">
+    <label>原因 / 备注</label><input id="mk-note" placeholder="如：该功能未启用 / 已排期 10 月迭代 / 仅内网工具">
+    <div class="save-bar"><button class="btn" onclick="saveMark()">保存</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+}
+async function saveMark(){
+  try{ await api('POST','/api/security/marks',{service:$('#mk-svc').value,package:$('#mk-pkg').value,status:$('#mk-st').value,
+        until:$('#mk-until').value,note:$('#mk-note').value}); closeModal(); securityPage(); }
+  catch(e){ alert(e.message); }
+}
+async function delMark(id){ if(!confirm('撤销这个标记？撤销后会重新计入优先级与日报。')) return; await api('DELETE','/api/security/marks/'+id); securityPage(); }
+const _maxVer=vs=>(vs||[]).slice().sort((a,b)=>{const x=a.match(/\d+/g)||[],y=b.match(/\d+/g)||[];for(let i=0;i<Math.max(x.length,y.length);i++){const d=(+x[i]||0)-(+y[i]||0);if(d)return d;}return 0;}).pop()||'';
+function _secToggle(p){ _secShow=_secShow.includes(p)?_secShow.filter(x=>x!==p):_secShow.concat(p); renderSecurity(); }
+function renderSecurity(){
+  const r=_secData, cov=r.coverage||{}, bp=r.by_priority||{}, rb=r.rebuild||{};
+  const gaps=(cov.not_in_harbor||[]).length+(cov.not_scanned||[]).length+(cov.scanning||[]).length+(cov.errors||[]).length+(cov.outside_harbor||[]).length;
+  const stale=(r.inventory||[]).filter(x=>x.status!=='ok');
+  const stat=(p,label,cls)=>`<div class="stat ${bp[p]?cls:'good'}" style="cursor:pointer;${_secShow.includes(p)?'outline:2px solid var(--pri)':''}" onclick="_secToggle('${p}')">
+      <div class="k">${p} · ${label}</div><div class="v">${fmt(bp[p])}</div><div class="s">个镜像 · 点击${_secShow.includes(p)?'收起':'展开'}</div></div>`;
+  const fixes=(r.common_fixes||[]).map(x=>`<tr>
+      <td><b class="mono">${esc(x.package)}</b>${x.kev&&x.kev.length?' <span class="sev kev">KEV</span>':''}<div><span class="tag">${x.layer==='base'?'基础镜像':'应用依赖'}</span>${x.package.split(' / ').map(n=>_markLink('*',n)).join('')}</div></td>
+      <td class="mono" style="white-space:nowrap">${x.layer==='base'?'≥ '+esc(_maxVer(x.fix_to)):esc((x.fix_to||[]).join(' / '))}</td>
+      <td>${x.critical?`<span class="sev critical">${x.critical} 严重</span> `:''}${x.high?`<span class="sev high">${x.high} 高危</span>`:''}</td>
+      <td class="num" style="white-space:nowrap"><b>${x.images}</b> <span class="muted">（公网 ${x.images_public}）</span></td>
+      <td class="clip muted" style="font-size:12px">${esc((x.image_names||[]).join('、'))}${x.images>(x.image_names||[]).length?' …':''}</td></tr>`).join('');
+  const items=(r.items||[]).filter(x=>_secShow.includes(x.priority));
+  const rows=items.map(x=>{ const fc=x.fixable_cves||{};
+    return `<tr>
+      <td><span class="sev ${PRIO_CLS[x.priority]}">${x.priority}</span><div class="muted" style="font-size:11.5px;margin-top:4px">${esc(x.priority_reason)}</div></td>
+      <td><b>${esc(x.service)}</b><div class="mono muted" style="word-break:break-all">${esc(x.image.replace(/^[^/]+\//,''))}</div>
+        <div class="muted" style="font-size:12px">${esc((x.workloads||[]).join('，'))}</div>${x.match_note?`<div class="muted" style="font-size:12px">⚠ ${esc(x.match_note)}</div>`:''}</td>
+      <td style="font-size:12.5px">${esc(x.reachability)}<div class="muted" style="font-size:11.5px">${esc(x.reachability_note||'')}</div></td>
+      <td><div style="font-size:12px" class="muted">应用依赖</div>${fc.app_critical?`<span class="sev critical">${fc.app_critical} 严重</span> `:''}${fc.app_high?`<span class="sev high">${fc.app_high} 高危</span>`:''}${!fc.app_critical&&!fc.app_high?'<span class="muted">—</span>':''}
+        <div style="font-size:12px;margin-top:4px" class="muted">基础镜像 ${fc.base_critical||0} 严重 · ${fc.base_high||0} 高危</div>
+        ${x.kev_cves&&x.kev_cves.length?`<div><span class="sev kev">KEV</span> <span class="mono">${esc(x.kev_cves.join(' '))}</span></div>`:''}</td>
+      <td style="font-size:12.5px">${(x.app_packages||[]).slice(0,4).map(p=>`<div><span class="mono">${esc(p.package)}</span> <span class="muted">${esc(p.version)} →</span> <b class="mono">${esc(p.fixed)}</b>${_markLink(x.service,p.package)}</div>`).join('')||'<span class="muted">只需随批量重建</span>'}
+        ${(x.overdue||[]).map(o=>`<div style="color:var(--err);font-size:12px">⏰ ${esc(o.package)} 计划修复已逾期（原定 ${esc(o.until)}）</div>`).join('')}
+        ${(x.marked||[]).length?`<div class="muted" style="font-size:11.5px;margin-top:4px">已标记：${x.marked.map(m=>esc(m.package)+'（'+esc((_secMarks.status||{})[m.status]||m.status)+'）').join('、')}</div>`:''}</td></tr>`; }).join('');
+  const gapList=(title,list,hint)=>list&&list.length?`<div style="margin-bottom:12px"><div><b>${title}</b> <span class="muted">${list.length} 个 · ${hint}</span></div>
+      <div class="mono muted" style="font-size:12px;line-height:1.7;word-break:break-all">${list.map(esc).join('<br>')}</div></div>`:'';
+  $('#sec-body').innerHTML=`
+    ${stale.length?`<div class="card" style="border-color:#fde68a;background:var(--warn-soft)">⚠ 资产采集有来源失败，数据可能过期：${stale.map(x=>esc(x.source+'：'+(x.error||x.status))).join('；')}</div>`:''}
+    <div class="grid" style="margin-bottom:16px">
+      ${stat('P0','含在野利用','alert')}${stat('P1','应用依赖有严重漏洞','alert')}${stat('P2','高危 / 仅基础镜像','warn')}${stat('P3','无需单独处理','')}
+      <div class="stat ${gaps?'warn':'good'}"><div class="k">扫描覆盖</div><div class="v">${fmt(cov.scanned)}<span class="muted" style="font-size:14px"> / ${fmt(cov.images)}</span></div>
+        <div class="s">自家 Harbor 镜像已扫描${(cov.outside_harbor||[]).length?` · 另有 ${fmt(cov.outside_harbor.length)} 个不经 Harbor`:''}</div></div></div>
+    ${rb.images?`<div class="card"><div class="card-title">批量重建镜像 <span class="muted">基础镜像层（系统包、语言运行时）的漏洞：更新 FROM 到最新构建后重新构建发布即可，不改业务代码</span></div>
+      <div style="margin-bottom:8px"><b>${fmt(rb.images)}</b> 个镜像 · <span class="sev critical">${fmt(rb.critical)} 严重</span> <span class="sev high">${fmt(rb.high)} 高危</span>
+        <span class="muted">（去重 CVE；公网相关 ${fmt((rb.public||[]).length)} 个）</span></div>
+      <div class="muted" style="font-size:12.5px;line-height:1.7">${esc((rb.names||[]).join('、'))}</div></div>`:''}
+    <div class="card"><div class="card-title">按包汇总 <span class="muted">同一个包出现在多个镜像；标「基础镜像」的随批量重建修复，标「应用依赖」的需要开发升级；数字是去重 CVE</span></div>
+      ${fixes?`<div style="overflow-x:auto"><table><thead><tr><th>包</th><th>升级到</th><th>CVE</th><th class="num">涉及镜像</th><th>涉及服务</th></tr></thead><tbody>${fixes}</tbody></table></div>`:'<div class="empty">没有跨镜像的通用修复</div>'}</div>
+    <div class="card"><div class="card-title">镜像漏洞（${_secShow.slice().sort().join(' + ')||'未选优先级'}）<span class="muted">点上方 P0~P3 卡片切换显示；每个镜像最多列 4 个要升级的包</span></div>
+      ${rows?`<div style="overflow-x:auto"><table><thead><tr><th style="width:110px">优先级</th><th>服务 / 镜像</th><th style="width:170px">暴露面</th><th style="width:150px">可修复 CVE</th><th>要升级的应用依赖</th></tr></thead><tbody>${rows}</tbody></table></div>`
+            :'<div class="empty">所选优先级下没有镜像</div>'}</div>
+    <div class="card"><div class="card-title">已标记 <span class="muted">研判结论：有效期内不计入优先级、不在日报里重复提醒</span></div>
+      ${(_secMarks.marks||[]).length?`<div style="overflow-x:auto"><table><thead><tr><th>包</th><th>范围</th><th>结论</th><th>到期 / 复核</th><th>原因</th><th>标记人</th><th></th></tr></thead><tbody>
+        ${_secMarks.marks.map(m=>`<tr><td class="mono">${esc(m.package)}</td><td>${esc(m.service==='*'?'全部服务':m.service)}</td>
+          <td><span class="tag">${esc((_secMarks.status||{})[m.status]||m.status)}</span></td>
+          <td class="mono" style="${m.until&&m.until<new Date(Date.now()+8*36e5).toISOString().slice(0,10)?'color:var(--err)':''}">${esc(m.until||'—')}</td>
+          <td class="muted" style="font-size:12.5px">${esc(m.note||'')}</td><td class="muted" style="font-size:12px">${esc(m.created_by||'')}</td>
+          <td><button class="btn ghost sm" onclick="delMark(${m.id})">撤销</button></td></tr>`).join('')}</tbody></table></div>`
+        :'<div class="empty">还没有标记。在上方「要升级的应用依赖」或「按包汇总」里点「标记」</div>'}</div>
+    <div class="card"><div class="card-title">扫描覆盖缺口 <span class="muted">这些镜像的漏洞不在上面的统计里</span></div>
+      ${gaps?gapList('Harbor 里找不到',cov.not_in_harbor,'代理缓存已清理或从未经 Harbor 拉取；重新拉取一次后即可扫描')
+        +gapList('未扫描',cov.not_scanned,'等 Harbor 每日 03:00 全量扫描，或在 Harbor 手动扫描')
+        +gapList('扫描中',cov.scanning,'稍后刷新')
+        +gapList('读取失败',cov.errors,'检查 Harbor 连接与 robot 权限')
+        +gapList('不经自家 Harbor 的镜像',cov.outside_harbor,'直接从 quay.io / ghcr.io / Docker Hub 等拉取，没有 Trivy 结果；可改为经 Harbor 代理拉取')
+        :'<div class="empty">所有在跑镜像都已扫描</div>'}
+      <div class="muted" style="font-size:12px">扫描结果读取于 ${esc(r.fetched_at||'—')}（北京时间）；资产清单：${(r.inventory||[]).map(x=>esc(x.source)+(x.status==='ok'?' ✓ '+esc(dt(x.ok_at)):' ✗')).join('，')}</div></div>`;
+}
+
+async function vulnsPage(){
+  const c=$('#content');
+  const opt=(v,list)=>list.map(([k,t])=>`<option value="${k}" ${String(v)===String(k)?'selected':''}>${t}</option>`).join('');
+  c.innerHTML=`<div class="head"><div><h2>漏洞台账</h2><p class="desc">情报采集器自动从 KEV / GitHub Advisory / 厂商公告 / 社区舆情汇总的 CVE（近 30 天）。数字员工可以用 vuln_list / vuln_get 查，用 vuln_update 写研判结论。</p></div>
+      <button class="btn ghost" onclick="go('intel')">情报源</button></div>
+    <div id="vuln-stats" class="grid" style="margin-bottom:16px"></div>
+    <div class="card">
+      <div class="toolbar">
+        <input class="grow" id="vf-q" placeholder="搜 CVE / 标题 / 产品（如 gitlab、argo、postgres）" value="${esc(_vf.q)}" onkeydown="if(event.key==='Enter'){_vf.q=this.value;_vf.offset=0;renderVulns()}">
+        <select onchange="_vf.status=this.value;_vf.offset=0;renderVulns()">${opt(_vf.status,[['','全部状态']].concat(Object.entries(VULN_ST)))}</select>
+        <select onchange="_vf.sort=this.value;_vf.offset=0;renderVulns()">${opt(_vf.sort,[['last_seen','最近出现'],['first_seen','最早发现'],['kev','KEV 收录'],['epss','EPSS 最高'],['social','舆情最热']])}</select>
+        <select onchange="_vf.days=this.value;_vf.offset=0;renderVulns()">${opt(_vf.days,[['','全部时间'],['1','24 小时'],['7','7 天'],['30','30 天']])}</select>
+        <label style="margin:0;display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" ${_vf.kev?'checked':''} onchange="_vf.kev=this.checked;_vf.offset=0;renderVulns()">只看 KEV</label>
+      </div>
+      <div id="vuln-body">加载中…</div>
+    </div>`;
+  renderVulns();
+}
+async function renderVulns(){
+  const p=new URLSearchParams({sort:_vf.sort,limit:_VLIMIT,offset:_vf.offset});
+  if(_vf.status) p.set('status',_vf.status); if(_vf.kev) p.set('kev','1'); if(_vf.q) p.set('q',_vf.q); if(_vf.days) p.set('days',_vf.days);
+  const r=await api('GET','/api/vulns?'+p.toString()); const st=r.stats||{};
+  $('#vuln-stats').innerHTML=`
+    <div class="stat ${st.kev?'alert':''}"><div class="k">在野利用（KEV）</div><div class="v">${fmt(st.kev)}</div></div>
+    <div class="stat warn"><div class="k">待研判</div><div class="v">${fmt(st.triage)}</div></div>
+    <div class="stat ${st.affected?'alert':'good'}"><div class="k">受影响</div><div class="v">${fmt(st.affected)}</div></div>
+    <div class="stat good"><div class="k">已修复</div><div class="v">${fmt((st.by_status||{}).fixed)}</div></div>
+    <div class="stat"><div class="k">台账总数</div><div class="v">${fmt(st.total)}</div><div class="s">近 7 天新增 ${fmt(st.new_7d)}</div></div>`;
+  const b=$('#vuln-body');
+  if(!r.items.length){ b.innerHTML='<div class="empty">没有符合条件的漏洞。台账为空时，去「情报源」页点「立即抓取」。</div>'; return; }
+  b.innerHTML=`<table><thead><tr><th style="width:150px">CVE</th><th>标题 / 产品</th><th style="width:84px">严重度</th><th style="width:120px">EPSS</th>
+      <th class="num" style="width:70px" title="社区舆情提及次数 / 全部来源提及次数">舆情</th><th style="width:92px">状态</th><th style="width:110px">最近出现</th></tr></thead><tbody>
+    ${r.items.map(x=>`<tr style="cursor:pointer" onclick="viewVuln('${esc(x.cve)}')">
+      <td><div class="mono">${esc(x.cve)}</div>${x.kev?'<span class="sev kev">KEV 在野利用</span>':''}</td>
+      <td class="clip"><div>${esc(x.title||'(暂无标题)')}</div><div class="muted" style="font-size:12px">${esc((x.products||[]).slice(0,3).join(' · ')||(x.sources||[]).slice(0,2).join(' · '))}</div></td>
+      <td>${sevBadge(x.severity)}</td><td>${epssBar(x.epss)}</td>
+      <td class="num">${x.social?'<b>'+x.social+'</b>':'<span class="muted">0</span>'} <span class="muted">/ ${x.mentions}</span></td>
+      <td><span class="st ${esc(x.status)}">${esc(VULN_ST[x.status]||x.status)}</span></td>
+      <td class="muted" style="font-size:12px">${dt(x.last_seen)}</td></tr>`).join('')}</tbody></table>
+    <div class="pager">共 ${fmt(r.total)} 条 · 第 ${_vf.offset+1}-${Math.min(_vf.offset+_VLIMIT,r.total)} 条
+      <button class="btn ghost sm" ${_vf.offset?'':'disabled'} onclick="_vf.offset=Math.max(0,_vf.offset-${_VLIMIT});renderVulns()">上一页</button>
+      <button class="btn ghost sm" ${_vf.offset+_VLIMIT<r.total?'':'disabled'} onclick="_vf.offset+=${_VLIMIT};renderVulns()">下一页</button></div>`;
+}
+async function viewVuln(cve){
+  const {vuln:v,intel}=await api('GET','/api/vulns/'+encodeURIComponent(cve));
+  openModal(`<h3 class="mono">${esc(v.cve)} ${v.kev?'<span class="sev kev">KEV 在野利用</span>':''} ${sevBadge(v.severity)}</h3>
+    <p class="desc">${esc(v.title||'')}</p>
+    <dl class="kv">
+      <dt>EPSS</dt><dd>${epssBar(v.epss)} ${v.epss_pct!=null?'<span class="muted">（百分位 '+(v.epss_pct*100).toFixed(0)+'%）</span>':''}</dd>
+      ${v.cvss?`<dt>CVSS</dt><dd>${esc(v.cvss)}</dd>`:''}
+      ${v.kev?`<dt>KEV 收录</dt><dd>${esc(v.kev_added||'')}${v.ransomware&&v.ransomware!=='Unknown'?' · 勒索软件：'+esc(v.ransomware):''}</dd>`:''}
+      <dt>涉及产品</dt><dd>${esc((v.products||[]).join('、')||'—')}</dd>
+      <dt>来源</dt><dd>${esc((v.sources||[]).join('、'))}（提及 ${v.mentions} 次，舆情 ${v.social} 次）</dd>
+      <dt>首次发现</dt><dd>${dt(v.first_seen)} · 最近 ${dt(v.last_seen)}</dd>
+      <dt>参考</dt><dd><a href="https://nvd.nist.gov/vuln/detail/${esc(v.cve)}" target="_blank">NVD</a> · <a href="https://osv.dev/vulnerability/${esc(v.cve)}" target="_blank">OSV</a></dd>
+    </dl>
+    ${v.description?`<pre class="box">${esc(v.description)}</pre>`:''}
+    <label>研判状态</label>
+    <div class="row"><div style="flex:0 0 180px"><select id="vv-st">${Object.entries(VULN_ST).map(([k,t])=>`<option value="${k}" ${v.status===k?'selected':''}>${t}</option>`).join('')}</select></div>
+      <div><input id="vv-note" placeholder="备注：哪个服务、什么版本、依据是什么" value="${esc(v.note||'')}"></div></div>
+    ${(v.assets||[]).length?`<div class="hint">受影响资产：${esc(v.assets.join('、'))}</div>`:''}
+    <label>相关情报（${intel.length}）</label>
+    <div style="max-height:260px;overflow:auto">${intel.map(i=>`<div class="ev"><div class="t">${i.category==='social'?'<span class="tag">舆情</span>':'<span class="tag off">官方</span>'}</div>
+      <div class="b"><b>${esc(i.source||'')}</b> · <a href="${esc(i.url||'#')}" target="_blank">${esc(i.title||'(无标题)')}</a>
+      <div class="muted" style="font-size:12px">${esc(i.published||'')}</div></div></div>`).join('')||'<div class="muted">暂无</div>'}</div>
+    <div class="save-bar"><button class="btn" onclick="saveVuln('${esc(v.cve)}')">保存研判</button><button class="btn ghost" onclick="closeModal()">关闭</button></div>`);
+}
+async function saveVuln(cve){
+  try{ await api('PUT','/api/vulns/'+encodeURIComponent(cve),{status:$('#vv-st').value,note:$('#vv-note').value});
+    closeModal(); toast('已保存'); if($('#vuln-body')) renderVulns(); refreshNavBadge(); }catch(e){ toast(e.message); }
+}
+
+/* ---------- 情报源 ---------- */
+const INTEL_KIND={kev:'CISA KEV',rss:'RSS / Atom',jsonfeed:'JSON Feed',ghsa:'GitHub Advisory',ghsa_repo:'仓库安全公告',mastodon:'Mastodon',hackernews:'Hacker News',x:'X（推特）'};
+let _intelCache=[];
+async function intelPage(){
+  const c=$('#content'); c.innerHTML='<h2>情报源</h2><p class="desc">加载中…</p>';
+  const {sources}=await api('GET','/api/intel-sources'); _intelCache=sources;
+  const rows=list=>list.map(s=>{ const [st,dot]={ok:['正常','g'],error:['失败','r']}[s.last_status]||['未抓取',''];
+    return `<tr><td class="clip"><div><b>${esc(s.name)}</b>${s.enabled?'':' <span class="tag off">已停用</span>'}</div>
+        <div class="muted mono" title="${esc(s.url)}">${esc(INTEL_KIND[s.kind]||s.kind)} · ${esc(s.url)}</div></td>
+      <td><span class="chip"><span class="dot ${dot}"></span>${st}</span>
+        <div class="muted" style="font-size:12px">${s.last_fetch?dt(s.last_fetch)+' · 新增 '+s.last_new:''}</div>
+        ${s.last_error?`<div style="color:var(--err);font-size:12px" title="${esc(s.last_error)}">${esc(s.last_error.slice(0,80))}</div>`:''}</td>
+      <td class="muted">每 ${s.interval_min} 分钟</td>
+      <td style="white-space:nowrap"><button class="btn sm" id="if-${s.id}" onclick="fetchIntel(${s.id})">立即抓取</button>
+        <button class="btn ghost sm" onclick="editIntel(${s.id})">编辑</button>
+        <button class="btn danger" onclick="delIntel(${s.id},'${esc(s.name)}')">删除</button></td></tr>`;}).join('');
+  const table=(title,desc,list)=>`<div class="card"><div class="card-title">${title} <span class="muted">${desc}</span></div>
+    ${list.length?`<table><thead><tr><th>名称 / 地址</th><th style="width:230px">状态</th><th style="width:100px">频率</th><th style="width:230px"></th></tr></thead><tbody>${rows(list)}</tbody></table>`:'<div class="empty">没有</div>'}</div>`;
+  c.innerHTML=`<div class="head"><div><h2>情报源</h2><p class="desc">采集器按频率自动抓取（不经过大模型），抽取 CVE 进漏洞台账；近 30 天的才进台账。舆情源提到的 CVE 计入「舆情热度」。</p></div>
+      <button class="btn" onclick="newIntel()">+ 添加情报源</button></div>
+    <div class="notice">X（推特）读取接口需要付费档位的 Bearer Token，默认关闭；拿到 token 后在下方编辑填入并启用。在此之前用 Mastodon / Reddit / Hacker News 等公开源代替。</div>
+    ${table('官方 / 厂商','漏洞库、厂商安全公告',sources.filter(s=>s.category!=='social'))}
+    ${table('社区舆情','安全圈讨论热度，只加权、不直接触发修复',sources.filter(s=>s.category==='social'))}`;
+}
+function _intelForm(s){
+  const kinds=Object.entries(INTEL_KIND).map(([k,t])=>`<option value="${k}" ${s.kind===k?'selected':''}>${t}</option>`).join('');
+  return `<h3>${s.id?'编辑情报源':'添加情报源'}</h3><p class="desc">RSS/Atom 填订阅地址；仓库安全公告填 owner/repo；Mastodon 填话题时间线 API；X 填 Bearer Token 与检索式。</p>
+    <div class="row"><div><label>名称</label><input id="is-name" value="${esc(s.name||'')}"></div>
+      <div style="flex:0 0 170px"><label>类型</label><select id="is-kind">${kinds}</select></div>
+      <div style="flex:0 0 150px"><label>类别</label><select id="is-cat"><option value="official" ${s.category!=='social'?'selected':''}>官方/厂商</option><option value="social" ${s.category==='social'?'selected':''}>社区舆情</option></select></div></div>
+    <label>地址</label><input id="is-url" class="mono" value="${esc(s.url||'')}">
+    <label>检索式（Hacker News / X 用）</label><input id="is-query" value="${esc(s.query||'')}" placeholder="如：CVE OR 0day">
+    <label>令牌 ${s.token_set?'<span class="muted">（已设置，留空＝不改）</span>':'<span class="muted">（X 必填；GitHub 选填，可提高限额）</span>'}</label><input id="is-token" type="password">
+    <div class="row"><div style="flex:0 0 160px"><label>抓取间隔（分钟）</label><input id="is-int" type="number" min="10" value="${s.interval_min||60}"></div>
+      <div style="flex:0 0 160px"><label>启用</label><select id="is-en"><option value="1" ${s.enabled!==false?'selected':''}>启用</option><option value="0" ${s.enabled===false?'selected':''}>停用</option></select></div></div>
+    <div class="save-bar"><button class="btn" onclick="saveIntel(${s.id||0})">保存</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
+}
+function newIntel(){ openModal(_intelForm({})); }
+function editIntel(id){ openModal(_intelForm(_intelCache.find(s=>s.id===id)||{})); }
+async function saveIntel(id){
+  const body={name:$('#is-name').value.trim(),kind:$('#is-kind').value,category:$('#is-cat').value,url:$('#is-url').value.trim(),
+    query:$('#is-query').value.trim(),interval_min:Number($('#is-int').value)||60,enabled:Number($('#is-en').value)};
+  const t=$('#is-token').value.trim(); if(t) body.token=t;
+  try{ if(id) await api('PUT','/api/intel-sources/'+id,body); else await api('POST','/api/intel-sources',body); closeModal(); toast('已保存'); intelPage(); }catch(e){ toast(e.message); }
+}
+async function fetchIntel(id){
+  const b=$('#if-'+id); if(b){ b.disabled=true; b.textContent='抓取中…'; }
+  try{ const r=await api('POST','/api/intel-sources/'+id+'/fetch'); toast(r.ok?`抓到 ${r.fetched} 条，新增 ${r.new}，进台账 CVE ${r.cves}`:'失败：'+r.error); }catch(e){ toast(e.message); }
+  intelPage(); refreshNavBadge();
+}
+async function delIntel(id,name){ if(!confirm('删除情报源「'+name+'」？它抓到的情报原文一并删除（台账里的漏洞保留）。')) return;
+  await api('DELETE','/api/intel-sources/'+id); toast('已删除'); intelPage(); }
+
+/* ---------- 连接凭证 ---------- */
+async function connectionsPage(){
+  const c=$('#content'); c.innerHTML='<h2>连接凭证</h2><p class="desc">加载中…</p>';
+  const {argocd:a={},gitlab:g={},web:w={},harbor:hb={}}=await api('GET','/api/connections');
+  c.innerHTML=`<div class="head"><div><h2>连接凭证</h2><p class="desc">给数字员工「看」的只读连接：勾上 argocd_* / gitlab_* 工具的应用可以查 ArgoCD 应用与实际运行镜像、读 GitLab 仓库。令牌只存在服务端，模型拿不到。</p></div></div>
+    <div class="card"><div class="card-title">ArgoCD <span class="muted">看应用同步/健康状态与集群里实际运行的镜像版本</span></div>
+      <div class="row"><div><label>地址</label><input id="cn-a-url" value="${esc(a.url)}" placeholder="https://argocd.internal.example"></div>
+        <div><label>只读 API token ${a.token_set?'<span class="muted">（已设置 '+esc(a.token_masked)+'，留空＝不改）</span>':''}</label><input id="cn-a-token" type="password" placeholder="argocd account generate-token --account readonly"></div></div>
+      <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-a-ins" ${a.insecure?'checked':''}>跳过 TLS 证书校验（内网自签证书时勾选）</label>
+      <div class="hint">建议在 ArgoCD 里建只读账号：argocd-cm 加 <span class="mono">accounts.readonly: apiKey</span>，argocd-rbac-cm 绑 <span class="mono">role:readonly</span>，再生成 token。</div>
+      <div class="save-bar"><button class="btn" onclick="saveConn('argocd')">保存</button><button class="btn ghost" onclick="testConn('argocd')">测试连接</button><span id="cn-a-res" class="muted"></span></div></div>
+    <div class="card"><div class="card-title">GitLab <span class="muted">搜项目、列目录、读文件（不克隆、不写）</span></div>
+      <div class="row"><div><label>地址</label><input id="cn-g-url" value="${esc(g.url)}" placeholder="https://gitlab.upmore.net"></div>
+        <div><label>访问令牌（scope 只勾 read_api）${g.token_set?' <span class="muted">（已设置 '+esc(g.token_masked)+'，留空＝不改）</span>':''}</label><input id="cn-g-token" type="password" placeholder="glpat-…"></div></div>
+      <div class="hint">要改代码并提 MR，请到「代码仓库」页单独登记仓库与写令牌；技能同步在「技能」页配置技能源。</div>
+      <div class="save-bar"><button class="btn" onclick="saveConn('gitlab')">保存</button><button class="btn ghost" onclick="testConn('gitlab')">测试连接</button><span id="cn-g-res" class="muted"></span></div></div>
+    <div class="card"><div class="card-title">Harbor 镜像扫描 <span class="muted">读取 Trivy 扫描结果，补上自研镜像依赖与基础镜像漏洞；工具 image_vulns / vuln_report</span></div>
+      <div class="row"><div><label>地址</label><input id="cn-h-url" value="${esc(hb.url||'')}" placeholder="https://harbor.upmore.net"></div>
+        <div><label>robot 账号</label><input id="cn-h-user" value="${esc(hb.username||'')}" placeholder="robot$harness-readonly"></div>
+        <div><label>密钥 ${hb.password_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label><input id="cn-h-pass" type="password"></div></div>
+      <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-h-trig" ${hb.trigger_scan?'checked':''}>对未扫描的在用镜像自动触发扫描（写操作，robot 需有「创建扫描」权限）</label>
+      <div class="hint">建议在 Harbor 建系统级 robot，只给「项目/仓库/制品 读取」与「扫描 读取」；Harbor 需已安装 Trivy 并开启推送即扫描。</div>
+      <div class="save-bar"><button class="btn" onclick="saveHarbor()">保存</button><button class="btn ghost" onclick="testConn('harbor')">测试连接</button><span id="cn-h-res" class="muted"></span></div></div>
+    <div class="card"><div class="card-title">联网搜索与读网页 <span class="muted">web_search / web_fetch；应用还需在资源权限里授予 web_domains</span></div>
+      <div class="row"><div style="flex:0 0 200px"><label>搜索后端</label><select id="cn-w-prov">
+          ${[['searxng','SearXNG（自建）'],['brave','Brave Search API'],['tavily','Tavily']].map(([k,t])=>`<option value="${k}" ${w.provider===k?'selected':''}>${t}</option>`).join('')}</select></div>
+        <div><label>SearXNG 地址（须开启 formats: json）</label><input id="cn-w-sx" value="${esc(w.searxng_url)}" placeholder="http://searxng.192.168.110.75.sslip.io"></div></div>
+      <div class="row"><div><label>Brave API Key ${w.brave_key_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label><input id="cn-w-brave" type="password"></div>
+        <div><label>Tavily API Key ${w.tavily_key_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label><input id="cn-w-tav" type="password"></div></div>
+      <label>内网出境代理（可选，HTTP CONNECT 代理；用于拿到更完整的境外资源）</label>
+      <input id="cn-w-proxy" value="${esc(w.proxy)}" placeholder="http://user:pass@proxy.internal:3128">
+      <div style="display:flex;gap:18px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-w-psearch" ${w.proxy_search?'checked':''}>搜索 API 走代理（Brave / Tavily；SearXNG 是内网地址，始终直连）</label>
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-w-pfetch" ${w.proxy_fetch?'checked':''}>读网页 / 沙箱下载走代理</label></div>
+      <div class="hint">读网页走代理时由代理远端解析域名，无法把连接固定到已校验的 IP：本地仍拦内网主机名、内网 IP 与本地解析到内网的域名，其余须由代理自己拒绝内网网段（如 squid ACL 禁止 RFC1918、169.254.0.0/16）。</div>
+      <label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--ink)"><input type="checkbox" style="width:auto" id="cn-w-fake" ${w.allow_fake_ip?'checked':''}>允许代理 fake-IP（198.18.0.0/15）——仅开发机开 TUN 代理时使用，生产勿开</label>
+      <div class="hint">读网页只允许公网地址：内网/回环/元数据地址、内网域名、带账号密码的网址都会被拒，每一跳重定向都重新校验。网页内容视为外部文本，读过的任务不能再直接写生产或执行命令。</div>
+      <div class="save-bar"><button class="btn" onclick="saveWeb()">保存</button><button class="btn ghost" onclick="testConn('web')">测试搜索</button><span id="cn-w-res" class="muted"></span></div></div>
+    <div class="card" id="cn-box"></div>`;
+  renderBox();
+}
+async function renderBox(){
+  const el=$('#cn-box'); if(!el) return;
+  let d; try{ d=await api('GET','/api/box'); }catch(e){ el.innerHTML='<div class="muted">工作机信息加载失败：'+esc(e.message)+'</div>'; return; }
+  const rows=d.runners.map(r=>`<tr><td><b>${esc(r.name)}</b></td>
+      <td><span class="chip"><span class="dot ${r.online?'g':'r'}"></span>${r.online?'在线':'离线'}</span></td>
+      <td class="muted">${r.last_seen?dt(r.last_seen):'从未连接'}</td>
+      <td class="muted">${esc((r.info&&r.info.version)||'')}</td>
+      <td style="white-space:nowrap"><button class="btn ghost sm" onclick="newRunner('${esc(r.name)}')">轮换令牌</button>
+        <button class="btn danger" onclick="delRunner('${esc(r.name)}')">移除</button></td></tr>`).join('');
+  el.innerHTML=`<div class="card-title">工作机 <span class="muted">box_shell / box_files / box_browser / box_desktop；应用还需在资源权限里授予 box</span></div>
+    ${d.runners.length?`<table><thead><tr><th>名称</th><th>状态</th><th>最近心跳</th><th>版本</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+      :'<div class="empty" style="padding:16px">还没有工作机。新建后把令牌配给工作机上的 runner（环境变量 HARNESS_RUNNER_TOKEN）。</div>'}
+    <div class="row" style="margin-top:10px"><div style="flex:0 0 220px"><label>新工作机名称</label><input id="bx-name" placeholder="default"></div>
+      <div><label>工作机画面地址（noVNC，遇到人机验证时发给用户）</label><input id="bx-vnc" value="${esc(d.novnc_url)}" placeholder="https://box.internal/vnc.html"></div></div>
+    <div class="hint">runner 主动连接本服务拉取操作，工作机不需要开放入站端口。工作机上不要放任何公司凭据，也不要让它访问内网。</div>
+    <div class="save-bar"><button class="btn" onclick="newRunner()">新建 / 轮换</button><button class="btn ghost" onclick="saveBoxVnc()">保存画面地址</button></div>`;
+}
+async function newRunner(name){
+  name=name||$('#bx-name').value.trim()||'default';
+  if(!confirm('为工作机「'+name+'」生成令牌？同名已存在时旧令牌立即失效。')) return;
+  try{ const r=await api('POST','/api/box/runners',{name});
+    openModal(`<h3>工作机令牌</h3><p class="desc">${esc(r.note)}</p><label>名称</label><pre class="box">${esc(r.name)}</pre>
+      <label>令牌（只显示这一次）</label><pre class="box">${esc(r.token)}</pre>
+      <div class="hint">工作机上设置 HARNESS_URL=本服务地址、HARNESS_RUNNER_TOKEN=上面的令牌，启动 runner。</div>
+      <div class="save-bar"><button class="btn ghost" onclick="closeModal();renderBox()">我已保存</button></div>`);
+  }catch(e){ toast(e.message); }
+}
+async function delRunner(name){ if(!confirm('移除工作机「'+name+'」？它的令牌立即失效，进行中的操作会失败。')) return;
+  await api('DELETE','/api/box/runners/'+encodeURIComponent(name)); toast('已移除'); renderBox(); }
+async function saveBoxVnc(){ try{ await api('PUT','/api/box/settings',{novnc_url:$('#bx-vnc').value.trim()}); toast('已保存'); }catch(e){ toast(e.message); } }
+async function saveWeb(){
+  const body={provider:$('#cn-w-prov').value, searxng_url:$('#cn-w-sx').value.trim(), proxy:$('#cn-w-proxy').value.trim(),
+    proxy_search:$('#cn-w-psearch').checked, proxy_fetch:$('#cn-w-pfetch').checked, allow_fake_ip:$('#cn-w-fake').checked};
+  const b=$('#cn-w-brave').value.trim(); if(b) body.brave_key=b;
+  const t=$('#cn-w-tav').value.trim(); if(t) body.tavily_key=t;
+  try{ await api('PUT','/api/connections',{web:body}); toast('已保存'); connectionsPage(); }catch(e){ toast(e.message); }
+}
+async function saveHarbor(){
+  const body={url:$('#cn-h-url').value.trim(), username:$('#cn-h-user').value.trim(), trigger_scan:$('#cn-h-trig').checked};
+  const p=$('#cn-h-pass').value.trim(); if(p) body.password=p;
+  try{ await api('PUT','/api/connections',{harbor:body}); toast('已保存'); connectionsPage(); }catch(e){ toast(e.message); }
+}
+async function saveConn(kind){
+  const k=kind==='argocd'?'a':'g'; const body={url:$('#cn-'+k+'-url').value.trim()};
+  const t=$('#cn-'+k+'-token').value.trim(); if(t) body.token=t;
+  if(kind==='argocd') body.insecure=$('#cn-a-ins').checked;
+  try{ await api('PUT','/api/connections',{[kind]:body}); toast('已保存'); connectionsPage(); }catch(e){ toast(e.message); }
+}
+async function testConn(kind){
+  const el=$('#cn-'+({argocd:'a',gitlab:'g',web:'w',harbor:'h'}[kind])+'-res'); el.textContent='测试中…'; el.style.color='';
+  try{ const r=await api('POST','/api/connections/test',{kind});
+    el.style.color=r.ok?'var(--ok)':'var(--err)';
+    el.textContent=r.ok?({argocd:`✓ 连通，ArgoCD ${r.version||''}，${r.apps} 个应用`, gitlab:`✓ 连通，用户 ${r.user}`,
+      web:`✓ ${r.provider} 返回 ${r.count} 条：${(r.sample||[]).join(' / ').slice(0,80)}`,
+      harbor:`✓ 连通，默认扫描器：${r.default_scanner||'未读到'}${r.note?'（'+r.note+'）':''}`}[kind]):('✗ '+(r.error||'失败')); }
+  catch(e){ el.style.color='var(--err)'; el.textContent='✗ '+e.message; }
+}
+
+/* ---------- Webhook 触发 ---------- */
+let _hookCache=[], _hookMeta={chats:[],workflows:[]};
+async function hooksPage(){
+  const c=$('#content'); c.innerHTML='<h2>Webhook 触发</h2><p class="desc">加载中…</p>';
+  const [{webhooks,chats,workflows},{apps}]=await Promise.all([api('GET','/api/webhooks'),api('GET','/api/apps')]);
+  _hookCache=webhooks; _hookMeta={chats,workflows,apps};
+  const appName=id=>(apps.find(a=>a.id===id)||{}).name||('#'+id);
+  const base=location.origin;
+  const rows=webhooks.map(h=>{ const [st,dot]={accepted:['已建任务','g'],duplicate:['重复投递','g'],throttled:['被限流','y'],
+      rejected:['被拒','r'],error:['失败','r'],disabled:['已停用','y']}[h.last_status]||['未调用',''];
+    return `<tr><td class="clip"><div><b>${esc(h.name)}</b>${h.enabled?'':' <span class="tag off">已停用</span>'}</div>
+        <div class="muted mono" title="${esc(base+h.path)}">${esc(base+h.path)}</div></td>
+      <td>${esc(appName(h.app_id))}<div class="muted mono" style="font-size:11px">${esc(h.chat_id)}</div></td>
+      <td><span class="chip"><span class="dot ${dot}"></span>${st}</span><div class="muted" style="font-size:12px">${h.last_called?dt(h.last_called):''} · 共 ${h.calls} 次</div>
+        ${h.last_error?`<div style="color:var(--err);font-size:12px">${esc(h.last_error.slice(0,60))}</div>`:''}</td>
+      <td style="white-space:nowrap"><button class="btn ghost sm" onclick="editHook('${esc(h.id)}')">编辑</button>
+        <button class="btn ghost sm" onclick="rotateHook('${esc(h.id)}')">轮换令牌</button>
+        <button class="btn danger" onclick="delHook('${esc(h.id)}','${esc(h.name)}')">删除</button></td></tr>`;}).join('');
+  c.innerHTML=`<div class="head"><div><h2>Webhook 触发</h2><p class="desc">外部系统（CI、告警、工单、表单）POST 一个 JSON 事件，按指令模板生成任务交给数字员工处理，结果发到指定会话。同一事件重复投递只建一个任务。</p></div>
+      <button class="btn" onclick="newHook()">+ 新建 Webhook</button></div>
+    <div class="notice">请求体是外部内容：这类任务从第一步起按「已读外部内容」处理——可以查询、分析、在隔离工作区改代码并经审批提 MR，但不能直接写生产或执行生产命令。</div>
+    <div class="card">${webhooks.length?`<table><thead><tr><th>名称 / 地址</th><th style="width:22%">投递到</th><th style="width:22%">最近调用</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+      :'<div class="empty">还没有 Webhook。新建后把地址和令牌配到 GitLab / 告警平台的 Webhook 设置里。</div>'}</div>
+    <div class="card"><div class="card-title">调用方式</div>
+      <pre class="box">curl -X POST ${esc(base)}/hooks/&lt;id&gt; \\
+  -H 'X-Harness-Token: &lt;令牌&gt;' -H 'Content-Type: application/json' \\
+  -H 'Idempotency-Key: 事件唯一ID（可选，用于去重）' \\
+  -d '{"alert":"PodCrashLooping","namespace":"payments","pod":"api-7f9c"}'</pre>
+      <div class="hint">GitLab Webhook 把令牌填进 Secret token 即可（走 X-Gitlab-Token，并自动用 X-Gitlab-Event-UUID 去重）。返回 202 = 新建任务，200 = 重复投递，429 = 超出每小时上限。</div></div>`;
+}
+function _hookForm(h){
+  const {chats,workflows,apps}=_hookMeta;
+  const appOpts=apps.map(a=>`<option value="${a.id}" ${h.app_id===a.id?'selected':''}>${esc(a.name)}</option>`).join('');
+  const wfOpts=workflows.map(w=>`<option value="${w}" ${(h.workflow||'auto')===w?'selected':''}>${w==='auto'?'自动判断':w}</option>`).join('');
+  const chatList=chats.map(x=>`<option value="${esc(x.chat_id)}">应用 #${x.app_id} · 最近 ${dt(x.last)}</option>`).join('');
+  return `<h3>${h.id?'编辑 Webhook':'新建 Webhook'}</h3><p class="desc">模板里用 {{字段路径}} 取请求体里的值（如 {{object_attributes.title}}），用 {{payload}} 放入整个请求体（截断并标注为外部数据）。</p>
+    <div class="row"><div><label>名称</label><input id="wh-name" value="${esc(h.name||'')}" placeholder="如：生产告警 → 运维助手"></div>
+      <div style="flex:0 0 200px"><label>交给哪个应用</label><select id="wh-app">${appOpts}</select></div>
+      <div style="flex:0 0 160px"><label>工作流</label><select id="wh-wf">${wfOpts}</select></div></div>
+    <label>投递会话 chat_id（任务进度与结果发到这里）</label>
+    <input id="wh-chat" class="mono" list="wh-chats" value="${esc(h.chat_id||'')}" placeholder="oc_xxx"><datalist id="wh-chats">${chatList}</datalist>
+    <label>指令模板</label>
+    <textarea id="wh-tpl" style="min-height:160px">${esc(h.template||'收到告警：{{alert}}，命名空间 {{namespace}}，Pod {{pod}}。\n请排查原因、评估影响范围，给出证据和处理建议；需要变更时走 GitOps 提 MR。\n{{payload}}')}</textarea>
+    <div class="row"><div style="flex:0 0 180px"><label>每小时最多新建任务</label><input id="wh-max" type="number" min="1" value="${h.max_per_hour||60}"></div>
+      <div style="flex:0 0 160px"><label>启用</label><select id="wh-en"><option value="1" ${h.enabled!==false?'selected':''}>启用</option><option value="0" ${h.enabled===false?'selected':''}>停用</option></select></div></div>
+    <div class="save-bar"><button class="btn" onclick="saveHook('${esc(h.id||'')}')">保存</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
+}
+function newHook(){ if(!_hookMeta.apps.length){ toast('先在「应用」页建一个应用'); return; } openModal(_hookForm({})); }
+function editHook(id){ openModal(_hookForm(_hookCache.find(h=>h.id===id)||{})); }
+function _showToken(title, r){
+  openModal(`<h3>${title}</h3><p class="desc">${esc(r.note||'')}</p>
+    <label>地址</label><pre class="box">${esc(location.origin+(r.path||''))}</pre>
+    <label>令牌（只显示这一次）</label><pre class="box">${esc(r.token)}</pre>
+    <div class="save-bar"><button class="btn" onclick="navigator.clipboard&&navigator.clipboard.writeText('${esc(r.token)}');toast('已复制令牌')">复制令牌</button><button class="btn ghost" onclick="closeModal();hooksPage()">我已保存</button></div>`);
+}
+async function saveHook(id){
+  const body={name:$('#wh-name').value.trim(),app_id:Number($('#wh-app').value),workflow:$('#wh-wf').value,
+    chat_id:$('#wh-chat').value.trim(),template:$('#wh-tpl').value,max_per_hour:Number($('#wh-max').value)||60,enabled:Number($('#wh-en').value)};
+  try{ if(id){ await api('PUT','/api/webhooks/'+id,body); closeModal(); toast('已保存'); hooksPage(); }
+    else{ const r=await api('POST','/api/webhooks',body); _showToken('Webhook 已创建',r); } }catch(e){ toast(e.message); }
+}
+async function rotateHook(id){ if(!confirm('轮换后旧令牌立即失效，调用方需要更新。继续？')) return;
+  try{ const r=await api('POST','/api/webhooks/'+id+'/rotate'); r.path='/hooks/'+id; _showToken('令牌已轮换',r); }catch(e){ toast(e.message); } }
+async function delHook(id,name){ if(!confirm('删除 Webhook「'+name+'」？调用方再投递会收到 401。')) return;
+  await api('DELETE','/api/webhooks/'+id); toast('已删除'); hooksPage(); }
+
 /* ---------- 应用 ---------- */
-let _provCache=[], _toolPool=[], _skillPool=[], _mcpPool=[];
+let _provCache=[], _toolPool=[], _skillPool=[], _mcpPool=[], _presetPool=[];
+const presetName = p => { const k=(p&&p.preset)||'compat'; if(k==='custom') return '自定义';
+  return (_presetPool.find(x=>x.key===k)||{}).name || ({compat:'兼容',readonly:'只读',approval:'审批'})[k] || k; };
 async function apps(){
   const c=$('#content'); c.innerHTML='<h2>应用</h2><p class="desc">加载中…</p>';
-  const [{apps},{providers},{tools},sk,mc] = await Promise.all([
+  const [{apps},{providers},{tools,policy_presets},sk,mc] = await Promise.all([
     api('GET','/api/apps'), api('GET','/api/providers'), api('GET','/api/tools/pool'),
     api('GET','/api/skills'), api('GET','/api/mcp')]);
-  _provCache=providers; _toolPool=tools; _skillPool=sk.skills; _mcpPool=mc.servers;
+  _provCache=providers; _toolPool=tools; _skillPool=sk.skills; _mcpPool=mc.servers; _presetPool=policy_presets||[];
   const provName=id=>{ const p=providers.find(x=>x.id===id); return p?p.name:'未绑定'; };
   const list = apps.length ? `<div class="cards">${apps.map(a=>`
       <div class="appcard">
@@ -212,6 +820,8 @@ async function apps(){
           <span class="tag">${esc(provName(a.ai_provider_id))}</span>
           <span class="chip">工具 ${a.tools.length}</span>
           <span class="chip">技能 ${a.skills.length}</span>
+          <span class="chip">策略 ${esc(presetName(a.policy))}</span>
+          ${(a.approvers||[]).length?`<span class="chip">审批人 ${a.approvers.length}</span>`:''}
         </div>
         <div class="meta mono">App ID: ${esc(a.feishu_app_id||'(未配)')}</div>
         <div class="acts">
@@ -239,6 +849,10 @@ function _appForm(a){
   const mcp = _mcpPool.map(s=>`<label><input type="checkbox" class="mc" value="${s.id}" ${(a.mcp||[]).includes(s.id)?'checked':''}>
       <span><span class="tn">${esc(s.name)}${s.enabled?'':'（已停用）'}</span><br><span class="td">${esc(s.url||'')}</span></span></label>`).join('');
   const sset=a.feishu_secret_set;
+  const pol=a.policy||{preset:'readonly'};
+  const polOpts=_presetPool.map(p=>`<option value="${p.key}" ${pol.preset===p.key?'selected':''}>${esc(p.name)}</option>`).join('')
+    +`<option value="custom" ${pol.preset==='custom'?'selected':''}>自定义规则</option>`;
+  const polRules=JSON.stringify(pol.preset==='custom'?pol.rules:((_presetPool.find(p=>p.key===pol.preset)||_presetPool[0]||{}).rules||[]),null,2);
   return `<h3>${a.id?'编辑应用':'新建应用'}</h3>
     <p class="desc">数字员工的身份、大脑与能力。</p>
     <div class="row">
@@ -257,6 +871,21 @@ function _appForm(a){
       <div style="flex:0 0 160px"><label>思考模式(reasoning)</label><select id="ap-think"><option value="1" ${a.thinking!==false?'selected':''}>开启(默认)</option><option value="0" ${a.thinking===false?'selected':''}>关闭</option></select></div>
       <div><label>启用</label><select id="ap-enabled"><option value="1" ${a.enabled!==false?'selected':''}>启用</option><option value="0" ${a.enabled===false?'selected':''}>停用</option></select></div>
     </div>
+    <label>工具调用策略（决定勾选的工具里哪些能直接执行；黑名单、只读集群、旁听拦截等安全检查始终生效）</label>
+    <div class="row">
+      <div style="flex:0 0 200px"><select id="ap-pol" onchange="onPolChange()">${polOpts}</select></div>
+      <div class="hint" id="ap-pol-desc" style="margin-top:8px"></div>
+    </div>
+    <div id="ap-pol-custom" style="display:${pol.preset==='custom'?'block':'none'}">
+      <textarea id="ap-pol-rules" class="mono" style="min-height:120px">${esc(polRules)}</textarea>
+      <div class="hint">自上而下第一条命中的规则生效，都不命中则拒绝。字段：tool（工具名/数组/"*"）、risk（read/local/write/exec，local＝只改代码工作区）、decision（allow/deny/ask，ask＝发审批卡片）。</div>
+    </div>
+    <label>审批人（飞书 open_id，一行一个；策略里有 ask 时由他们在群里点「批准一次」。留空＝谁都批不了，需要审批的操作一律拒绝）</label>
+    <textarea id="ap-approvers" class="mono" style="min-height:60px" placeholder="ou_xxxxxxxx">${esc((a.approvers||[]).join('\n'))}</textarea>
+    <div class="hint">open_id 可在「运行记录」里点开某次 run，看「触发人」。执行类操作不能由发起人自己批准。</div>
+    <label>资源权限（JSON；未列出的资源默认禁止访问）</label>
+    <textarea id="ap-resources" class="mono" style="min-height:150px">${esc(JSON.stringify(a.resources||{},null,2))}</textarea>
+    <div class="hint">例：{"k8s_clusters":["主集群"],"namespaces":["upmore-api"],"repos":["gitops"],"log_orgs":["default"],"log_streams":["k8s_upmore_api"],"web_domains":["*"],"sandbox":["research"],"box":["default"]}。web_domains 控制联网搜索/读网页/沙箱下载的网站（web_search 需 ["*"]），sandbox:["research"] 允许离线研究沙箱，box:["default"] 允许使用名为 default 的工作机。完整访问须显式填写 ["*"]。可选 users/chats 限制发起人和群。生产连接仍应使用最小权限账号。</div>
     <label>可用工具（只勾该应用该有的——能力隔离）</label>
     <div class="toolpick">${tools||'<span class="muted">工具池为空</span>'}</div>
     <label>可用技能（知识/工作方法包——只勾该应用该懂的）</label>
@@ -266,8 +895,13 @@ function _appForm(a){
     <div class="save-bar"><button class="btn" onclick="saveApp(${a.id||0})">保存</button>
       <button class="btn ghost" onclick="closeModal()">取消</button></div>`;
 }
-function newApp(){ openModal(_appForm({})); }
-async function editApp(id){ const a=await api('GET','/api/apps/'+id); openModal(_appForm(a)); }
+function onPolChange(){
+  const v=$('#ap-pol').value, p=_presetPool.find(x=>x.key===v);
+  $('#ap-pol-custom').style.display = v==='custom'?'block':'none';
+  $('#ap-pol-desc').textContent = v==='custom' ? '按下面的 JSON 规则判断。' : (p?p.description:'');
+}
+function newApp(){ openModal(_appForm({})); onPolChange(); }
+async function editApp(id){ const a=await api('GET','/api/apps/'+id); openModal(_appForm(a)); onPolChange(); }
 async function saveApp(id){
   const body={
     name:$('#ap-name').value.trim(),
@@ -283,6 +917,13 @@ async function saveApp(id){
   };
   const sec=$('#ap-fsec').value.trim(); if(sec) body.feishu_app_secret=sec;
   if(!body.name){ toast('请填应用名称'); return; }
+  const pv=$('#ap-pol').value;
+  if(pv==='custom'){
+    try{ body.policy={preset:'custom', rules:JSON.parse($('#ap-pol-rules').value)}; }
+    catch(e){ toast('自定义规则不是合法 JSON'); return; }
+  } else body.policy={preset:pv};
+  try{ body.resources=JSON.parse($('#ap-resources').value); }catch(e){ toast('资源权限不是合法 JSON'); return; }
+  body.approvers=$('#ap-approvers').value.split(/[\s,，]+/).map(s=>s.trim()).filter(Boolean);
   try{
     if(id) await api('PUT','/api/apps/'+id,body); else await api('POST','/api/apps',body);
     closeModal(); toast('已保存'); apps();
@@ -336,21 +977,105 @@ async function saveProv(id){
 async function delProv(id,name){ if(!confirm('删除 AI「'+name+'」？绑定它的应用会暂时无 AI 可用。')) return; await api('DELETE','/api/providers/'+id); toast('已删除'); providers(); }
 
 /* ---------- 技能（知识/工作方法包） ---------- */
+let _srcCache=[];
+const SYNC_STATUS={ok:['同步正常','g'],partial:['部分失败','y'],error:['同步失败','r']};
 async function skills(){
   const c=$('#content'); c.innerHTML='<h2>技能</h2><p class="desc">加载中…</p>';
-  const {skills}=await api('GET','/api/skills');
+  const [{skills},{sources}]=await Promise.all([api('GET','/api/skills'),api('GET','/api/skill-sources')]);
+  _srcCache=sources;
+  const srcName=id=>{ const s=sources.find(x=>x.id===id); return s?s.name:('#'+id); };
+  const srcRows = sources.length ? sources.map(s=>{
+    const [st,dot]=SYNC_STATUS[s.last_status]||['未同步',''];
+    return `<tr><td style="max-width:0;width:100%"><b>${esc(s.name)}</b>${s.enabled?'':' <span class="tag off">已停用</span>'}
+      <div class="muted mono" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(s.url)}">${esc(s.url)}${s.branch?' @'+esc(s.branch):''}</div></td>
+      <td class="muted">${s.kind==='marketplace'?'索引仓':'能力仓'}${(s.plugins||[]).length?'<br>只同步 '+esc(s.plugins.join('、')):''}</td>
+      <td><span class="chip" style="padding:2px 10px"><span class="dot ${dot}"></span>${st}</span>
+        <div class="muted" style="font-size:12px">${s.last_sync?dt(s.last_sync):''} · ${s.skill_count} 个技能 · 每 ${s.interval_min} 分钟</div>
+        ${s.last_error?`<div style="color:var(--err);font-size:12px;white-space:pre-wrap">${esc(s.last_error)}</div>`:''}</td>
+      <td style="white-space:nowrap"><button class="btn sm" id="sync-${s.id}" onclick="syncSource(${s.id})">立即同步</button>
+        <button class="btn ghost sm" onclick="editSource(${s.id})">编辑</button>
+        <button class="btn danger" onclick="delSource(${s.id},'${esc(s.name)}')">删除</button></td></tr>`;}).join('')
+    : '<tr><td colspan="4" class="muted">还没有技能源。添加公司 GitLab 的 skill marketplace 后，架构知识（k8s-fleet、k8s-ops…）会自动同步进来，和 Claude Code 共用一份。</td></tr>';
   const rows = skills.length ? skills.map(s=>`<tr>
       <td>${esc(s.name)}</td><td class="muted">${esc(s.description||'')}</td>
-      <td class="muted">${(s.content||'').length} 字</td>
-      <td><button class="btn sm" onclick='editSkill(${JSON.stringify(s)})'>编辑</button>
-          <button class="btn danger" onclick="delSkill(${s.id},'${esc(s.name)}')">删除</button></td></tr>`).join('')
-    : '<tr><td colspan="4" class="muted">还没有技能。技能=喂给数字员工的知识/工作方法（如「服务器情况」「公众号选题规范」），应用按需勾选。</td></tr>';
+      <td class="muted">${s.source_id?`<span class="tag">Git</span> ${esc(s.plugin||'')}<br><span class="mono" style="font-size:11px">${esc(srcName(s.source_id))} · ${esc((s.revision||'').slice(0,8))}</span>`:'手工'}</td>
+      <td class="muted">${(s.content||'').length} 字${(s.file_names||[]).length?' + '+s.file_names.length+' 个文件':''}</td>
+      <td style="white-space:nowrap">${s.source_id?`<button class="btn ghost sm" onclick="viewSkill(${s.id})">查看</button>`
+        :`<button class="btn sm" onclick='editSkill(${JSON.stringify(s)})'>编辑</button>
+          <button class="btn danger" onclick="delSkill(${s.id},'${esc(s.name)}')">删除</button>`}</td></tr>`).join('')
+    : '<tr><td colspan="5" class="muted">还没有技能。技能=喂给数字员工的知识/工作方法（如「服务器情况」「公众号选题规范」），应用按需勾选。</td></tr>';
   c.innerHTML=`
     <div class="head"><div><h2>技能</h2><p class="desc">知识/工作方法包，区别于工具(动作)；应用各自勾选，按应用隔离。</p></div>
       <button class="btn" onclick="newSkill()">+ 新建技能</button></div>
-    <div class="card"><table><thead><tr><th style="width:200px">名称</th><th>简介</th><th style="width:90px">篇幅</th><th style="width:140px"></th></tr></thead>
+    <div class="card"><div style="display:flex;align-items:center;margin-bottom:8px"><b>技能源（从 Git 同步）</b>
+        <span class="muted" style="margin-left:8px;font-size:12px">Git 来源的技能后台只读，改动请到能力仓提 MR</span>
+        <button class="btn ghost sm" style="margin-left:auto" onclick="newSource()">+ 添加技能源</button></div>
+      <table><thead><tr><th>名称 / 地址</th><th style="width:150px">类型</th><th style="width:260px">状态</th><th style="width:230px"></th></tr></thead>
+      <tbody>${srcRows}</tbody></table></div>
+    <div class="card"><table><thead><tr><th style="width:180px">名称</th><th>简介</th><th style="width:170px">来源</th><th style="width:120px">篇幅</th><th style="width:130px"></th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
 }
+async function viewSkill(id){
+  const s=await api('GET','/api/skills/'+id);
+  const files=Object.entries(s.files||{});
+  openModal(`<h3>${esc(s.name)}</h3><p class="desc">${esc(s.description||'')}</p>
+    <div class="muted mono" style="margin-bottom:8px">plugin ${esc(s.plugin||'')} · ${esc(s.path||'')} · ${esc((s.revision||'').slice(0,12))} · 同步于 ${dt(s.synced)}</div>
+    <pre style="background:#f7f8fa;padding:10px;border-radius:6px;max-height:320px;overflow:auto;white-space:pre-wrap">${esc(s.content)}</pre>
+    ${files.map(([k,v])=>`<details><summary class="mono">${esc(k)}（${v.length} 字）</summary><pre style="background:#f7f8fa;padding:10px;border-radius:6px;max-height:240px;overflow:auto;white-space:pre-wrap">${esc(v)}</pre></details>`).join('')}
+    <div class="save-bar"><button class="btn ghost" onclick="closeModal()">关闭</button></div>`);
+}
+function _sourceForm(s){
+  const rw=(s.rewrite||[['ssh://git@192.168.110.44:10022/','https://gitlab.layfz.com/']]).map(r=>r[0]+' => '+r[1]).join('\n');
+  return `<h3>${s.id?'编辑技能源':'添加技能源'}</h3>
+    <p class="desc">用只读 Deploy Token（scope 只勾 read_repository）。令牌只会发给与仓库地址同一主机的地址。</p>
+    <div class="row">
+      <div><label>名称</label><input id="ss-name" value="${esc(s.name||'')}" placeholder="如：公司 skill marketplace"></div>
+      <div style="flex:0 0 200px"><label>类型</label><select id="ss-kind">
+        <option value="marketplace" ${s.kind!=='repo'?'selected':''}>索引仓（marketplace）</option>
+        <option value="repo" ${s.kind==='repo'?'selected':''}>单个能力仓</option></select></div>
+    </div>
+    <div class="row">
+      <div><label>仓库地址（https）</label><input id="ss-url" value="${esc(s.url||'https://gitlab.layfz.com/claude-skills/marketplace.git')}"></div>
+      <div style="flex:0 0 140px"><label>分支</label><input id="ss-branch" value="${esc(s.branch||'')}" placeholder="默认分支"></div>
+    </div>
+    <div class="row">
+      <div><label>Deploy Token 用户名</label><input id="ss-user" value="${esc(s.username||'')}" placeholder="gitlab+deploy-token-1"></div>
+      <div><label>Deploy Token ${s.token_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label>
+        <input id="ss-token" type="password" placeholder="${s.token_set?'留空保持不变':'粘贴令牌'}"></div>
+    </div>
+    <label>只同步这些 plugin（逗号或换行分隔，留空＝索引里的全部；敏感能力不想给数字员工就别列）</label>
+    <input id="ss-plugins" value="${esc((s.plugins||[]).join(', '))}" placeholder="k8s-fleet, k8s-ops, fleet-network">
+    <label>能力仓子目录（仅「单个能力仓」用，monorepo 时填）</label>
+    <input id="ss-subdir" value="${esc(s.subdir||'')}" placeholder="留空＝仓根">
+    <label>地址改写（每行「原前缀 => 新前缀」，把索引里的 ssh 地址转成 https）</label>
+    <textarea id="ss-rewrite" class="mono" style="min-height:60px">${esc(rw)}</textarea>
+    <div class="row">
+      <div style="flex:0 0 160px"><label>同步间隔（分钟）</label><input id="ss-interval" type="number" min="5" value="${s.interval_min||60}"></div>
+      <div style="flex:0 0 160px"><label>启用</label><select id="ss-enabled"><option value="1" ${s.enabled!==false?'selected':''}>启用</option><option value="0" ${s.enabled===false?'selected':''}>停用</option></select></div>
+    </div>
+    <div class="save-bar"><button class="btn" onclick="saveSource(${s.id||0})">保存</button>
+      <button class="btn ghost" onclick="closeModal()">取消</button></div>`;
+}
+function newSource(){ openModal(_sourceForm({})); }
+function editSource(id){ openModal(_sourceForm(_srcCache.find(s=>s.id===id)||{})); }
+async function saveSource(id){
+  const body={ name:$('#ss-name').value.trim(), kind:$('#ss-kind').value, url:$('#ss-url').value.trim(),
+    branch:$('#ss-branch').value.trim(), username:$('#ss-user').value.trim(), plugins:$('#ss-plugins').value,
+    subdir:$('#ss-subdir').value.trim(), rewrite:$('#ss-rewrite').value, interval_min:Number($('#ss-interval').value)||60,
+    enabled:Number($('#ss-enabled').value) };
+  const tk=$('#ss-token').value.trim(); if(tk) body.token=tk;
+  try{ if(id) await api('PUT','/api/skill-sources/'+id,body); else await api('POST','/api/skill-sources',body);
+    closeModal(); toast('已保存，点「立即同步」拉取'); skills(); }catch(e){ toast(e.message); }
+}
+async function syncSource(id){
+  const b=$('#sync-'+id); if(b){ b.disabled=true; b.textContent='同步中…'; }
+  try{ const {report:r}=await api('POST','/api/skill-sources/'+id+'/sync');
+    toast(r.error?('同步失败：'+r.error):`同步完成：新增 ${r.added.length}、更新 ${r.updated.length}、删除 ${r.removed.length}`+(r.conflicts.length?`、冲突 ${r.conflicts.length}`:'')); }
+  catch(e){ toast(e.message); }
+  skills();
+}
+async function delSource(id,name){ if(!confirm('删除技能源「'+name+'」？它同步来的技能会一并删除，勾选了这些技能的应用会失去它们。')) return;
+  await api('DELETE','/api/skill-sources/'+id); toast('已删除'); skills(); }
 function _skillForm(s){
   return `<h3>${s.id?'编辑技能':'新建技能'}</h3>
     <p class="desc">简介会常驻在数字员工的提示词里；正文在它需要时通过 read_skill 拉取。</p>
@@ -528,6 +1253,156 @@ async function viewChat(appId,chatId){
   b.innerHTML=`<div style="margin-bottom:10px"><button class="btn ghost sm" onclick="renderChats()">← 返回</button>
     <span class="mono muted" style="margin-left:10px">${esc(chatId)}</span></div>
     ${messages.map(m=>`<div class="bubble ${m.role}"><div class="who">${m.role} · ${dt(m.ts)}</div>${esc(m.content)}</div>`).join('')||'<div class="empty">空</div>'}`;
+}
+
+/* ---------- 代码仓库 ---------- */
+let _repoCache=[];
+async function codePage(){
+  const c=$('#content'); c.innerHTML='<h2>代码仓库</h2><p class="desc">加载中…</p>';
+  const {repos,workspaces,ttl_hours}=await api('GET','/api/code-repos');
+  _repoCache=repos;
+  const repoRows = repos.length ? repos.map(r=>`<tr>
+      <td style="max-width:0;width:100%"><b class="mono">${esc(r.name)}</b>${r.enabled?'':' <span class="tag off">已停用</span>'}
+        <div class="muted mono" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(r.url)}">${esc(r.url)}${r.branch?' @'+esc(r.branch):''}</div></td>
+      <td class="muted" style="white-space:nowrap">${r.token_set?'✅ 可克隆':'⚠ 未配读令牌'}<br>${r.write_token_set?'✅ 可提 MR':'— 不能提 MR'}</td>
+      <td class="mono muted" style="font-size:12px">${esc(r.test_cmd|| (r.validation_kind==='gitops'?'GitOps 静态校验':'（未配置）'))}</td>
+      <td style="white-space:nowrap"><button class="btn ghost sm" onclick="editRepo(${r.id})">编辑</button>
+        <button class="btn danger" onclick="delRepo(${r.id},'${esc(r.name)}')">删除</button></td></tr>`).join('')
+    : '<tr><td colspan="4" class="muted">还没有仓库。登记后，给应用勾上 code_* 工具，数字员工就能在一次性工作区里改代码、跑测试、提 MR。</td></tr>';
+  const wsRows = workspaces.length ? workspaces.map(w=>`<tr>
+      <td class="mono">${esc(w.id)}</td><td class="mono">${esc(w.repo)}</td><td>${esc(w.app||'')}</td>
+      <td class="mono muted" style="font-size:12px">${esc(w.base_branch||'')} @ ${esc(w.base_commit)}</td>
+      <td class="num">${w.changed}</td>
+      <td>${w.mr_url?`<a href="${esc(w.mr_url)}" target="_blank">查看 MR</a>`:'<span class="muted">—</span>'}</td>
+      <td class="muted">${dt(w.last_used)}</td>
+      <td><button class="btn danger" onclick="closeWs('${esc(w.id)}')">关闭</button></td></tr>`).join('')
+    : '<tr><td colspan="8" class="muted">没有打开的工作区。</td></tr>';
+  c.innerHTML=`
+    <div class="head"><div><h2>代码仓库</h2><p class="desc">数字员工可以改的仓库。模型只在一次性工作区里改，对外唯一出口是「提 MR」（由系统用写令牌调 GitLab API，模型拿不到令牌），合并永远由人在 GitLab 里做。</p></div>
+      <button class="btn" style="white-space:nowrap" onclick="newRepo()">+ 登记仓库</button></div>
+    <div class="card" style="border-color:#ffe2b8;background:#fff8ee">⚠ code_test 会执行仓库代码（包括数字员工改过的部分），等同执行任意代码；建议给改代码的应用选「审批」预设，跑测试和提 MR 都会先发审批卡片（卡片上带 diff）。</div>
+    <div class="card"><table><thead><tr><th>仓库</th><th style="width:110px">权限</th><th style="width:220px">测试命令</th><th style="width:140px"></th></tr></thead><tbody>${repoRows}</tbody></table></div>
+    <div class="card"><div style="margin-bottom:8px"><b>打开的工作区</b><span class="muted" style="margin-left:8px;font-size:12px">闲置 ${ttl_hours} 小时自动清理</span></div>
+      <table><thead><tr><th>工作区</th><th>仓库</th><th>应用</th><th>基于</th><th class="num">改动文件</th><th>MR</th><th>最近使用</th><th></th></tr></thead><tbody>${wsRows}</tbody></table></div>`;
+}
+function _repoForm(r){
+  return `<h3>${r.id?'编辑仓库':'登记仓库'}</h3>
+    <p class="desc">可用同一个项目访问令牌读取仓库和在审批后提 MR：角色 Developer，scope 为 api + read_repository，仅授予这一个项目。无需 write_repository；应用不会直接 git push。</p>
+    <div class="row">
+      <div style="flex:0 0 220px"><label>名称（模型用它打开）</label><input id="cr-name" class="mono" value="${esc(r.name||'')}" placeholder="feishu-agent"></div>
+      <div><label>仓库地址（https）</label><input id="cr-url" value="${esc(r.url||'')}" placeholder="https://gitlab.layfz.com/group/repo.git"></div>
+      <div style="flex:0 0 130px"><label>默认分支</label><input id="cr-branch" value="${esc(r.branch||'')}" placeholder="main"></div>
+    </div>
+    <div class="row">
+      <div><label>读：Git 用户名</label><input id="cr-user" value="${esc(r.username||'')}" placeholder="oauth2"></div>
+      <div><label>读：read_repository 令牌 ${r.token_set?'<span class="muted">（已设置，留空＝不改）</span>':''}</label><input id="cr-token" type="password" placeholder="${r.token_set?'留空保持不变':'粘贴令牌'}"></div>
+    </div>
+    <label>写：提 MR 用的项目访问令牌 ${r.write_token_set?'<span class="muted">（已设置，留空＝不改）</span>':'<span class="muted">（不填＝只能改和看 diff，不能提 MR）</span>'}</label>
+    <input id="cr-wtoken" type="password" placeholder="${r.write_token_set?'留空保持不变':'glpat-…'}">
+    <label>测试命令（在仓库根目录用 sh -c 执行；不填＝不能跑测试）</label>
+    <input id="cr-test" class="mono" value="${esc(r.test_cmd||'')}" placeholder="pip install -q -r requirements.txt && pytest -q">
+    <label>静态校验</label><select id="cr-validation"><option value="" ${!r.validation_kind?'selected':''}>无</option><option value="gitops" ${r.validation_kind==='gitops'?'selected':''}>GitOps YAML/JSON（提 MR 前必须通过）</option></select>
+    <div class="row"><div style="flex:0 0 160px"><label>启用</label><select id="cr-enabled"><option value="1" ${r.enabled!==false?'selected':''}>启用</option><option value="0" ${r.enabled===false?'selected':''}>停用</option></select></div></div>
+    <div class="save-bar"><button class="btn" onclick="saveRepo(${r.id||0})">保存</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
+}
+function newRepo(){ openModal(_repoForm({})); }
+function editRepo(id){ openModal(_repoForm(_repoCache.find(r=>r.id===id)||{})); }
+async function saveRepo(id){
+  const body={ name:$('#cr-name').value.trim(), url:$('#cr-url').value.trim(), branch:$('#cr-branch').value.trim(),
+    username:$('#cr-user').value.trim(), test_cmd:$('#cr-test').value.trim(),
+    validation_kind:$('#cr-validation').value, enabled:Number($('#cr-enabled').value) };
+  const t=$('#cr-token').value.trim(); if(t) body.token=t;
+  const w=$('#cr-wtoken').value.trim(); if(w) body.write_token=w;
+  try{ if(id) await api('PUT','/api/code-repos/'+id,body); else await api('POST','/api/code-repos',body);
+    closeModal(); toast('已保存'); codePage(); }catch(e){ toast(e.message); }
+}
+async function delRepo(id,name){ if(!confirm('删除仓库「'+name+'」？它的工作区会一并关闭（已提的 MR 不受影响）。')) return;
+  await api('DELETE','/api/code-repos/'+id); toast('已删除'); codePage(); }
+async function closeWs(id){ if(!confirm('关闭工作区 '+id+'？未提交的改动会丢弃。')) return;
+  await api('DELETE','/api/workspaces/'+id); toast('已关闭'); codePage(); }
+
+/* ---------- 运行记录 ---------- */
+const TRIGGER_NAMES={chat:'群聊',proactive:'旁听',schedule:'定时任务',job:'后台任务',webhook:'webhook',delegate:'委派'};
+const RUN_STATUS={running:['运行中','y'],completed:['完成','g'],silent:['旁听未发言',''],'max-steps':['轮数用尽','y'],error:['出错','r'],aborted:['中断','r']};
+const _RUN_LIMIT=50;
+let _runTrigger='', _runStatus='', _runBefore=null;
+const durTxt = ms => ms==null?'':(ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s');
+const appName = id => { const a=(_appsForFilter||[]).find(x=>String(x.id)===String(id)); return a?a.name:('#'+id); };
+function runStatusChip(s){ const [t,c]=RUN_STATUS[s]||[s,'']; return `<span class="chip" style="padding:2px 10px"><span class="dot ${c}"></span>${esc(t)}</span>`; }
+async function runsPage(before){
+  _runBefore = before||null;
+  const c=$('#content'); const filter=await appFilterHtml('runsPage()');
+  const sel=(v,opts,on)=>`<select style="width:130px" onchange="${on}">`+opts.map(([k,t])=>`<option value="${k}" ${v===k?'selected':''}>${esc(t)}</option>`).join('')+'</select>';
+  c.innerHTML=`<div class="head"><div><h2>运行记录</h2><p class="desc">数字员工每干一次活就是一个 run：模型回复、工具调用和结果按时间线回放，保留 90 天。</p></div>
+      <span style="margin-left:auto;display:flex;gap:8px">
+        ${sel(_runTrigger,[['','全部触发']].concat(Object.entries(TRIGGER_NAMES)),"_runTrigger=this.value;runsPage()")}
+        ${sel(_runStatus,[['','全部状态']].concat(Object.entries(RUN_STATUS).map(([k,v])=>[k,v[0]])),"_runStatus=this.value;runsPage()")}
+        ${filter}</span></div>
+    <div id="run-body" class="card">加载中…</div>`;
+  renderRuns();
+}
+async function renderRuns(){
+  const p=new URLSearchParams();
+  if(_appFilter!=='all') p.set('app_id',_appFilter);
+  if(_runTrigger) p.set('trigger',_runTrigger);
+  if(_runStatus) p.set('status',_runStatus);
+  if(_runBefore) p.set('before',_runBefore);
+  p.set('limit',_RUN_LIMIT);
+  const {runs}=await api('GET','/api/runs?'+p.toString()); const b=$('#run-body');
+  if(!runs.length){ b.innerHTML='<div class="empty">'+(_runBefore?'没有更早的记录了。':'还没有运行记录。群里 @ 一下数字员工就会出现。')+'</div>'
+    +(_runBefore?'<div style="text-align:center"><button class="btn ghost sm" onclick="runsPage()">← 回到最新</button></div>':''); return; }
+  const more = runs.length===_RUN_LIMIT ? `<button class="btn ghost sm" onclick="runsPage(${runs[runs.length-1].started})">更早 →</button>` : '';
+  b.innerHTML=`<table><thead><tr><th style="width:160px">开始</th><th>应用</th><th>触发</th><th>状态</th>
+      <th class="num">工具调用</th><th class="num">Token</th><th class="num">耗时</th><th style="width:70px"></th></tr></thead><tbody>
+    ${runs.map(r=>`<tr><td class="muted">${dt(r.started)}</td><td>${esc(appName(r.app_id))}</td>
+      <td>${esc(TRIGGER_NAMES[r.trigger]||r.trigger)}</td><td>${runStatusChip(r.status)}</td>
+      <td class="num">${fmt(r.tool_calls)}</td><td class="num">${fmt(r.total_tokens)}</td>
+      <td class="num">${r.ended?durTxt(Math.round((r.ended-r.started)*1000)):''}</td>
+      <td><button class="btn ghost sm" style="white-space:nowrap" onclick='viewRun(${JSON.stringify(r.id)})'>查看</button></td></tr>`).join('')}</tbody></table>
+    <div style="display:flex;justify-content:space-between;margin-top:12px">
+      <span>${_runBefore?'<button class="btn ghost sm" onclick="runsPage()">← 回到最新</button>':''}</span><span>${more}</span></div>`;
+}
+function evBody(e){
+  const p=e.payload||{}; const raw=`<details><summary>原始数据</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`;
+  switch(e.type){
+    case 'run/start': return `<span class="etype">开始</span>模型 ${esc(p.model)}（${esc(p.provider||'')}）· 工具 ${(p.tools||[]).length} 个 · 带入历史 ${p.history_msgs??0} 条${p.policy?' · 策略「'+esc(presetName(p.policy))+'」':''}${p.proactive?' · 旁听模式':''}${raw}`;
+    case 'user/message': return `<span class="etype">输入</span><div class="txt">${esc(p.content)}</div>`;
+    case 'assistant/message': {
+      const calls=(p.tool_calls||[]).map(t=>esc(t.name)).join('、');
+      const u=p.usage?` · ${fmt(p.usage.total)} token`:'';
+      return `<span class="etype asst">模型${p.fallback?'（轮数用尽兜底）':''}</span><span class="muted">${calls?'调用工具：'+calls:'给出答复'}${u}</span>`
+        +(p.content?`<div class="txt">${esc(p.content)}</div>`:'')+raw; }
+    case 'tool/call': return `<span class="etype tool">调用</span><b class="mono">${esc(e.tool)}</b>${p.parse_error?' <span style="color:var(--err)">参数解析失败</span>':''}<pre>${esc(JSON.stringify(p.args??p.raw_args,null,2))}</pre>`;
+    case 'approval/asked': return `<span class="etype" style="background:#fff7e6;color:#ad6800">待审批</span>已在群里发审批卡片，等待审批人（${(p.approvers||[]).length} 人）处理，最长 ${Math.round((p.timeout_s||0)/60)} 分钟`;
+    case 'approval/decided': {
+      const t={'allowed-once':['已批准','ok'],rejected:['被拒绝','err'],expired:['超时','err'],cancelled:['已取消','err'],unavailable:['不可用','err']}[p.outcome]||[p.outcome,'err'];
+      return `<span class="etype" style="background:#fff7e6;color:#ad6800">审批</span><span style="color:var(--${t[1]})">${t[0]}</span>`
+        +(p.decider_open_id?`<span class="muted"> · 审批人 <span class="mono">${esc(p.decider_open_id)}</span></span>`:'')
+        +(p.note?`<div class="txt muted">${esc(p.note)}</div>`:''); }
+    case 'tool/decision': {
+      if(p.decision==='ask') return `<span class="etype" style="background:#fff7e6;color:#ad6800">需审批</span><span class="muted">${esc(p.reason||'')}</span>`;
+      if(p.decision==='allow') return `<span class="etype">放行</span><span class="muted">策略「${esc(presetName({preset:p.preset}))}」${p.rule?'第 '+p.rule+' 条规则':''}允许</span>`;
+      const by = p.by==='guard' ? '安全检查 '+esc(p.guard) : '策略「'+esc(presetName({preset:p.preset}))+'」';
+      return `<span class="etype" style="background:#fff1f0;color:var(--err)">拒绝</span><b>${by}</b><div class="txt" style="color:var(--err)">${esc(p.reason)}</div>`; }
+    case 'tool/result': return `<span class="etype tool">结果</span><b class="mono">${esc(e.tool)}</b> `
+        +(p.status==='denied'?'<span style="color:var(--err)">未执行（被拒绝）</span>'
+          :`<span style="color:var(--${p.status==='error'?'err':'ok'})">${p.status==='error'?'出错':'成功'}</span>`)
+        +`<span class="muted"> · ${durTxt(p.duration_ms)} · ${fmt(p.chars)} 字${p.truncated?'（下面只显示前 4000 字）':''}</span>`
+        +`<details><summary>结果内容</summary><pre>${esc(p.result)}</pre></details>`;
+    case 'run/end': return `<span class="etype">结束</span>${runStatusChip(p.status)} <span class="muted">${durTxt(p.duration_ms)} · ${fmt(p.total_tokens)} token</span>`
+        +(p.reason?`<div class="txt" style="color:var(--err)">${esc(p.reason)}</div>`:'');
+    default: return `<span class="etype">${esc(e.type)}</span>${raw}`;
+  }
+}
+async function viewRun(id){
+  const {run,events}=await api('GET','/api/runs/'+encodeURIComponent(id)); const b=$('#run-body');
+  b.innerHTML=`<div style="margin-bottom:12px"><button class="btn ghost sm" onclick="renderRuns()">← 返回</button></div>
+    <div class="meta" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+      <b>${esc(appName(run.app_id))}</b> ${runStatusChip(run.status)}
+      <span class="chip">${esc(TRIGGER_NAMES[run.trigger]||run.trigger)}</span>
+      <span class="muted">${dt(run.started)} · ${run.ended?durTxt(Math.round((run.ended-run.started)*1000)):'进行中'} · ${fmt(run.total_tokens)} token</span></div>
+    <div class="muted mono" style="margin-bottom:10px">run ${esc(run.id)} · chat ${esc(run.chat_id||'')}${run.speaker_open_id?' · 触发人 '+esc(run.speaker_open_id):''}</div>
+    ${events.map(e=>`<div class="ev"><div class="t">+${((e.ts-run.started)).toFixed(1)}s</div><div class="b">${evBody(e)}</div></div>`).join('')||'<div class="empty">没有事件</div>'}`;
 }
 
 /* ---------- Token 用量 ---------- */
@@ -827,6 +1702,12 @@ async function changePw(){
 
 /* ---------- 启动 ---------- */
 (async function(){ try{ const me=await api('GET','/api/me'); enterApp(me.username); }catch(e){ showLogin(); } })();
+function showStale(){
+  const d=document.createElement('div'); d.className='notice';
+  d.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:50;box-shadow:0 4px 16px rgba(0,0,0,.12)';
+  d.textContent='后台代码已更新，但服务还没重启：部分页面可能无法加载。请重启服务（概览页「重启服务」或 launchd/容器重启）后刷新。';
+  document.body.appendChild(d);
+}
 </script>
 </body>
 </html>

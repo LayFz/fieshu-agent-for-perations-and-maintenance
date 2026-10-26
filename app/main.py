@@ -1,5 +1,6 @@
 """入口：首启播种/迁移 → 启动各应用飞书长连接(后台线程) + 管理后台(uvicorn 主线程)。"""
 import json
+import os
 
 import uvicorn
 
@@ -53,13 +54,42 @@ def _bootstrap():
     username = cfg.admin.get("username") or "admin"
     password = cfg.admin.get("password") or "admin12345"
     if store.ensure_admin(username, password):
-        print(f"★ 已初始化管理员账号：{username} / {password}  —— 登录后请到「账号」里改掉初始密码")
+        print(f"★ 已初始化管理员账号：{username} —— 登录后请到「账号」里改掉初始密码")
+
+
+def _deterministic_task(task):
+    """不经模型的固定任务：安全日报直接由数据生成卡片。其余返回 None 交给模型。"""
+    import json
+    from core import store, taskstore
+    from harness import access
+    from sec import daily
+    if task["instruction"].strip() != daily.INSTRUCTION:
+        return None
+    app = store.get_app(task["app_id"]) or {}
+    if "vuln_report" not in (app.get("tools") or []) or not (app.get("resources") or {}).get("k8s_clusters"):
+        raise PermissionError("安全日报需要应用勾选 vuln_report 并授权至少一个集群（资源权限 k8s_clusters）")
+    card = daily.run(visible=lambda a: access.asset_visible(app, a))
+    return taskstore.CARD_PREFIX + json.dumps(card, ensure_ascii=False)
 
 
 def main():
     _bootstrap()
 
-    from feishu import bot
+    from harness import runs, tasks
+    runs.abort_stale()            # 上次进程遗留的 running → aborted
+    from sec import collector
+    if collector.seed_defaults():  # 首次启动写入默认情报源（之后以后台为准）
+        print("★ 已写入默认情报源（后台「安全 → 情报源」可增删改）", flush=True)
+
+    from feishu import bot        # 导入即注册审批应答者（发/改审批卡片）
+    from harness import approval
+    approval.cancel_stale()        # 仅失效旧版无 task 的审批；持久任务审批由恢复器接续
+    tasks.register_executor(bot.execute_task)
+    bot.register_task_executor(_deterministic_task)
+    tasks.register_sender(bot.deliver_task)
+    tasks.start(workers=int(os.getenv("HARNESS_WORKERS", "2")))
+    from app import patrol_service
+    patrol_service.start()
     started = bot.start_all()
     if started == 0:
         print("⚠ 暂无可启动的应用（需在后台建应用、填飞书凭证、绑 AI、并启用）", flush=True)
@@ -70,7 +100,13 @@ def main():
     from web import admin
     port = int(cfg.web.get("port", 8800))
     print(f"★ 管理后台：http://localhost:{port}")
-    uvicorn.run(admin.app, host="0.0.0.0", port=port, log_level="info")
+    try:
+        uvicorn.run(admin.app, host=os.getenv("WEB_HOST", "0.0.0.0"), port=port, log_level="info")
+    finally:
+        scheduler.stop()
+        patrol_service.stop()
+        bot.stop()
+        tasks.stop()
 
 
 if __name__ == "__main__":

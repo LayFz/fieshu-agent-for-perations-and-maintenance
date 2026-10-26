@@ -1,88 +1,120 @@
-# feishu-agent · 飞书数字员工平台
+# feishu-agent · 飞书服务端 Harness
 
-一个进程里跑**多个「数字员工」**的飞书机器人平台。每个数字员工 = 一个独立飞书机器人 + 绑定一个 AI 模型 + 勾选的工具 + 勾选的技能 + 自己的人设。
+通过飞书交付任务、查看进度、批准操作的常驻助手。一个 Python 服务承载多个应用，每个应用有独立飞书身份、模型、工具、技能、资源白名单与审批人。面向三类工作：**集群排障、问题日志分析、漏洞分析与代码修复**。
 
-> 群里 **@机器人** → 大模型 + 工具循环干活 → 回群。带对话记忆、长期记忆、定时任务，外加一个零构建的管理后台。
+当前版本已接入持久任务队列、工具动作账本、审批挂起恢复、隔离测试执行器和独立于模型的持续巡检。2026-10-23 已在本机验证：飞书长连接、集群与 ArgoCD 只读采集、两个 GitOps 仓库克隆与本地静态校验、GitLab 项目和流水线 API、三个 OpenObserve 日志流，以及进程重启恢复。**尚未部署云端；飞书群列表因缺少权限不可用，巡检通知和 MR 审批尚未绑定目标会话及审批人，尚未创建真实 MR。**
 
-- **多应用、四层隔离**：身份(独立飞书应用) + AI(各绑各的) + 工具(勾选子集) + 技能(勾选子集)，天然防越权。
-- **只对内、不用公网**：飞书走**长连接**（机器人主动拨出），服务只出站、不开入站端口。
-- **任意 OpenAI 兼容模型**：DeepSeek / 豆包 / 通义 / OpenAI / 自建网关…，后台配置即生效，不动代码。
-- **单容器**：Python + SQLite，前端内置，`docker compose up` 一条命令起。
-- **密钥不入库**：`config.yaml`(gitignore) 或环境变量；运行时配置存 SQLite。
+## 当前能力与边界
 
-## 能力一览
-
-| 能力 | 说明 |
+| 能力 | 当前实现 |
 |---|---|
-| 🤖 多数字员工 | 一套平台开多个应用，每个独立身份、模型、能力、人设 |
-| 🛠️ 工具(function calling) | 飞书文档读写、日志/监控查询、定时任务管理…按应用勾选 |
-| 📚 技能(skill) | 知识/工作方法包（如「公司架构」），渐进披露，按应用隔离 |
-| ⏰ 定时任务 | 到点自动跑指令并发回群（每天/每周/每隔N分钟）；对话或后台均可创建 |
-| 🧠 记忆 | 对话历史(滑动窗口) + 长期记忆(remember)，按应用隔离 |
-| 📊 可观测 | 只读接 OpenObserve(日志) / Beszel(服务器负载) / Uptime Kuma(服务状态) |
-| 🔧 运维执行 | SSH 到受管主机跑命令 + kubectl 直连 k8s 集群；三层闸门（模型判断 + 危险命令硬黑名单 + 勾选隔离），集群可设只读 |
-| 🔌 MCP 外挂 | 注册远程 HTTP MCP server，应用勾选后其工具进工具循环，不改代码即扩能力 |
-| 🖥️ 管理后台 | 应用 / AI供应商 / 技能 / MCP工具 / 定时任务 / 记忆 / 用量 / 可观测 / SSH运维 / K8s运维，全可视化配置 |
+| 持续任务 | 飞书消息、定时触发进入 SQLite 任务队列；同一应用/群串行，worker 租约与检查点支持重启恢复 |
+| 工具动作账本 | 动作先落库再执行；已完成动作恢复时复用结果；中断的非只读动作结果不明时停到 `needs_attention`，不自动重做 |
+| 飞书审批 | 审批持久化，等待期间释放 worker；点击后恢复任务，并重查权限、guard 与代码快照 |
+| 授权 | 默认 `readonly`；配置非法则拒绝；勾选工具之外还须配置资源白名单，缺失资源授权即拒绝 |
+| 集群与日志 | 授权范围内只读查询；集群正式变更走 GitOps 仓库修复与 MR；Secret、身份覆盖、原始 API 路径等受限制 |
+| 常驻巡检 | 固定只读采集 Kubernetes、ArgoCD、GitOps、GitLab 流水线及指定 OpenObserve 日志流；按来源标记成功/部分/失败，SQLite 保存快照与问题状态，只在变化或首次绑定时通过飞书通知 |
+| 漏洞与研发 | 查询证据、隔离工作区改代码、Docker 测试或 GitOps 静态校验、审批后提 MR；校验通过和 MR 证据是修复任务的最低完成条件 |
+| 代码测试 | Docker 隔离执行，默认禁用；须显式配置可信本地镜像及运行器，不回退到宿主 shell |
+| 管理与审计 | 任务列表/详情/取消/继续、运行事件、应用/模型/技能/MCP/代码仓库与连接配置 |
+
+漏洞匹配、根因判断和生产恢复仍需业务验收；“已建 MR”不代表“已发布修复”。当前证据检查是最低门槛，不能代替发布后验证或复扫。
 
 ## 架构
 
+```text
+飞书长连接 / 定时任务 / 后台提交
+                    ↓
+       tasks 队列 → worker 租约 → 模型检查点
+                    ↓
+       当前授权 → 工具策略/guard → task_actions
+                    ↓
+       只读查询 / 隔离工作区 / 审批挂起恢复
+                    ↓
+       证据校验 → 持久通知 outbox → 飞书
+
+本地常驻服务 → patrols 租约 → 固定只读采集器
+                    ↓
+         快照/问题台账/通知 outbox → 飞书
+
+管理后台 :8800 ── SQLite（任务、动作、审批、运行记录、配置）
+代码测试 ── 显式配置的 Docker 沙箱（无网络、无生产凭据）
 ```
-飞书群 ──长连接(出站)──▶ bot(每应用一条长连接) ──▶ 编排(历史+记忆+技能 → 工具循环)
-                                                          │              │
-                                              工具池(按应用勾选)    绑定的 AI(OpenAI 兼容)
-                                          ┌───────┼───────┬──────────┬────────┐
-                                       文档读写 只读监控 运维(SSH/K8s) MCP外挂 定时任务/read_skill
-管理员浏览器 ──:8800──▶ 管理后台(FastAPI) ──▶ 同一个 SQLite
-调度线程 ──到点──▶ 跑指令 → 发回群
-```
 
-依赖单向、好扩展：`core ← feishu/obs/sched ← llm ← web ← app`。
+飞书使用主动出站的长连接，不需要公开 webhook 入口；管理后台仍监听 HTTP 端口，应由部署网络限制访问。SQLite 数据目录需持久保存，当前按单服务实例设计；未验证多实例、高可用或大规模负载。
 
-## 核心概念
+### 本机真实巡检
 
-- **应用 = 数字员工 = 席位**：开一个应用就上岗一个数字员工。
-- **工具 vs 技能**：工具是「能做的动作」，技能是「该懂的知识/方法」。互不替代，都按应用勾选。
-- **定时任务**：用对应应用的 AI+工具+技能跑，结果发回原群；走 REST，不依赖长连接。
-- **可观测**：监控连接是只读集成，连接信息在后台「可观测」页配置（全局共享）。OpenObserve 按**组织(org)**隔离数据，可在该页加多个 org（每个 org 用它自己的只读 service account），`query_logs`/`list_log_streams` 用 `org` 参数切换。
-- **运维执行(高风险)**：SSH 跑命令、kubectl 直连集群能真实改动生产。三层闸门兜底：模型判断为主 + 危险命令硬黑名单 + 应用勾选隔离；集群可设只读。**绝不给「主动旁听」类应用勾。**
+本机已有配置时，使用 Python 3.12 虚拟环境启动 macOS 登录会话的常驻服务：
 
-## 快速开始
-
-### 本地
 ```bash
-pip install -r requirements.txt
-cp config.example.yaml config.yaml      # 填飞书 app_id/app_secret + 管理员密码；模型可登录后台再配
-python -m app.main
-# 浏览器开 http://localhost:8800，用初始管理员账号登录
+python3.12 -m venv .venv-runtime
+.venv-runtime/bin/python -m pip install -r requirements-dev.txt
+python3 scripts/local_service.py install
+python3 scripts/local_service.py status
 ```
 
-### Docker
+打开 [真实管理后台的持续巡检](http://127.0.0.1:8800/#patrols) 查看来源状态、扫描快照和问题台账；`8801` 是独立的模拟演示。后台可配置项目 SSH 仓库、日志目标、间隔、汇报群并触发立即扫描。应用需要明确的 `k8s_clusters`、`namespaces`、`gitlab_projects`、`log_orgs`、`log_streams` 资源授权。日志巡检只请求固定错误关键词的聚合计数，不保存日志正文；关键词命中只是待核对线索。
+
+在目标群 @机器人发送“我的身份”或“巡检状态”，它会返回 `chat_id`；后台也会列出机器人实际收到消息的会话及发言人 `open_id`。管理员选定汇报会话并登记审批人后，应用重新扫描并发送首次汇报。若希望后台直接列出机器人当前加入的群，需要在飞书开放平台为该应用开通 `im:chat:readonly` 或 `im:chat.group_info:readonly` 并发布。GitLab 只读巡检可用每项目 Reporter + `read_api`；若同一项目还需经审批创建修复 MR，可用 Developer + `api` + `read_repository` 项目令牌，并将它分别配置为该仓库读/写令牌。令牌不会在后台回显。停止本机常驻服务：`python3 scripts/local_service.py uninstall`；SQLite 数据保留。详细验收见 [本地 Harness 测试手册](docs/local-harness-testing.md#真实本地常驻巡检)。
+
+## 本地测试与演示
+
+需要 Python **3.12**。若已有虚拟环境，先检查 `.venv/bin/python --version`。
+
 ```bash
-docker compose up -d --build
-docker compose logs -f                  # 看首启打印的管理员账号
-# 访问 http://<host>:8800
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+FEISHU_AGENT_CONFIG='' .venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python scripts/local_demo.py --seed --port 8801
 ```
-数据持久化在 `./data`（设置/记忆/用量，删容器不丢）。
 
-## 飞书侧一次性配置
+打开 [本地演示](http://127.0.0.1:8801/demo) 或 [管理后台](http://127.0.0.1:8801/)。演示只绑定 localhost，使用假模型、假集群、假日志与假 CVE，经过真实任务引擎；不证明外部系统已经接通。完整验收、审批恢复、真实 Docker 测试与清理步骤见 [本地 Harness 测试手册](docs/local-harness-testing.md)。
 
-1. 自建应用启用**机器人**，加进目标群。
-2. 事件订阅选 **长连接**（不是 webhook），订阅 `im.message.receive_v1`。
-3. 按用途开权限：纯聊天/运维只需 `im:message` + `im:message:send_as_bot`；要读写文档再加 `wiki:wiki` / `docx:document`(写文档加 `drive:drive`)。
-4. 改完权限/事件**重新发版**才生效。
+## 连接真实服务
 
-> ⚠️ 事件订阅必须走**长连接**——这是「免公网、只出站」方案成立的根。
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+cp config.example.yaml config.yaml
+# 编辑引导配置后启动；模型与资源可在后台配置
+WEB_HOST=127.0.0.1 .venv/bin/python -m app.main
+```
 
-## 上手配一个数字员工（后台）
+也可通过既有 Compose 部署流程启动服务；本轮没有在云端执行部署。默认数据在 `./data`；`FEISHU_AGENT_DATA_DIR` 可指定独立目录，`FEISHU_AGENT_CONFIG` 可指定引导配置路径，设为空字符串可禁用配置文件读取。云端 GitOps SSH 采集需为服务账户提供只读密钥和已验证的 `known_hosts`；镜像无 git 二进制时会使用 Paramiko/Dulwich。
 
-1. **AI 供应商** → 加一个模型（任意 OpenAI 兼容接口）。
-2. **应用** → 新建：填飞书 App ID/Secret、绑 AI、勾工具、（可选）勾技能、写人设、启用 → **重启服务**让长连接上线。
-3.（可选）**技能** → 建知识包；**可观测** → 配监控连接；**定时任务** → 建周期报告。
+1. 在后台配置 AI 供应商、监控/集群/仓库连接和所需技能。
+2. 创建应用，勾选工具与技能，配置资源权限。工具可见不等于能访问所有资源；`*` 必须显式授予。
+3. 保持 `readonly` 做首次诊断；要改代码时选 `approval` 并配置审批人。`compat` 仅为显式兼容选项，不是默认。
+4. 配置飞书长连接并启用应用，重启服务建立连接。在飞书订阅 `im.message.receive_v1` 和审批回调 `card.action.trigger`，按实际工具需要授予权限并发布应用版本。
+5. 用测试群和测试资源先验收，再接生产范围。审批不会覆盖资源限制、命令限制或外部内容污染 guard。
 
-## 技术栈
+资源权限例子（名称应替换成后台实际登记的资源）：
 
-Python · FastAPI · uvicorn · lark-oapi(飞书) · openai(OpenAI 兼容) · SQLite(WAL) · 原生 JS 单文件前端。
+```json
+{
+  "k8s_clusters": ["test-cluster"],
+  "namespaces": ["demo"],
+  "log_orgs": ["demo-org"],
+  "log_streams": ["app_logs"],
+  "repos": ["demo-repo"]
+}
+```
 
-## 开发与坑
+飞书可发送 `我的身份`、`任务列表`、`任务 <ID>`、`取消任务 <ID>`、`继续任务 <ID>`；已绑定巡检的会话还可发送 `巡检`、`巡检状态`、`问题台账`、`修复问题 <编号>`。修复任务会核对问题、在授权仓库本地改动并静态校验，具体完整 diff 通过飞书卡片审批后才由 GitLab API 创建 MR。审批等待须通过审批卡片处理；结果不明的写操作须先人工核对，不能用“继续”盲重试。应用权限、工具、技能、MCP 或模型供应商变更后，旧任务检查点停止继续使用，需按新配置新建任务。
 
-工程约定、数据模型、以及若干**部署/并发/时区的隐蔽坑**见 [`CLAUDE.md`](./CLAUDE.md)。内网部署流程见 [`deploy/DEPLOY.md`](./deploy/DEPLOY.md)。
+后台配置的应用密钥、模型密钥和连接凭据可能持久化到 SQLite；`config.yaml`、数据库及备份都应按敏感数据保护。凭据不会因此自动加密。
+
+## 代码测试的额外配置
+
+设置 `HARNESS_SANDBOX_IMAGE` 为已存在的可信 Docker 镜像才可启用 `code_test`。依赖须预装在镜像里，测试无网络；审批绑定代码快照、测试命令和实际镜像 ID。测试容器不挂载服务配置、数据库、生产凭据或 Docker socket。
+
+**现有主 Dockerfile 不含 Docker CLI，Compose 不会自动启用代码测试。** 云端接入还需验证可信执行节点，或明确配置控制面到 Docker daemon 的访问和一致的宿主挂载路径；不能仅设置镜像变量就认为可用。详见 [沙箱验收](docs/local-harness-testing.md#真实-docker-沙箱验收)。
+
+## 开发与部署参考
+
+Python 3.12 · FastAPI · SQLite WAL · lark-oapi · OpenAI 兼容模型接口 · 原生 JS 管理后台。
+
+- [工程约定](CLAUDE.md)：数据模型、恢复契约与并发注意事项。
+- [设计与历史路线](docs/harness-design.md)：已实现范围及后续计划。
+- [内网部署流程](deploy/DEPLOY.md)：已有部署机制；本轮仅本地真实验收，未触发云端发布。
+- CI 新增 Python 3.12 自动测试，测试通过后才进入原有 main 构建/部署阶段；本轮未触发远程 CI 或部署。

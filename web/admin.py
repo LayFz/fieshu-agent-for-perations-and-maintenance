@@ -12,15 +12,28 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from core import store
 from feishu import auth, bot
+from harness import policy, tasks, access, workflows
+from harness import skills as skills_sync
+from harness import workspace, webhooks
+from harness import box as box_ops
+from core import boxstore
+from ops import argocd as ops_argocd
+from ops import gitlab as ops_gitlab
+from ops import web as ops_web
+from ops import harbor as ops_harbor
+from sec import collector
 from llm import mcp as mcp_mod
 from llm.tools import all_tools, tool_list_for
 
 app = FastAPI(title="数字员工平台 管理后台", docs_url=None, redoc_url=None)
 _WEB = Path(__file__).resolve().parent / "static"
+# index.html 每次请求现读磁盘，后端代码却只在进程启动时加载：记下启动时的页面指纹，
+# 代码更新但服务没重启时让前端提示，避免新页面调旧接口导致整页空白。
+_UI_AT_START = hashlib.sha256((_WEB / "index.html").read_bytes()).hexdigest()
 _COOKIE = "fa_sid"
 _TTL = 7 * 24 * 3600
 
@@ -70,6 +83,346 @@ def index():
 def healthz():
     return {"ok": True}
 
+@app.get("/readyz")
+def readyz(response: Response):
+    h = tasks.health()
+    try:
+        store._conn.execute("SELECT 1").fetchone()
+        db = True
+    except Exception:
+        db = False
+    ok = db and h["workers"] > 0 and not h["stopping"]
+    if not ok:
+        response.status_code = 503
+    return {"ok": ok, "database": db, "runtime": h}
+
+
+# ---------- 应用自主持续巡检 ----------
+@app.get("/api/patrols/repositories")
+def patrol_repositories(request: Request):
+    _auth(request)
+    from ops import gitops_scan
+    return {"repositories": gitops_scan.configured()}
+
+
+@app.put("/api/patrols/repositories")
+async def patrol_repositories_update(request: Request):
+    _auth(request)
+    from ops import gitops_scan
+    from harness import patrols
+    body = await _body(request)
+    rows = body.get("repositories")
+    if not isinstance(rows, list) or len(rows) > 20:
+        raise HTTPException(status_code=400, detail="仓库连接必须是最多 20 项的数组")
+    try:
+        validated = [gitops_scan.validate_repository(row) for row in rows]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if len({row["project"] for row in validated}) != len(validated):
+        raise HTTPException(status_code=400, detail="GitOps 项目不能重复")
+    store.set_setting("gitops_repositories", json.dumps(validated, ensure_ascii=False))
+    for monitor in patrols.list_monitors():
+        if set(monitor["git_projects"]) & {row["project"] for row in validated}:
+            patrols.request_scan(monitor["id"])
+    return {"ok": True, "repositories": validated}
+
+
+@app.get("/api/patrols")
+def patrol_list(request: Request):
+    _auth(request)
+    from harness import patrols
+    from sched import runner
+    return {"monitors": patrols.list_monitors(), "runtime": patrols.health(),
+            "feishu": bot.health(), "scheduler": runner.health()}
+
+
+@app.post("/api/patrols")
+async def patrol_create(request: Request):
+    _auth(request)
+    from harness import patrols
+    body = await _body(request)
+    try:
+        row = patrols.configure(app_id=int(body.get("app_id") or 0), name=body.get("name") or "持续巡检",
+            cluster=body.get("cluster"), git_projects=body.get("git_projects") or [],
+            log_targets=body.get("log_targets") or [],
+            interval_seconds=int(body.get("interval_seconds") or 300), chat_id=body.get("chat_id") or None,
+            namespaces=body.get("namespaces") or [], enabled=bool(body.get("enabled", True)))
+        return {"monitor": row}
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.patch("/api/patrols/{monitor_id}")
+async def patrol_update(monitor_id: str, request: Request):
+    _auth(request)
+    from harness import patrols
+    body = await _body(request)
+    allowed = {"name", "cluster", "git_projects", "log_targets", "interval_seconds", "chat_id", "namespaces", "enabled"}
+    if set(body) - allowed:
+        raise HTTPException(status_code=400, detail="不支持的巡检设置")
+    try:
+        return {"monitor": patrols.update(monitor_id, **body)}
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/patrols/{monitor_id}/scan")
+def patrol_scan(monitor_id: str, request: Request):
+    _auth(request)
+    from harness import patrols
+    return {"queued": patrols.request_scan(monitor_id)}
+
+
+@app.get("/api/patrols/{monitor_id}")
+def patrol_detail(monitor_id: str, request: Request):
+    _auth(request)
+    from harness import patrols
+    monitor = patrols.get(monitor_id)
+    if not monitor:
+        raise HTTPException(status_code=404, detail="巡检不存在")
+    return {"monitor": monitor, "scans": patrols.list_scans(monitor_id=monitor_id, limit=20),
+            "issues": patrols.list_issues(monitor_id=monitor_id, limit=200)}
+
+
+@app.get("/api/feishu/chats/{app_id}")
+def feishu_chat_list(app_id: int, request: Request):
+    _auth(request)
+    from feishu import chats
+    application = store.get_app(app_id)
+    if not application:
+        raise HTTPException(status_code=404, detail="应用不存在")
+    result = chats.list_for(application)
+    result["observed"] = store.list_observed_feishu_chats(app_id)
+    return result
+
+
+def _task_view(t, detail=False):
+    checkpoint = t.get("checkpoint") or {}
+    fields = ("id", "app_id", "chat_id", "instruction", "speaker_open_id", "workflow", "trigger", "status",
+              "attempts", "created", "updated", "ended", "result", "error", "cancel_requested")
+    view = {k: t.get(k) for k in fields}
+    view.update(progress=checkpoint.get("progress", ""), steps=checkpoint.get("step", 0),
+                tokens=checkpoint.get("tokens", 0))
+    if detail:
+        from core import taskstore
+        view["evidence"] = checkpoint.get("evidence", [])
+        view["actions"] = [dict(r) for r in store._conn.execute(
+            "SELECT action_key,tool,risk,state,approval_id,created,updated FROM task_actions WHERE task_id=? ORDER BY created",
+            (t["id"],)).fetchall()]
+    return view
+
+
+@app.get("/api/tasks")
+def task_list(request: Request):
+    _auth(request)
+    q = request.query_params
+    return {"tasks": [_task_view(t) for t in tasks.list_tasks(app_id=q.get("app_id") or None,
+            status=q.get("status") or None, limit=100)],
+            "workflows": {k: v[0] for k, v in workflows.PROFILES.items()}, "runtime": tasks.health()}
+
+
+# ---------- Webhook 触发（harness.webhooks）：外部系统投递事件 → 生成任务 ----------
+@app.post("/hooks/{hook_id}")
+async def webhook_receive(hook_id: str, request: Request):
+    """公开入口：只认 webhook 令牌，不需要后台登录。"""
+    body = await request.body()
+    status, payload = webhooks.receive(hook_id, dict(request.headers), body)
+    return JSONResponse(payload, status_code=status)
+
+# ---------- 工作机 runner 接口（只认 runner 令牌，不需要后台登录） ----------
+_RUNNER_POLL = 25
+
+
+def _runner(request):
+    auth = request.headers.get("authorization", "")
+    name = boxstore.authenticate(auth[7:].strip() if auth.lower().startswith("bearer ") else "")
+    if not name:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return name
+
+
+@app.post("/runner/v1/claim")
+def runner_claim(request: Request, body: dict = None):
+    """长轮询：有操作立即返回，没有就最多等 25s 后 204。顺带记录心跳与 runner 能力。"""
+    name = _runner(request)
+    boxstore.touch(name, (body or {}).get("info") if isinstance(body, dict) else None)
+    deadline = time.monotonic() + _RUNNER_POLL
+    while True:
+        op = boxstore.claim(name)
+        if op:
+            return op
+        left = deadline - time.monotonic()
+        if left <= 0:
+            boxstore.touch(name)
+            return Response(status_code=204)
+        box_ops.wait(min(left, 1.0))
+
+
+@app.post("/runner/v1/ops/{op_id}")
+async def runner_result(op_id: str, request: Request):
+    name = _runner(request)
+    body = await _body(request)
+    ok = boxstore.complete(op_id, name, bool(body.get("ok")), body.get("result") if isinstance(body.get("result"), dict)
+                           else {"error": "runner 返回格式不正确"})
+    box_ops.notify()
+    if not ok:
+        raise HTTPException(status_code=409, detail="操作不存在、已超时或不属于该 runner")
+    return {"ok": True}
+
+
+@app.get("/api/box")
+def box_status(request: Request):
+    _auth(request)
+    return {"runners": boxstore.list_runners(), "novnc_url": store.get_setting("box_novnc_url") or ""}
+
+
+@app.post("/api/box/runners")
+async def box_create(request: Request):
+    _auth(request)
+    b = await _body(request)
+    name = (b.get("name") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
+        raise HTTPException(status_code=400, detail="名称只能用字母、数字、- 和 _（最多 40 个）")
+    token = boxstore.create_runner(name)
+    return {"name": name, "token": token, "note": "令牌只显示这一次；同名再次创建会轮换令牌。"}
+
+
+@app.delete("/api/box/runners/{name}")
+def box_delete(name: str, request: Request):
+    _auth(request)
+    boxstore.delete_runner(name)
+    box_ops.notify()
+    return {"ok": True}
+
+
+@app.put("/api/box/settings")
+async def box_settings(request: Request):
+    _auth(request)
+    b = await _body(request)
+    url = (b.get("novnc_url") or "").strip()
+    if url and not url.startswith(("https://", "http://")):
+        raise HTTPException(status_code=400, detail="地址需为 http(s):// 开头")
+    store.set_setting("box_novnc_url", url)
+    return {"ok": True}
+
+
+def _hook_view(h, request=None):
+    v = {k: h.get(k) for k in ("id", "name", "app_id", "chat_id", "workflow", "template", "enabled", "max_per_hour",
+                               "calls", "last_called", "last_status", "last_error", "created")}
+    v["path"] = f"/hooks/{h['id']}"
+    return v
+
+def _hook_fields(b, creating):
+    f = {}
+    if creating or "name" in b:
+        f["name"] = (b.get("name") or "").strip()
+        if not f["name"]:
+            raise HTTPException(status_code=400, detail="请填名称")
+    if creating or "app_id" in b:
+        try:
+            f["app_id"] = int(b.get("app_id"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="请选择应用")
+        if not store.get_app(f["app_id"]):
+            raise HTTPException(status_code=400, detail="应用不存在")
+    if creating or "chat_id" in b:
+        f["chat_id"] = (b.get("chat_id") or "").strip()
+        if not f["chat_id"]:
+            raise HTTPException(status_code=400, detail="请填投递会话 chat_id（结果和通知发到这里）")
+    if creating or "template" in b:
+        f["template"] = (b.get("template") or "").strip()
+        if not f["template"] or len(f["template"]) > 20000:
+            raise HTTPException(status_code=400, detail="指令模板不能为空，且不超过 20000 字")
+    if "workflow" in b:
+        f["workflow"] = b.get("workflow") or "auto"
+        if f["workflow"] != "auto" and f["workflow"] not in workflows.PROFILES:
+            raise HTTPException(status_code=400, detail="未知工作流")
+    if "enabled" in b:
+        f["enabled"] = 1 if b["enabled"] else 0
+    if "max_per_hour" in b:
+        try:
+            f["max_per_hour"] = max(1, min(int(b.get("max_per_hour") or 60), 3600))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="每小时上限需为整数")
+    return f
+
+@app.get("/api/webhooks")
+def list_webhooks(request: Request):
+    _auth(request)
+    return {"webhooks": [_hook_view(h) for h in store.list_webhooks()],
+            "chats": store.recent_chats(), "workflows": ["auto"] + list(workflows.PROFILES)}
+
+@app.post("/api/webhooks")
+async def create_webhook(request: Request):
+    _auth(request)
+    f = _hook_fields(await _body(request), True)
+    token, hook_id = webhooks.new_token(), webhooks.new_id()
+    store.create_webhook(hook_id, token_hash=webhooks.hash_token(token), **f)
+    return {"ok": True, "id": hook_id, "path": f"/hooks/{hook_id}", "token": token,
+            "note": "令牌只显示这一次，请立即保存；丢失可轮换"}
+
+@app.put("/api/webhooks/{hook_id}")
+async def edit_webhook(hook_id: str, request: Request):
+    _auth(request)
+    if not store.get_webhook(hook_id):
+        raise HTTPException(status_code=404, detail="webhook 不存在")
+    store.update_webhook(hook_id, **_hook_fields(await _body(request), False))
+    return {"ok": True}
+
+@app.post("/api/webhooks/{hook_id}/rotate")
+def rotate_webhook(hook_id: str, request: Request):
+    _auth(request)
+    if not store.get_webhook(hook_id):
+        raise HTTPException(status_code=404, detail="webhook 不存在")
+    token = webhooks.new_token()
+    store.update_webhook(hook_id, token_hash=webhooks.hash_token(token))
+    return {"ok": True, "token": token, "note": "旧令牌已立即失效；新令牌只显示这一次"}
+
+@app.delete("/api/webhooks/{hook_id}")
+def remove_webhook(hook_id: str, request: Request):
+    _auth(request)
+    store.delete_webhook(hook_id)
+    return {"ok": True}
+
+
+@app.post("/api/tasks")
+async def task_submit(request: Request):
+    user = _auth(request)
+    b = await _body(request)
+    try:
+        t, created = tasks.submit(int(b.get("app_id") or 0), b.get("chat_id"), b.get("instruction"),
+                                  source="admin", event_id=b.get("request_id"), workflow=b.get("workflow", "auto"),
+                                  speaker=user, speaker_open_id="admin:" + user)
+    except (ValueError, PermissionError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"task": _task_view(t), "created": created}
+
+
+@app.get("/api/tasks/{task_id}")
+def task_detail(task_id: str, request: Request):
+    _auth(request)
+    t = tasks.get(task_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return _task_view(t, detail=True)
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def task_cancel(task_id: str, request: Request):
+    _auth(request)
+    return {"ok": tasks.cancel(task_id)}
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def task_resume(task_id: str, request: Request):
+    _auth(request)
+    b = await _body(request)
+    if b.get("instruction") is not None and (not isinstance(b["instruction"], str) or len(b["instruction"]) > 100000):
+        raise HTTPException(status_code=400, detail="补充指令必须是不超过 100000 字的文本")
+    if not tasks.resume(task_id, instruction=b.get("instruction")):
+        raise HTTPException(status_code=409, detail="任务状态不允许恢复；未决变更须先人工核对，审批请用飞书卡片")
+    return {"ok": True}
+
 
 # ---------- 鉴权 ----------
 @app.post("/api/login")
@@ -89,7 +442,9 @@ def logout(response: Response):
 
 @app.get("/api/me")
 def me(request: Request):
-    return {"username": _auth(request)}
+    user = _auth(request)
+    current = hashlib.sha256((_WEB / "index.html").read_bytes()).hexdigest()
+    return {"username": user, "stale": current != _UI_AT_START}
 
 @app.post("/api/password")
 async def change_password(request: Request):
@@ -129,6 +484,11 @@ def overview(request: Request):
         "counts": store.counts(),
         "usage_total": store.usage_total(),
         "usage_today": store.usage_since(24 * 3600),
+        "vulns": store.vuln_stats(),
+        "top_vulns": [{k: v.get(k) for k in ("cve", "title", "kev", "epss", "social", "status", "severity")}
+                      for v in store.list_vulns(kev=True, sort="kev", limit=5)["items"]],
+        "intel_sources": {"total": len(store.list_intel_sources()),
+                          "errors": sum(1 for s in store.list_intel_sources() if s.get("last_status") == "error")},
     }
 
 
@@ -171,7 +531,7 @@ def remove_provider(pid: int, request: Request):
 @app.get("/api/tools/pool")
 def tools_pool(request: Request):
     _auth(request)
-    return {"tools": all_tools()}
+    return {"tools": all_tools(), "policy_presets": policy.presets_public()}
 
 
 # ---------- MCP server（全局注册表；应用按 server 整体勾选后其工具进工具循环） ----------
@@ -268,9 +628,24 @@ async def create_skill(request: Request):
         raise HTTPException(status_code=400, detail="技能名称已存在")
     return {"ok": True, "id": sid}
 
+def _manual_skill_or_400(sid):
+    sk = store.get_skill(sid)
+    if sk and sk.get("source_id"):
+        raise HTTPException(status_code=400, detail="这个技能从 Git 同步而来，后台只读；要改请到对应能力仓提 MR，删除请在技能源里取消同步")
+    return sk
+
+@app.get("/api/skills/{sid}")
+def skill_detail(sid: int, request: Request):
+    _auth(request)
+    sk = store.get_skill(sid)
+    if not sk:
+        raise HTTPException(status_code=404, detail="技能不存在")
+    return sk
+
 @app.put("/api/skills/{sid}")
 async def edit_skill(sid: int, request: Request):
     _auth(request)
+    _manual_skill_or_400(sid)
     b = await _body(request)
     store.update_skill(sid, name=b.get("name"), description=b.get("description"), content=b.get("content"))
     return {"ok": True}
@@ -278,8 +653,452 @@ async def edit_skill(sid: int, request: Request):
 @app.delete("/api/skills/{sid}")
 def remove_skill(sid: int, request: Request):
     _auth(request)
+    _manual_skill_or_400(sid)
     store.delete_skill(sid)
     return {"ok": True}
+
+
+# ---------- 连接凭证（ArgoCD / GitLab 只读，给数字员工看） ----------
+@app.get("/api/connections")
+def connections(request: Request):
+    _auth(request)
+    a, g, hc = ops_argocd.config(), ops_gitlab.config(), ops_harbor.config()
+    return {"argocd": {"url": a["url"], "insecure": a["insecure"], "token_set": bool(a["token"]), "token_masked": _mask(a["token"])},
+            "gitlab": {"url": g["url"], "token_set": bool(g["token"]), "token_masked": _mask(g["token"])},
+            "harbor": {"url": hc["url"], "username": hc["username"], "password_set": bool(hc["password"]),
+                       "trigger_scan": hc["trigger_scan"]},
+            "web": {"provider": ops_web.config()["provider"], "searxng_url": ops_web.config()["searxng_url"],
+                    "brave_key_set": bool(ops_web.config()["brave_key"]), "tavily_key_set": bool(ops_web.config()["tavily_key"]),
+                    "proxy": _mask_proxy(store.get_setting("web_proxy") or ""),
+                    "proxy_search": store.get_setting("web_proxy_search") == "1",
+                    "proxy_fetch": store.get_setting("web_proxy_fetch") == "1",
+                    "allow_fake_ip": store.get_setting("web_allow_fake_ip") == "1"}}
+
+
+def _mask_proxy(url):
+    """代理地址可能带账号密码：回显时隐藏口令。"""
+    from urllib.parse import urlsplit
+    try:
+        p = urlsplit(url)
+    except ValueError:
+        return ""
+    if p.password:
+        return url.replace(f":{p.password}@", ":***@", 1)
+    return url
+
+
+@app.put("/api/connections")
+async def save_connections(request: Request):
+    _auth(request)
+    b = await _body(request)
+    for kind, keys in (("argocd", ("url", "token", "insecure")), ("gitlab", ("url", "token"))):
+        c = b.get(kind)
+        if not isinstance(c, dict):
+            continue
+        if "url" in c:
+            u = (c.get("url") or "").strip().rstrip("/")
+            if u and not u.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail=f"{kind} 地址需为 http(s):// 开头")
+            store.set_setting(f"{kind}_url", u)
+        if c.get("token"):
+            store.set_setting(f"{kind}_token", c["token"].strip())
+        if c.get("clear_token"):
+            store.set_setting(f"{kind}_token", "")
+        if kind == "argocd" and "insecure" in c:
+            store.set_setting("argocd_insecure", "1" if c["insecure"] else "0")
+    h = b.get("harbor")
+    if isinstance(h, dict):
+        if "url" in h:
+            u = (h.get("url") or "").strip().rstrip("/")
+            if u and not u.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail="Harbor 地址需为 http(s):// 开头")
+            store.set_setting("harbor_url", u)
+        if "username" in h:
+            store.set_setting("harbor_username", (h.get("username") or "").strip())
+        if h.get("password"):
+            store.set_setting("harbor_password", h["password"].strip())
+        if "trigger_scan" in h:
+            store.set_setting("harbor_trigger_scan", "1" if h["trigger_scan"] else "0")
+    w = b.get("web")
+    if isinstance(w, dict):
+        if "provider" in w:
+            if w["provider"] not in ("searxng", "brave", "tavily"):
+                raise HTTPException(status_code=400, detail="搜索后端只能是 searxng / brave / tavily")
+            store.set_setting("web_search_provider", w["provider"])
+        if "searxng_url" in w:
+            u = (w.get("searxng_url") or "").strip().rstrip("/")
+            if u and not u.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail="searxng_url 需为 http(s):// 开头")
+            store.set_setting("web_searxng_url", u)
+        # 代理：回显的是打码地址，原样提交回来表示不改
+        if "proxy" in w and w.get("proxy") != _mask_proxy(store.get_setting("web_proxy") or ""):
+            u = (w.get("proxy") or "").strip().rstrip("/")
+            if u and not u.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail="代理地址需为 http(s):// 开头（HTTP CONNECT 代理）")
+            store.set_setting("web_proxy", u)
+        for key in ("proxy_search", "proxy_fetch"):
+            if key in w:
+                store.set_setting(f"web_{key}", "1" if w[key] else "0")
+        for key, setting in (("brave_key", "web_brave_key"), ("tavily_key", "web_tavily_key")):
+            if w.get(key):
+                store.set_setting(setting, w[key].strip())
+        if "allow_fake_ip" in w:
+            store.set_setting("web_allow_fake_ip", "1" if w["allow_fake_ip"] else "0")
+    return {"ok": True}
+
+
+@app.get("/api/connections/gitlab-project-tokens")
+def gitlab_project_tokens(request: Request):
+    _auth(request)
+    from ops import gitops_scan
+    configured = {item["project"] for item in gitops_scan.configured() if isinstance(item, dict) and item.get("project")}
+    tokens = ops_gitlab.project_tokens()
+    return {"projects": [{"project": project, "token_set": bool(tokens.get(project))}
+                         for project in sorted(configured)]}
+
+
+@app.put("/api/connections/gitlab-project-tokens")
+async def save_gitlab_project_token(request: Request):
+    _auth(request)
+    from ops import gitops_scan
+    from harness import patrols
+    body = await _body(request)
+    project = body.get("project")
+    if not isinstance(project, str) or project not in {r.get("project") for r in gitops_scan.configured()}:
+        raise HTTPException(status_code=400, detail="请先配置对应的 GitOps 仓库")
+    token = body.get("token")
+    if not isinstance(token, str) or not token or len(token) > 1000 or any(c.isspace() for c in token):
+        raise HTTPException(status_code=400, detail="项目 API 令牌格式无效")
+    tokens = ops_gitlab.project_tokens()
+    tokens[project] = token
+    store.set_setting("gitlab_project_tokens", json.dumps(tokens, ensure_ascii=False))
+    for monitor in patrols.list_monitors():
+        if project in monitor["git_projects"]:
+            patrols.request_scan(monitor["id"])
+    return {"ok": True, "project": project, "token_set": True}
+
+@app.post("/api/connections/test")
+async def test_connection(request: Request):
+    _auth(request)
+    kind = (await _body(request)).get("kind")
+    if kind == "argocd":
+        return ops_argocd.test()
+    if kind == "gitlab":
+        return ops_gitlab.test()
+    if kind == "harbor":
+        return ops_harbor.test()
+    if kind == "web":
+        r = ops_web.search("Kubernetes security advisory", limit=3)
+        return {"ok": not r.get("error"), "provider": r.get("provider"), "error": r.get("error"),
+                "count": r.get("count"), "sample": [x.get("title") for x in r.get("results", [])][:3]}
+    raise HTTPException(status_code=400, detail="kind 只能是 argocd / gitlab / harbor / web")
+
+
+# ---------- 情报源与漏洞台账（sec） ----------
+def _intel_view(s):
+    v = {k: s.get(k) for k in ("id", "name", "kind", "category", "url", "query", "enabled", "interval_min",
+                               "last_fetch", "last_status", "last_error", "last_new")}
+    v.update(token_set=bool(s.get("token")), token_masked=_mask(s.get("token")))
+    return v
+
+def _intel_fields(b, creating):
+    f = {}
+    if creating or "name" in b:
+        f["name"] = (b.get("name") or "").strip()
+        if not f["name"]:
+            raise HTTPException(status_code=400, detail="请填名称")
+    if creating or "kind" in b:
+        f["kind"] = b.get("kind")
+        if f["kind"] not in collector.KINDS:
+            raise HTTPException(status_code=400, detail=f"类型只能是：{'、'.join(collector.KINDS)}")
+    if creating or "category" in b:
+        f["category"] = b.get("category") or "official"
+        if f["category"] not in ("official", "social"):
+            raise HTTPException(status_code=400, detail="类别只能是 official / social")
+    for k in ("url", "query"):
+        if k in b:
+            f[k] = (b.get(k) or "").strip()
+    if creating and not f.get("url"):
+        raise HTTPException(status_code=400, detail="请填地址")
+    if b.get("token"):
+        f["token"] = b["token"].strip()
+    if "enabled" in b:
+        f["enabled"] = 1 if b["enabled"] else 0
+    if "interval_min" in b:
+        try:
+            f["interval_min"] = max(10, int(b.get("interval_min") or 60))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="抓取间隔需为分钟数")
+    return f
+
+@app.get("/api/intel-sources")
+def intel_sources(request: Request):
+    _auth(request)
+    return {"sources": [_intel_view(s) for s in store.list_intel_sources()], "kinds": list(collector.KINDS)}
+
+@app.post("/api/intel-sources")
+async def create_intel_source(request: Request):
+    _auth(request)
+    return {"ok": True, "id": store.create_intel_source(**_intel_fields(await _body(request), True))}
+
+@app.put("/api/intel-sources/{sid}")
+async def edit_intel_source(sid: int, request: Request):
+    _auth(request)
+    if not store.get_intel_source(sid):
+        raise HTTPException(status_code=404, detail="情报源不存在")
+    store.update_intel_source(sid, **_intel_fields(await _body(request), False))
+    return {"ok": True}
+
+@app.delete("/api/intel-sources/{sid}")
+def remove_intel_source(sid: int, request: Request):
+    _auth(request)
+    store.delete_intel_source(sid)
+    return {"ok": True}
+
+@app.post("/api/intel-sources/{sid}/fetch")
+def fetch_intel_source(sid: int, request: Request):
+    _auth(request)
+    r = collector.fetch_source(sid)
+    if r.get("ok"):
+        collector.enrich_epss()
+    return r
+
+@app.get("/api/security/overview")
+def security_overview(request: Request):
+    """安全概览：我们在跑镜像的 Harbor 扫描结果（P0~P3、通用修复、覆盖缺口），与日报同一份数据。"""
+    _auth(request)
+    from core import assetstore
+    from sec import match
+    assets = assetstore.list_assets(limit=20000)
+    f = match.image_findings(assets, limit=200)
+    f["coverage"]["outside_harbor"] = match.outside_harbor(assets)
+    f["inventory"] = [{"source": x["source"], "status": x["status"], "assets": x["count"], "error": x["error"],
+                       "ok_at": x["ok_at"]} for x in assetstore.sources()]
+    return f
+
+@app.get("/api/security/marks")
+def security_marks(request: Request):
+    _auth(request)
+    from core import assetstore
+    return {"marks": assetstore.list_marks(), "status": assetstore.MARK_STATUS}
+
+
+@app.post("/api/security/marks")
+async def security_mark_set(request: Request):
+    user = _auth(request)
+    from core import assetstore
+    b = await _body(request)
+    try:
+        assetstore.set_mark(b.get("service"), b.get("package"), b.get("status"), b.get("note") or "",
+                            b.get("until") or "", by=user)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/security/marks/{mark_id}")
+def security_mark_delete(mark_id: int, request: Request):
+    _auth(request)
+    from core import assetstore
+    assetstore.delete_mark(mark_id)
+    return {"ok": True}
+
+
+@app.get("/api/vulns")
+def vulns(request: Request):
+    _auth(request)
+    q = request.query_params
+    r = store.list_vulns(q.get("status") or None, q.get("kev") in ("1", "true"), q.get("q") or None,
+                         q.get("days") or None, q.get("sort") or "last_seen", q.get("limit") or 50, q.get("offset") or 0)
+    r["stats"] = store.vuln_stats()
+    return r
+
+@app.get("/api/vulns/{cve}")
+def vuln_detail(cve: str, request: Request):
+    _auth(request)
+    v = store.get_vuln(cve.upper())
+    if not v:
+        raise HTTPException(status_code=404, detail="台账里没有这个 CVE")
+    return {"vuln": v, "intel": store.intel_items(cve=cve.upper(), limit=50)}
+
+@app.put("/api/vulns/{cve}")
+async def edit_vuln(cve: str, request: Request):
+    _auth(request)
+    b = await _body(request)
+    if not store.get_vuln(cve.upper()):
+        raise HTTPException(status_code=404, detail="台账里没有这个 CVE")
+    if b.get("status") and b["status"] not in store.VULN_STATUSES:
+        raise HTTPException(status_code=400, detail="状态不对")
+    store.upsert_vuln(cve.upper(), status=b.get("status"), note=b.get("note"))
+    return {"ok": True}
+
+
+# ---------- 代码仓库与工作区（harness.workspace） ----------
+def _repo_view(r):
+    v = {k: r.get(k) for k in ("id", "name", "url", "branch", "username", "test_cmd", "validation_kind", "enabled")}
+    v.update(token_set=bool(r.get("token")), token_masked=_mask(r.get("token")),
+             write_token_set=bool(r.get("write_token")), write_token_masked=_mask(r.get("write_token")))
+    return v
+
+def _repo_fields(b, creating):
+    f = {}
+    if creating or "name" in b:
+        f["name"] = (b.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", f["name"] or ""):
+            raise HTTPException(status_code=400, detail="仓库名只能用字母、数字、. _ -（模型按这个名字打开仓库）")
+    if creating or "url" in b:
+        f["url"] = (b.get("url") or "").strip()
+        if not (f["url"].startswith(("https://", "http://")) or os.path.isabs(f["url"])):
+            raise HTTPException(status_code=400, detail="仓库地址需为 https:// 开头")
+    for k in ("branch", "username", "test_cmd"):
+        if k in b:
+            f[k] = (b.get(k) or "").strip()
+    if "validation_kind" in b:
+        f["validation_kind"] = (b.get("validation_kind") or "").strip()
+        if f["validation_kind"] not in ("", "gitops"):
+            raise HTTPException(status_code=400, detail="不支持的仓库静态校验类型")
+    for k in ("token", "write_token"):
+        if b.get(k):
+            f[k] = b[k].strip()
+    if "enabled" in b:
+        f["enabled"] = 1 if b["enabled"] else 0
+    return f
+
+@app.get("/api/code-repos")
+def code_repos(request: Request):
+    _auth(request)
+    names = {r["id"]: r["name"] for r in store.list_code_repos()}
+    apps_ = {a["id"]: a["name"] for a in store.list_apps()}
+    wss = [{"id": w["id"], "repo": names.get(w["repo_id"], "#%s" % w["repo_id"]), "app": apps_.get(w["app_id"]),
+            "chat_id": w["chat_id"], "base_branch": w["base_branch"], "base_commit": (w["base_commit"] or "")[:12],
+            "changed": len(w["changed"]), "mr_url": w.get("mr_url"), "created": w["created"], "last_used": w["last_used"]}
+           for w in store.list_workspaces(status="open")]
+    return {"repos": [_repo_view(r) for r in store.list_code_repos()], "workspaces": wss,
+            "ttl_hours": workspace.TTL_HOURS}
+
+@app.post("/api/code-repos")
+async def create_code_repo(request: Request):
+    _auth(request)
+    f = _repo_fields(await _body(request), creating=True)
+    if store.get_code_repo_by_name(f["name"]):
+        raise HTTPException(status_code=400, detail="仓库名已存在")
+    return {"ok": True, "id": store.create_code_repo(**f)}
+
+@app.put("/api/code-repos/{rid}")
+async def edit_code_repo(rid: int, request: Request):
+    _auth(request)
+    if not store.get_code_repo(rid):
+        raise HTTPException(status_code=404, detail="仓库不存在")
+    f = _repo_fields(await _body(request), creating=False)
+    other = store.get_code_repo_by_name(f.get("name") or "")
+    if other and other["id"] != rid:
+        raise HTTPException(status_code=400, detail="仓库名已存在")
+    store.update_code_repo(rid, **f)
+    return {"ok": True}
+
+@app.delete("/api/code-repos/{rid}")
+def remove_code_repo(rid: int, request: Request):
+    _auth(request)
+    for w in store.list_workspaces(status="open"):
+        if w["repo_id"] == rid:
+            workspace.close_workspace(w["id"])
+    store.delete_code_repo(rid)
+    return {"ok": True}
+
+@app.delete("/api/workspaces/{ws_id}")
+def remove_workspace(ws_id: str, request: Request):
+    _auth(request)
+    return {"ok": workspace.close_workspace(ws_id)}
+
+
+# ---------- 技能源（从 Git 同步技能，harness.skills） ----------
+def _source_view(s):
+    v = {k: s.get(k) for k in ("id", "name", "kind", "url", "branch", "subdir", "username", "rewrite", "plugins",
+                               "enabled", "interval_min", "last_sync", "last_status", "last_error", "last_report")}
+    v["token_masked"] = _mask(s.get("token"))
+    v["token_set"] = bool(s.get("token"))
+    v["skill_count"] = len(store.skills_by_source(s["id"]))
+    return v
+
+def _split_list(v):
+    if isinstance(v, str):
+        v = re.split(r"[\s,，]+", v)
+    return [str(x).strip() for x in (v or []) if str(x).strip()]
+
+def _source_fields(b, creating):
+    f = {}
+    if creating or "name" in b:
+        f["name"] = (b.get("name") or "").strip()
+        if not f["name"]:
+            raise HTTPException(status_code=400, detail="请填技能源名称")
+    if creating or "kind" in b:
+        f["kind"] = b.get("kind") or "marketplace"
+        if f["kind"] not in ("marketplace", "repo"):
+            raise HTTPException(status_code=400, detail="类型只能是 marketplace（索引仓）或 repo（单个能力仓）")
+    if creating or "url" in b:
+        f["url"] = (b.get("url") or "").strip()
+        if not (f["url"].startswith(("https://", "http://")) or os.path.isabs(f["url"])):
+            raise HTTPException(status_code=400, detail="仓库地址需为 https:// 开头（ssh 地址请用改写规则转成 https）")
+    for k in ("branch", "subdir", "username"):
+        if k in b:
+            f[k] = (b.get(k) or "").strip()
+    if b.get("token"):
+        f["token"] = b["token"].strip()
+    if "plugins" in b:
+        f["plugins"] = _split_list(b.get("plugins"))
+    if "rewrite" in b:
+        raw = b.get("rewrite") or []
+        if isinstance(raw, str):                         # 每行「from => to」
+            raw = [ln.split("=>", 1) for ln in raw.splitlines() if "=>" in ln]
+        rules = []
+        for r in raw:
+            if not (isinstance(r, (list, tuple)) and len(r) == 2 and str(r[0]).strip() and str(r[1]).strip()):
+                raise HTTPException(status_code=400, detail="改写规则格式：每行「原前缀 => 新前缀」")
+            rules.append([str(r[0]).strip(), str(r[1]).strip()])
+        f["rewrite"] = rules
+    if "enabled" in b:
+        f["enabled"] = 1 if b["enabled"] else 0
+    if "interval_min" in b:
+        try:
+            f["interval_min"] = max(5, int(b.get("interval_min") or 60))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="同步间隔需为分钟数")
+    return f
+
+@app.get("/api/skill-sources")
+def skill_sources(request: Request):
+    _auth(request)
+    return {"sources": [_source_view(s) for s in store.list_skill_sources()]}
+
+@app.post("/api/skill-sources")
+async def create_skill_source(request: Request):
+    _auth(request)
+    sid = store.create_skill_source(**_source_fields(await _body(request), creating=True))
+    return {"ok": True, "id": sid}
+
+@app.put("/api/skill-sources/{sid}")
+async def edit_skill_source(sid: int, request: Request):
+    _auth(request)
+    if not store.get_skill_source(sid):
+        raise HTTPException(status_code=404, detail="技能源不存在")
+    store.update_skill_source(sid, **_source_fields(await _body(request), creating=False))
+    return {"ok": True}
+
+@app.delete("/api/skill-sources/{sid}")
+def remove_skill_source(sid: int, request: Request):
+    _auth(request)
+    store.delete_skill_source(sid)
+    return {"ok": True}
+
+@app.post("/api/skill-sources/{sid}/sync")
+def sync_skill_source(sid: int, request: Request):
+    """立即同步（同步执行，可能要几十秒）。"""
+    _auth(request)
+    try:
+        rep = skills_sync.sync_source(sid)
+    except skills_sync.SyncError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "report": rep, "source": _source_view(store.get_skill_source(sid))}
 
 
 # ---------- 定时任务 ----------
@@ -345,9 +1164,58 @@ def _app_view(a):
         "skills": a.get("skills") or [],
         "mcp": a.get("mcp") or [],
         "thinking": bool(a.get("thinking", True)),
+        "policy": policy.normalize(a.get("policy")),
+        "approvers": a.get("approvers") or [],
+        "resources": a.get("resources") or {},
         "enabled": a["enabled"],
         "running": bot.is_running(a["id"]),
     }
+
+def _policy_from(b):
+    """从请求体取工具调用策略并校验；没传返回 None（不改）。"""
+    if "policy" not in b:
+        return None
+    p = b.get("policy") or {}
+    if not isinstance(p, dict):
+        raise HTTPException(status_code=400, detail="策略格式不对")
+    preset = p.get("preset") or policy.DEFAULT_PRESET
+    if preset == policy.CUSTOM:
+        try:
+            return {"preset": policy.CUSTOM, "rules": policy.validate_rules(p.get("rules"))}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"自定义规则有误：{e}")
+    if preset not in policy.PRESETS:
+        raise HTTPException(status_code=400, detail=f"未知的策略预设：{preset}")
+    return {"preset": preset}
+
+def _resources_from(b):
+    if "resources" not in b:
+        return None
+    try:
+        return access.validate(b["resources"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _approvers_from(b):
+    """审批人 open_id 名单：接受数组或换行/逗号分隔的字符串；没传返回 None（不改）。"""
+    if "approvers" not in b:
+        return None
+    raw = b.get("approvers") or []
+    if isinstance(raw, str):
+        raw = re.split(r"[\s,，]+", raw)
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="审批人格式不对")
+    out = []
+    for x in raw:
+        x = str(x).strip()
+        if not x:
+            continue
+        if not re.fullmatch(r"ou_[0-9a-zA-Z]{8,64}", x):
+            raise HTTPException(status_code=400, detail=f"审批人需填飞书 open_id（ou_ 开头）：{x}")
+        if x not in out:
+            out.append(x)
+    return out
 
 @app.get("/api/apps")
 def apps(request: Request):
@@ -375,6 +1243,9 @@ async def create_app(request: Request):
     name = (b.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="请填应用名称")
+    pol = _policy_from(b)
+    appr = _approvers_from(b)
+    resources = _resources_from(b)
     aid = store.create_app(
         name, (b.get("feishu_app_id") or "").strip(), (b.get("feishu_app_secret") or "").strip(),
         b.get("ai_provider_id"), b.get("system_prompt") or "",
@@ -383,6 +1254,12 @@ async def create_app(request: Request):
         mcp=b.get("mcp") or [])
     if "thinking" in b:
         store.update_app(aid, thinking=1 if b["thinking"] else 0)
+    if pol is not None:
+        store.update_app(aid, policy=pol)
+    if appr is not None:
+        store.update_app(aid, approvers=appr)
+    if resources is not None:
+        store.update_app(aid, resources=resources)
     return {"ok": True, "id": aid, "note": "新应用的飞书长连接需重启服务后建立"}
 
 @app.put("/api/apps/{aid}")
@@ -397,6 +1274,15 @@ async def edit_app(aid: int, request: Request):
         fields["thinking"] = 1 if fields["thinking"] else 0
     if b.get("feishu_app_secret"):
         fields["feishu_app_secret"] = b["feishu_app_secret"].strip()
+    pol = _policy_from(b)
+    if pol is not None:
+        fields["policy"] = pol
+    appr = _approvers_from(b)
+    if appr is not None:
+        fields["approvers"] = appr
+    resources = _resources_from(b)
+    if resources is not None:
+        fields["resources"] = resources
     store.update_app(aid, **fields)
     auth.reset(aid)   # 该应用飞书凭证若变更，取数立即用新值；长连接仍需重启
     return {"ok": True, "note": "人设/工具/AI 即时生效；飞书凭证或启用状态变更需重启服务重连"}
@@ -647,6 +1533,24 @@ def chat_detail(request: Request):
     if aid in (None, "", "all"):
         raise HTTPException(status_code=400, detail="缺少 app_id")
     return {"messages": store.chat_messages(int(aid), chat_id)}
+
+
+# ---------- 运行记录（run + 事件时间线，只读） ----------
+@app.get("/api/runs")
+def runs_list(request: Request):
+    _auth(request)
+    q = request.query_params
+    return {"runs": store.list_runs(_app_id(request), trigger=q.get("trigger") or None,
+                                    status=q.get("status") or None, before=q.get("before") or None,
+                                    limit=q.get("limit") or 50)}
+
+@app.get("/api/runs/{rid}")
+def run_detail(rid: str, request: Request):
+    _auth(request)
+    r = store.get_run(rid)
+    if not r:
+        raise HTTPException(status_code=404, detail="没有这个 run")
+    return {"run": r, "events": store.run_events(rid)}
 
 
 # ---------- token 用量（按应用过滤） ----------

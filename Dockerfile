@@ -20,10 +20,12 @@ RUN python -c "import urllib.request; urllib.request.urlretrieve('https://dl.k8s
 COPY app ./app
 COPY core ./core
 COPY feishu ./feishu
+COPY harness ./harness
 COPY llm ./llm
 COPY obs ./obs
 COPY ops ./ops
 COPY sched ./sched
+COPY sec ./sec
 COPY web ./web
 
 EXPOSE 8800

@@ -7,15 +7,18 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.getenv("FEISHU_AGENT_DATA_DIR") or ROOT / "data").expanduser().resolve()
 DB_PATH = DATA_DIR / "agent.db"
 
 
 class Config:
     def __init__(self):
-        DATA_DIR.mkdir(exist_ok=True)
-        p = ROOT / "config.yaml"
-        c = (yaml.safe_load(p.read_text(encoding="utf-8")) if p.exists() else {}) or {}
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # 空字符串显式禁用配置文件，便于本地测试不读取真实飞书/模型凭据。
+        config_path = os.getenv("FEISHU_AGENT_CONFIG")
+        p = Path(config_path).expanduser() if config_path else ROOT / "config.yaml"
+        c = (yaml.safe_load(p.read_text(encoding="utf-8"))
+             if config_path != "" and p.exists() else {}) or {}
         for k in ("feishu", "llm", "agent", "admin", "web"):
             c.setdefault(k, {})
         # 环境变量覆盖（优先级最高，便于生产/容器注入、不落盘）

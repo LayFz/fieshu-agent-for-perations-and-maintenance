@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 
 from core import store
+from harness import policy
 
 # 硬兜底黑名单：只列 k8s「不可逆/毁灭级」正则。正常运维（看日志、rollout restart、CNPG failover）不在此列——那交给模型判断。
 _DEFAULT_BLACKLIST = [
@@ -113,6 +114,42 @@ def _first_verb(argv):
     return ""
 
 
+def _normalize(command):
+    return re.sub(r"^\s*kubectl\s+", "", str(command or "").strip())   # 容错：模型可能把前导 kubectl 也带上
+
+
+def risk_of(command):
+    """工具元数据用：只读动词 → read，其余（含解析不了的）→ exec。"""
+    try:
+        argv = shlex.split(_normalize(command))
+    except ValueError:
+        return "exec"
+    return "read" if argv and _first_verb(argv) in _READONLY_VERBS else "exec"
+
+
+def precheck(target, command):
+    """执行前闸门：只读集群 + 硬黑名单。返回拒绝理由或 None。
+    run() 自己调一遍（兜底），harness 的 guard 也调它（在管道里先拦、留审计）。
+    集群不存在、命令解析失败这类不是安全拦截，留给 run() 报错。"""
+    command = _normalize(command)
+    c, _ = _find_cluster(target)
+    if c and c.get("read_only"):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+        verb = _first_verb(argv)
+        if verb not in _READONLY_VERBS:
+            return (f"集群「{c.get('name')}」被设为只读（后台「K8s 运维」页的 read_only 开关），"
+                    f"只允许只读命令（{'、'.join(sorted(_READONLY_VERBS))}）。"
+                    f"当前命令动词「{verb}」不在其中，已拒绝。若确需变更，请人工操作或去后台关掉只读。")
+    bad = _blocked(command)
+    if bad:
+        return (f"命令被安全黑名单拦截（这是不可逆/毁灭级操作，已拒绝执行）。"
+                f"若确属必要，请人工在集群上操作，别让机器人来。pattern={bad}")
+    return None
+
+
 def list_clusters():
     """列出受管集群（不含 kubeconfig）。read_only=只读集群，任何变更命令都会被拒。"""
     out = []
@@ -126,11 +163,9 @@ def list_clusters():
 def run(target, command, timeout=30):
     """在受管集群 target 上跑一条 kubectl 命令（command 是 kubectl 子命令，不含前导 kubectl，如 'get pods -A'）。
     返回 exit_code/stdout/stderr。"""
-    command = (command or "").strip()
+    command = _normalize(command)
     if not command:
         return {"error": "命令为空"}
-    # 容错：模型可能把前导 kubectl 也带上，去掉
-    command = re.sub(r"^\s*kubectl\s+", "", command)
 
     c, cs = _find_cluster(target)
     if not c:
@@ -149,16 +184,10 @@ def run(target, command, timeout=30):
     if not argv:
         return {"error": "命令为空"}
 
-    # 只读集群闸门：非只读 verb 直接拒
-    if c.get("read_only") and _first_verb(argv) not in _READONLY_VERBS:
-        return {"error": f"集群「{c.get('name')}」被设为只读（后台「K8s 运维」页的 read_only 开关），"
-                         f"只允许只读命令（{'、'.join(sorted(_READONLY_VERBS))}）。"
-                         f"当前命令动词「{_first_verb(argv)}」不在其中，已拒绝。若确需变更，请人工操作或去后台关掉只读。"}
-
-    bad = _blocked(command)
-    if bad:
-        return {"error": f"命令被安全黑名单拦截（这是不可逆/毁灭级操作，已拒绝执行）。"
-                         f"若确属必要，请人工在集群上操作，别让机器人来。pattern={bad}"}
+    # 只读集群 + 硬黑名单（管道里的 guard 已先拦过一次，这里是兜底，防止绕过管道直接调用）
+    reason = precheck(c.get("name"), command)
+    if reason:
+        return {"error": reason}
 
     kubeconfig = c.get("kubeconfig") or ""
     if not kubeconfig.strip():
@@ -209,3 +238,11 @@ def run(target, command, timeout=30):
             os.unlink(path)
         except Exception:
             pass
+
+
+def _guard(call):
+    if call.tool == "kubectl":
+        return precheck(call.args.get("target"), call.args.get("command"))
+
+
+policy.register_guard("k8s_precheck", _guard)

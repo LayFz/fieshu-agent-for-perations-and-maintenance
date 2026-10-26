@@ -14,6 +14,10 @@ import time
 
 import requests
 
+# 内网监控服务：不继承 HTTP(S)_PROXY / 系统代理（否则 TUN/代理会把内网请求带走）
+_http = requests.Session()
+_http.trust_env = False
+
 from core import store
 
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -96,7 +100,7 @@ def search(stream, where=None, period="15m", limit=50, org=None):
     sql += " ORDER BY _timestamp DESC"
     body = {"query": {"sql": sql, "start_time": start_us, "end_time": now_us, "size": limit}}
     try:
-        r = requests.post(f"{src['base']}/api/{src['org']}/_search", json=body,
+        r = _http.post(f"{src['base']}/api/{src['org']}/_search", json=body,
                           auth=(src["user"], src["pass"]), timeout=20)
         if r.status_code != 200:
             return {"error": f"[{src['org']}] HTTP {r.status_code}: {r.text[:300]}"}
@@ -121,7 +125,7 @@ def _streams_of(src):
     if err:
         return err
     try:
-        r = requests.get(f"{src['base']}/api/{src['org']}/streams",
+        r = _http.get(f"{src['base']}/api/{src['org']}/streams",
                          params={"type": "logs"}, auth=(src["user"], src["pass"]), timeout=15)
         if r.status_code != 200:
             return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}

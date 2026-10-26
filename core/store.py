@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from .config import DB_PATH
 
@@ -88,7 +89,6 @@ _conn.executescript("""
 """)
 _conn.commit()
 
-
 def _ensure_col(table, col, decl):
     cols = [r["name"] for r in _conn.execute(f"PRAGMA table_info({table})").fetchall()]
     if col not in cols:
@@ -97,13 +97,130 @@ def _ensure_col(table, col, decl):
 
 # 老库迁移：给记忆/用量表补 app_id（已存在则跳过）
 _ensure_col("msgs", "app_id", "INTEGER")
+_ensure_col("msgs", "task_id", "TEXT")
+_ensure_col("msgs", "context_key", "TEXT")
+_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgs_task ON msgs(task_id,role) WHERE task_id IS NOT NULL")
+_conn.commit()
 _ensure_col("notes", "app_id", "INTEGER")
 _ensure_col("token_usage", "app_id", "INTEGER")
 _ensure_col("apps", "skills", "TEXT DEFAULT '[]'")
 _ensure_col("apps", "mcp", "TEXT DEFAULT '[]'")     # 应用勾选的 MCP server id 名单
 _ensure_col("apps", "thinking", "INTEGER DEFAULT 1")  # 是否开启模型「思考(reasoning)」模式，默认开
+_ensure_col("apps", "policy", "TEXT DEFAULT '{}'")    # 工具调用策略，空=默认只读
+_ensure_col("apps", "approvers", "TEXT DEFAULT '[]'")  # 审批人 open_id 名单（harness.approval），空=谁都批不了
+_ensure_col("apps", "resources", "TEXT DEFAULT '{}'")  # 资源白名单；未配置不开放受管资源
+# 技能来源（harness.skills）：source_id 为空=后台手工技能；非空=从 Git 同步，后台只读
+_ensure_col("skills", "source_id", "INTEGER")
+_ensure_col("skills", "plugin", "TEXT")          # 所属 plugin（能力仓）名
+_ensure_col("skills", "path", "TEXT")            # SKILL.md 所在目录（相对能力仓根）
+_ensure_col("skills", "revision", "TEXT")        # 同步时的提交号
+_ensure_col("skills", "files", "TEXT DEFAULT '{}'")   # 附属文本文件 {相对路径: 内容}
+_ensure_col("skills", "synced", "REAL")
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_msgs_app ON msgs(app_id, chat_id, id)")
 _conn.commit()
+
+# 运行记录（harness）：一次 engine.run = 一个 run；它经历的每一步作为事件只追加写入 events
+_conn.executescript("""
+    CREATE TABLE IF NOT EXISTS runs(
+        id TEXT PRIMARY KEY,
+        app_id INTEGER, chat_id TEXT,
+        trigger TEXT,
+        speaker_open_id TEXT,
+        parent_run_id TEXT, depth INTEGER DEFAULT 0,
+        tainted INTEGER DEFAULT 0,
+        approval_policy TEXT,
+        status TEXT,
+        started REAL, ended REAL,
+        total_tokens INTEGER DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started);
+    CREATE INDEX IF NOT EXISTS idx_runs_app ON runs(app_id, started);
+    CREATE TABLE IF NOT EXISTS events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT, seq INTEGER,
+        type TEXT, call_id TEXT, tool TEXT,
+        payload TEXT,
+        ts REAL);
+    CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+    CREATE TABLE IF NOT EXISTS approvals(
+        id TEXT PRIMARY KEY,
+        kind TEXT DEFAULT 'tool',
+        run_id TEXT, call_id TEXT,
+        app_id INTEGER, chat_id TEXT,
+        tool TEXT, risk TEXT,
+        args TEXT, reason TEXT,
+        status TEXT,
+        requester_open_id TEXT, decider_open_id TEXT,
+        message_id TEXT,
+        created REAL, decided REAL);
+    CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+    CREATE TABLE IF NOT EXISTS skill_sources(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        kind TEXT DEFAULT 'marketplace',
+        url TEXT, branch TEXT, subdir TEXT,
+        username TEXT, token TEXT,
+        rewrite TEXT DEFAULT '[]',
+        plugins TEXT DEFAULT '[]',
+        enabled INTEGER DEFAULT 1,
+        interval_min INTEGER DEFAULT 60,
+        last_sync REAL, last_status TEXT, last_error TEXT, last_report TEXT,
+        ts REAL);
+    CREATE TABLE IF NOT EXISTS code_repos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        url TEXT, branch TEXT,
+        username TEXT, token TEXT,
+        write_token TEXT,
+        test_cmd TEXT,
+        enabled INTEGER DEFAULT 1,
+        ts REAL);
+    CREATE TABLE IF NOT EXISTS workspaces(
+        id TEXT PRIMARY KEY,
+        app_id INTEGER, chat_id TEXT, repo_id INTEGER,
+        path TEXT, base_branch TEXT, base_commit TEXT,
+        changed TEXT DEFAULT '{}',
+        mr_url TEXT, mr_branch TEXT,
+        status TEXT DEFAULT 'open',
+        created REAL, last_used REAL);
+    CREATE INDEX IF NOT EXISTS idx_ws_app ON workspaces(app_id, chat_id, status);
+    CREATE TABLE IF NOT EXISTS feishu_observed_chats(
+        app_id INTEGER NOT NULL,
+        chat_id TEXT NOT NULL,
+        sender_open_id TEXT NOT NULL,
+        chat_type TEXT,
+        last_seen REAL NOT NULL,
+        PRIMARY KEY(app_id, chat_id, sender_open_id));
+    CREATE INDEX IF NOT EXISTS idx_feishu_observed_app ON feishu_observed_chats(app_id, last_seen);
+    CREATE TABLE IF NOT EXISTS intel_sources(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, kind TEXT, category TEXT,
+        url TEXT, token TEXT, query TEXT,
+        enabled INTEGER DEFAULT 1, interval_min INTEGER DEFAULT 60,
+        last_fetch REAL, last_status TEXT, last_error TEXT, last_new INTEGER DEFAULT 0,
+        ts REAL);
+    CREATE TABLE IF NOT EXISTS intel_items(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id INTEGER, uid TEXT,
+        title TEXT, url TEXT, summary TEXT, published TEXT,
+        cves TEXT DEFAULT '[]', extra TEXT DEFAULT '{}',
+        fetched REAL,
+        UNIQUE(source_id, uid));
+    CREATE INDEX IF NOT EXISTS idx_intel_fetched ON intel_items(fetched);
+    CREATE TABLE IF NOT EXISTS vulns(
+        cve TEXT PRIMARY KEY,
+        title TEXT, description TEXT,
+        severity TEXT, cvss REAL,
+        kev INTEGER DEFAULT 0, kev_added TEXT, ransomware TEXT,
+        epss REAL, epss_pct REAL, epss_at REAL,
+        products TEXT DEFAULT '[]', sources TEXT DEFAULT '[]',
+        mentions INTEGER DEFAULT 0, social INTEGER DEFAULT 0,
+        first_seen REAL, last_seen REAL,
+        status TEXT DEFAULT 'new', note TEXT, assets TEXT DEFAULT '[]',
+        updated REAL);
+    CREATE INDEX IF NOT EXISTS idx_vulns_seen ON vulns(last_seen);
+""")
+_conn.commit()
+_ensure_col("code_repos", "validation_kind", "TEXT DEFAULT ''")
 
 
 # ---------- 运行时设置(kv：引导 + 全局，如 OpenObserve 连接) ----------
@@ -176,11 +293,23 @@ def delete_provider(pid):
 # ---------- 应用（数字员工/席位） ----------
 def _app_row(r):
     d = dict(r)
+    try:
+        d["resources"] = json.loads(d.get("resources") or "{}")
+    except Exception:
+        d["resources"] = {}
     for col in ("tools", "skills", "mcp"):
         try:
             d[col] = json.loads(d.get(col) or "[]")
         except Exception:
             d[col] = []
+    try:
+        d["policy"] = json.loads(d.get("policy") or "{}")
+    except Exception:
+        d["policy"] = {"preset": "deny"}
+    try:
+        d["approvers"] = json.loads(d.get("approvers") or "[]")
+    except Exception:
+        d["approvers"] = []
     d["enabled"] = bool(d.get("enabled"))
     d["thinking"] = bool(d.get("thinking", 1))
     return d
@@ -213,6 +342,8 @@ def create_app(name, feishu_app_id="", feishu_app_secret="", ai_provider_id=None
 
 def update_app(aid, **f):
     sets, vals = [], []
+    if "resources" in f:
+        sets.append("resources=?"); vals.append(json.dumps(f["resources"], ensure_ascii=False))
     for k in ("name", "feishu_app_id", "ai_provider_id", "system_prompt", "history_turns", "enabled", "thinking"):
         if k in f and f[k] is not None:
             sets.append(f"{k}=?")
@@ -223,6 +354,10 @@ def update_app(aid, **f):
         sets.append("skills=?"); vals.append(json.dumps(f["skills"], ensure_ascii=False))
     if "mcp" in f and f["mcp"] is not None:
         sets.append("mcp=?"); vals.append(json.dumps(f["mcp"], ensure_ascii=False))
+    if "policy" in f and f["policy"] is not None:
+        sets.append("policy=?"); vals.append(json.dumps(f["policy"], ensure_ascii=False))
+    if "approvers" in f and f["approvers"] is not None:
+        sets.append("approvers=?"); vals.append(json.dumps(f["approvers"], ensure_ascii=False))
     if f.get("feishu_app_secret"):              # 仅非空才更新 secret
         sets.append("feishu_app_secret=?"); vals.append(f["feishu_app_secret"])
     if not sets:
@@ -295,13 +430,51 @@ def providers_count():
 
 
 # ---------- 技能（知识/工作方法包，按应用勾选） ----------
+def _skill_row(r, with_files=True):
+    d = dict(r)
+    try:
+        files = json.loads(d.get("files") or "{}")
+    except Exception:
+        files = {}
+    if with_files:
+        d["files"] = files
+    else:
+        d.pop("files", None)
+    d["file_names"] = sorted(files)
+    return d
+
 def list_skills():
-    rows = _conn.execute("SELECT id,name,description,content,ts FROM skills ORDER BY id").fetchall()
-    return [dict(r) for r in rows]
+    """后台列表用：不带附属文件内容（只给文件名），避免列表过大。"""
+    rows = _conn.execute("SELECT * FROM skills ORDER BY id").fetchall()
+    return [_skill_row(r, with_files=False) for r in rows]
 
 def get_skill(sid):
-    r = _conn.execute("SELECT id,name,description,content,ts FROM skills WHERE id=?", (sid,)).fetchone()
-    return dict(r) if r else None
+    r = _conn.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone()
+    return _skill_row(r) if r else None
+
+def get_skill_by_name(name):
+    r = _conn.execute("SELECT * FROM skills WHERE name=?", (name,)).fetchone()
+    return _skill_row(r) if r else None
+
+def skills_by_source(source_id):
+    rows = _conn.execute("SELECT * FROM skills WHERE source_id=? ORDER BY id", (source_id,)).fetchall()
+    return [_skill_row(r, with_files=False) for r in rows]
+
+def upsert_git_skill(source_id, plugin, path, name, description, content, files, revision, skill_id=None):
+    """写入/更新一条 Git 同步来的技能。skill_id 给定=更新，否则插入。返回 id。"""
+    vals = (name, description or "", content or "", json.dumps(files or {}, ensure_ascii=False),
+            revision or "", time.time())
+    with _lock:
+        if skill_id:
+            _conn.execute("UPDATE skills SET name=?,description=?,content=?,files=?,revision=?,synced=? "
+                          "WHERE id=? AND source_id=?", vals + (skill_id, source_id))
+            _conn.commit()
+            return skill_id
+        cur = _conn.execute("INSERT INTO skills(name,description,content,files,revision,synced,source_id,plugin,path,ts) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)", vals + (source_id, plugin, path, time.time()))
+        _conn.commit()
+        return cur.lastrowid
+
 
 def create_skill(name, description, content):
     with _lock:
@@ -340,11 +513,79 @@ def skills_for(ids):
     return out
 
 
+# ---------- 技能源（Git，harness.skills 同步） ----------
+def _source_row(r):
+    d = dict(r)
+    for col, default in (("rewrite", []), ("plugins", []), ("last_report", {})):
+        try:
+            d[col] = json.loads(d.get(col) or json.dumps(default))
+        except Exception:
+            d[col] = default
+    d["enabled"] = bool(d.get("enabled"))
+    return d
+
+def list_skill_sources():
+    return [_source_row(r) for r in _conn.execute("SELECT * FROM skill_sources ORDER BY id").fetchall()]
+
+def get_skill_source(sid):
+    r = _conn.execute("SELECT * FROM skill_sources WHERE id=?", (sid,)).fetchone()
+    return _source_row(r) if r else None
+
+_SOURCE_FIELDS = ("name", "kind", "url", "branch", "subdir", "username", "token", "rewrite", "plugins",
+                  "enabled", "interval_min")
+
+def _source_val(k, v):
+    if k in ("rewrite", "plugins"):
+        return json.dumps(v or [], ensure_ascii=False)
+    if k in ("enabled", "interval_min"):
+        return int(v)
+    return v
+
+def create_skill_source(**f):
+    cols = [k for k in _SOURCE_FIELDS if k in f and f[k] is not None]
+    with _lock:
+        cur = _conn.execute(f"INSERT INTO skill_sources({','.join(cols + ['ts'])}) "
+                            f"VALUES({','.join('?' * (len(cols) + 1))})",
+                            [_source_val(k, f[k]) for k in cols] + [time.time()])
+        _conn.commit()
+        return cur.lastrowid
+
+def update_skill_source(sid, **f):
+    sets, vals = [], []
+    for k in _SOURCE_FIELDS:
+        if k not in f or f[k] is None:
+            continue
+        if k == "token" and not f[k]:            # 仅非空才更新 token，避免掩码覆盖真值
+            continue
+        sets.append(f"{k}=?"); vals.append(_source_val(k, f[k]))
+    if not sets:
+        return
+    vals.append(sid)
+    with _lock:
+        _conn.execute(f"UPDATE skill_sources SET {','.join(sets)} WHERE id=?", vals)
+        _conn.commit()
+
+def set_skill_source_result(sid, status, error="", report=None):
+    with _lock:
+        _conn.execute("UPDATE skill_sources SET last_sync=?, last_status=?, last_error=?, last_report=? WHERE id=?",
+                      (time.time(), status, error or "", json.dumps(report or {}, ensure_ascii=False), sid))
+        _conn.commit()
+
+def delete_skill_source(sid):
+    """删技能源连同它同步来的技能。"""
+    with _lock:
+        _conn.execute("DELETE FROM skills WHERE source_id=?", (sid,))
+        _conn.execute("DELETE FROM skill_sources WHERE id=?", (sid,))
+        _conn.commit()
+
+
 # ---------- 定时任务（按应用） ----------
 def next_run(kind, spec, from_ts=None):
     """根据周期算下次运行的 epoch 秒。kind: daily|weekly|interval。
-    daily spec='HH:MM'；weekly spec='1,2,3,4,5@HH:MM'(1=周一..7=周日)；interval spec=分钟数。"""
-    now = datetime.now() if from_ts is None else datetime.fromtimestamp(from_ts)
+    daily spec='HH:MM'；weekly spec='1,2,3,4,5@HH:MM'(1=周一..7=周日)；interval spec=分钟数。
+    钟点按 SCHEDULE_TZ（默认 Asia/Shanghai）解释，不随宿主机时区漂移（开发机可能是 PDT，容器默认 UTC）。"""
+    tz = ZoneInfo(os.environ.get("SCHEDULE_TZ") or "Asia/Shanghai")
+    now = datetime.now(tz) if from_ts is None else datetime.fromtimestamp(from_ts, tz)
     try:
         if kind == "interval":
             return (now + timedelta(minutes=max(1, int(spec)))).timestamp()
@@ -489,16 +730,41 @@ def set_password(new_password):
 
 
 # ---------- 对话记忆（按应用隔离） ----------
-def save(app_id, chat_id, role, content):
+def save(app_id, chat_id, role, content, task_id=None, context_key=None):
     with _lock:
-        _conn.execute("INSERT INTO msgs(app_id,chat_id,role,content,ts) VALUES(?,?,?,?,?)",
-                      (app_id, chat_id, role, content, time.time()))
+        _conn.execute("INSERT OR IGNORE INTO msgs(app_id,chat_id,role,content,ts,task_id,context_key) VALUES(?,?,?,?,?,?,?)",
+                      (app_id, chat_id, role, content, time.time(), task_id, context_key))
         _conn.commit()
 
-def load_history(app_id, chat_id, turns):
-    rows = _conn.execute("SELECT role,content FROM msgs WHERE app_id=? AND chat_id=? ORDER BY id DESC LIMIT ?",
-                         (app_id, chat_id, turns * 2)).fetchall()
+def load_history(app_id, chat_id, turns, context_key=None):
+    clause = " AND context_key=?" if context_key is not None else ""
+    values = (app_id, chat_id) + ((context_key,) if context_key is not None else ()) + (turns * 2,)
+    rows = _conn.execute("SELECT role,content FROM msgs WHERE app_id=? AND chat_id=?" + clause +
+                         " ORDER BY id DESC LIMIT ?", values).fetchall()
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def observe_feishu_chat(app_id, chat_id, sender_open_id, chat_type):
+    """仅记录机器人真实收到的会话与发言人标识，不保存消息正文。"""
+    with _lock:
+        _conn.execute("INSERT INTO feishu_observed_chats(app_id,chat_id,sender_open_id,chat_type,last_seen) "
+                      "VALUES(?,?,?,?,?) ON CONFLICT(app_id,chat_id,sender_open_id) DO UPDATE SET "
+                      "chat_type=excluded.chat_type,last_seen=excluded.last_seen",
+                      (app_id, str(chat_id)[:200], str(sender_open_id or "")[:200], str(chat_type or "")[:20], time.time()))
+        _conn.commit()
+
+
+def list_observed_feishu_chats(app_id, limit=100):
+    rows = _conn.execute("SELECT chat_id,sender_open_id,chat_type,last_seen FROM feishu_observed_chats "
+                         "WHERE app_id=? ORDER BY last_seen DESC LIMIT ?", (app_id, max(1, min(int(limit), 500)))).fetchall()
+    result = {}
+    for row in rows:
+        chat = result.setdefault(row["chat_id"], {"chat_id": row["chat_id"], "chat_type": row["chat_type"],
+                                                   "last_seen": row["last_seen"], "sender_open_ids": []})
+        if row["sender_open_id"] and row["sender_open_id"] not in chat["sender_open_ids"]:
+            chat["sender_open_ids"].append(row["sender_open_id"])
+    return list(result.values())
+
 
 def list_chats(app_id=None):
     if app_id is None:
@@ -518,15 +784,17 @@ def chat_messages(app_id, chat_id, limit=200):
 
 
 # ---------- 长期笔记（按应用隔离） ----------
-def add_note(app_id, content):
+def add_note(app_id, content, scope="app"):
     with _lock:
         _conn.execute("INSERT INTO notes(app_id,scope,content,ts) VALUES(?,?,?,?)",
-                      (app_id, "app", content, time.time()))
+                      (app_id, scope, content, time.time()))
         _conn.commit()
 
-def load_notes(app_id, limit=30):
-    rows = _conn.execute("SELECT content FROM notes WHERE app_id=? ORDER BY id DESC LIMIT ?",
-                         (app_id, limit)).fetchall()
+def load_notes(app_id, limit=30, scope=None):
+    clause = " AND scope=?" if scope is not None else ""
+    values = (app_id,) + ((scope,) if scope is not None else ()) + (limit,)
+    rows = _conn.execute("SELECT content FROM notes WHERE app_id=?" + clause +
+                         " ORDER BY id DESC LIMIT ?", values).fetchall()
     return [r["content"] for r in rows]
 
 def list_notes(app_id=None, limit=300):
@@ -583,6 +851,444 @@ def usage_recent(n=50, app_id=None):
     w, p = _app_filter(app_id)
     rows = _conn.execute("SELECT app_id,chat_id,model,prompt_tokens,completion_tokens,total_tokens,ts"
                          f" FROM token_usage WHERE 1=1{w} ORDER BY id DESC LIMIT ?", (*p, n)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------- 运行记录（run + 事件日志，按应用可筛） ----------
+def create_run(run_id, app_id, chat_id, trigger, speaker_open_id="", parent_run_id=None,
+               depth=0, approval_policy=None):
+    with _lock:
+        _conn.execute("INSERT INTO runs(id,app_id,chat_id,trigger,speaker_open_id,parent_run_id,depth,"
+                      "approval_policy,status,started) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (run_id, app_id, chat_id, trigger, speaker_open_id or "", parent_run_id,
+                       int(depth or 0), approval_policy, "running", time.time()))
+        _conn.commit()
+
+def end_run(run_id, status, total_tokens=0):
+    with _lock:
+        _conn.execute("UPDATE runs SET status=?, ended=?, total_tokens=? WHERE id=?",
+                      (status, time.time(), int(total_tokens or 0), run_id))
+        _conn.commit()
+
+def append_event(run_id, seq, etype, payload=None, call_id=None, tool=None):
+    with _lock:
+        _conn.execute("INSERT INTO events(run_id,seq,type,call_id,tool,payload,ts) VALUES(?,?,?,?,?,?,?)",
+                      (run_id, seq, etype, call_id, tool,
+                       json.dumps(payload if payload is not None else {}, ensure_ascii=False, default=str),
+                       time.time()))
+        _conn.commit()
+
+def _run_row(r):
+    return dict(r)
+
+def list_runs(app_id=None, trigger=None, status=None, before=None, limit=50):
+    where, args = [], []
+    if app_id is not None:
+        where.append("r.app_id=?"); args.append(app_id)
+    if trigger:
+        where.append("r.trigger=?"); args.append(trigger)
+    if status:
+        where.append("r.status=?"); args.append(status)
+    if before:
+        where.append("r.started<?"); args.append(float(before))
+    sql = ("SELECT r.*, (SELECT COUNT(*) FROM events e WHERE e.run_id=r.id AND e.type='tool/call') AS tool_calls "
+           "FROM runs r" + (" WHERE " + " AND ".join(where) if where else "") +
+           " ORDER BY r.started DESC LIMIT ?")
+    args.append(max(1, min(int(limit or 50), 200)))
+    return [_run_row(r) for r in _conn.execute(sql, args).fetchall()]
+
+def get_run(run_id):
+    r = _conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    return _run_row(r) if r else None
+
+def run_events(run_id):
+    rows = _conn.execute("SELECT seq,type,call_id,tool,payload,ts FROM events WHERE run_id=? ORDER BY seq",
+                         (run_id,)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["payload"] = json.loads(d["payload"] or "{}")
+        except Exception:
+            pass
+        out.append(d)
+    return out
+
+def abort_running_runs():
+    """启动时调用：上次进程留下的 running 一律标 aborted（进程已死，不可能还在跑）。"""
+    with _lock:
+        cur = _conn.execute("UPDATE runs SET status='aborted', ended=? WHERE status='running'", (time.time(),))
+        _conn.commit()
+        return cur.rowcount
+
+def purge_runs(before_ts):
+    """删除早于 before_ts 开始的 run 及其事件。"""
+    with _lock:
+        _conn.execute("DELETE FROM events WHERE run_id IN (SELECT id FROM runs WHERE started<?)", (before_ts,))
+        cur = _conn.execute("DELETE FROM runs WHERE started<?", (before_ts,))
+        _conn.commit()
+        return cur.rowcount
+
+
+# ---------- 审批（harness.approval） ----------
+def _approval_row(r):
+    d = dict(r)
+    try:
+        d["args"] = json.loads(d.get("args") or "{}")
+    except Exception:
+        pass
+    return d
+
+def create_approval(approval_id, kind, run_id, call_id, app_id, chat_id, tool, risk, args, reason,
+                    requester_open_id=""):
+    with _lock:
+        _conn.execute("INSERT INTO approvals(id,kind,run_id,call_id,app_id,chat_id,tool,risk,args,reason,"
+                      "status,requester_open_id,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (approval_id, kind, run_id, call_id, app_id, chat_id, tool, risk,
+                       json.dumps(args, ensure_ascii=False, default=str), reason, "pending",
+                       requester_open_id or "", time.time()))
+        _conn.commit()
+
+def get_approval(approval_id):
+    r = _conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+    return _approval_row(r) if r else None
+
+def set_approval_message(approval_id, message_id):
+    with _lock:
+        _conn.execute("UPDATE approvals SET message_id=? WHERE id=?", (message_id, approval_id))
+        _conn.commit()
+
+def decide_approval(approval_id, status, decider_open_id=""):
+    """原子地把 pending 改成终态；已被别人处理过返回 False（多人同时点/连点只生效一次）。"""
+    with _lock:
+        cur = _conn.execute("UPDATE approvals SET status=?, decider_open_id=?, decided=? "
+                            "WHERE id=? AND status='pending'",
+                            (status, decider_open_id or "", time.time(), approval_id))
+        _conn.commit()
+        return cur.rowcount == 1
+
+def cancel_pending_approvals():
+    """启动时调用：遗留的 pending 一律 cancelled（等它的线程已随进程消失）。返回被取消的行。"""
+    with _lock:
+        rows = _conn.execute("SELECT * FROM approvals WHERE status='pending'").fetchall()
+        _conn.execute("UPDATE approvals SET status='cancelled', decided=? WHERE status='pending'", (time.time(),))
+        _conn.commit()
+    return [_approval_row(r) for r in rows]
+
+
+# ---------- 代码仓库与工作区（harness.workspace） ----------
+_REPO_FIELDS = ("name", "url", "branch", "username", "token", "write_token", "test_cmd", "validation_kind", "enabled")
+
+def list_code_repos():
+    return [dict(r, enabled=bool(r["enabled"]))
+            for r in _conn.execute("SELECT * FROM code_repos ORDER BY id").fetchall()]
+
+def get_code_repo(rid):
+    r = _conn.execute("SELECT * FROM code_repos WHERE id=?", (rid,)).fetchone()
+    return dict(r, enabled=bool(r["enabled"])) if r else None
+
+def get_code_repo_by_name(name):
+    r = _conn.execute("SELECT * FROM code_repos WHERE name=?", (name,)).fetchone()
+    return dict(r, enabled=bool(r["enabled"])) if r else None
+
+def create_code_repo(**f):
+    cols = [k for k in _REPO_FIELDS if k in f and f[k] is not None]
+    with _lock:
+        cur = _conn.execute(f"INSERT INTO code_repos({','.join(cols + ['ts'])}) "
+                            f"VALUES({','.join('?' * (len(cols) + 1))})",
+                            [int(f[k]) if k == "enabled" else f[k] for k in cols] + [time.time()])
+        _conn.commit()
+        return cur.lastrowid
+
+def update_code_repo(rid, **f):
+    sets, vals = [], []
+    for k in _REPO_FIELDS:
+        if k not in f or f[k] is None:
+            continue
+        if k in ("token", "write_token") and not f[k]:     # 仅非空才更新凭证，避免掩码覆盖真值
+            continue
+        sets.append(f"{k}=?"); vals.append(int(f[k]) if k == "enabled" else f[k])
+    if not sets:
+        return
+    vals.append(rid)
+    with _lock:
+        _conn.execute(f"UPDATE code_repos SET {','.join(sets)} WHERE id=?", vals)
+        _conn.commit()
+
+def delete_code_repo(rid):
+    with _lock:
+        _conn.execute("DELETE FROM code_repos WHERE id=?", (rid,))
+        _conn.commit()
+
+def _ws_row(r):
+    d = dict(r)
+    try:
+        d["changed"] = json.loads(d.get("changed") or "{}")
+    except Exception:
+        d["changed"] = {}
+    return d
+
+def create_workspace(ws_id, app_id, chat_id, repo_id, path, base_branch, base_commit):
+    now = time.time()
+    with _lock:
+        _conn.execute("INSERT INTO workspaces(id,app_id,chat_id,repo_id,path,base_branch,base_commit,status,"
+                      "created,last_used) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (ws_id, app_id, chat_id, repo_id, path, base_branch, base_commit, "open", now, now))
+        _conn.commit()
+
+def get_workspace(ws_id):
+    r = _conn.execute("SELECT * FROM workspaces WHERE id=?", (ws_id,)).fetchone()
+    return _ws_row(r) if r else None
+
+def latest_workspace(app_id, chat_id):
+    r = _conn.execute("SELECT * FROM workspaces WHERE app_id=? AND chat_id=? AND status='open' "
+                      "ORDER BY last_used DESC LIMIT 1", (app_id, chat_id)).fetchone()
+    return _ws_row(r) if r else None
+
+def list_workspaces(status=None, app_id=None):
+    where, args = [], []
+    if status:
+        where.append("status=?"); args.append(status)
+    if app_id is not None:
+        where.append("app_id=?"); args.append(app_id)
+    sql = "SELECT * FROM workspaces" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY last_used DESC"
+    return [_ws_row(r) for r in _conn.execute(sql, args).fetchall()]
+
+def update_workspace(ws_id, **f):
+    sets, vals = [], []
+    for k in ("changed", "mr_url", "mr_branch", "status", "last_used"):
+        if k in f:
+            sets.append(f"{k}=?")
+            vals.append(json.dumps(f[k], ensure_ascii=False) if k == "changed" else f[k])
+    if not sets:
+        return
+    vals.append(ws_id)
+    with _lock:
+        _conn.execute(f"UPDATE workspaces SET {','.join(sets)} WHERE id=?", vals)
+        _conn.commit()
+
+
+# ---------- 安全情报与漏洞台账（sec） ----------
+_INTEL_FIELDS = ("name", "kind", "category", "url", "token", "query", "enabled", "interval_min")
+
+def list_intel_sources():
+    return [dict(r, enabled=bool(r["enabled"])) for r in _conn.execute("SELECT * FROM intel_sources ORDER BY id")]
+
+def get_intel_source(sid):
+    r = _conn.execute("SELECT * FROM intel_sources WHERE id=?", (sid,)).fetchone()
+    return dict(r, enabled=bool(r["enabled"])) if r else None
+
+def create_intel_source(**f):
+    cols = [k for k in _INTEL_FIELDS if k in f and f[k] is not None]
+    with _lock:
+        cur = _conn.execute(f"INSERT INTO intel_sources({','.join(cols + ['ts'])}) VALUES({','.join('?' * (len(cols) + 1))})",
+                            [int(f[k]) if k in ("enabled", "interval_min") else f[k] for k in cols] + [time.time()])
+        _conn.commit()
+        return cur.lastrowid
+
+def update_intel_source(sid, **f):
+    sets, vals = [], []
+    for k in _INTEL_FIELDS:
+        if k not in f or f[k] is None or (k == "token" and not f[k]):
+            continue
+        sets.append(f"{k}=?"); vals.append(int(f[k]) if k in ("enabled", "interval_min") else f[k])
+    if sets:
+        vals.append(sid)
+        with _lock:
+            _conn.execute(f"UPDATE intel_sources SET {','.join(sets)} WHERE id=?", vals)
+            _conn.commit()
+
+def set_intel_source_result(sid, status, error="", new=0):
+    with _lock:
+        _conn.execute("UPDATE intel_sources SET last_fetch=?, last_status=?, last_error=?, last_new=? WHERE id=?",
+                      (time.time(), status, error or "", int(new or 0), sid))
+        _conn.commit()
+
+def delete_intel_source(sid):
+    with _lock:
+        _conn.execute("DELETE FROM intel_items WHERE source_id=?", (sid,))
+        _conn.execute("DELETE FROM intel_sources WHERE id=?", (sid,))
+        _conn.commit()
+
+def add_intel_item(source_id, uid, title, url, summary, published, cves, extra=None):
+    """插入一条情报；同一来源同一 uid 已存在返回 None（去重）。"""
+    with _lock:
+        cur = _conn.execute("INSERT OR IGNORE INTO intel_items(source_id,uid,title,url,summary,published,cves,extra,fetched) "
+                            "VALUES(?,?,?,?,?,?,?,?,?)",
+                            (source_id, uid, title, url, summary, published, json.dumps(cves or []),
+                             json.dumps(extra or {}, ensure_ascii=False), time.time()))
+        _conn.commit()
+        return cur.lastrowid if cur.rowcount else None
+
+def intel_items(cve=None, q=None, source_id=None, days=None, limit=50):
+    where, args = [], []
+    if cve:
+        where.append("i.cves LIKE ?"); args.append(f'%"{cve}"%')
+    if q:
+        where.append("(i.title LIKE ? OR i.summary LIKE ?)"); args += [f"%{q}%", f"%{q}%"]
+    if source_id:
+        where.append("i.source_id=?"); args.append(source_id)
+    if days:
+        where.append("i.fetched>=?"); args.append(time.time() - float(days) * 86400)
+    sql = ("SELECT i.*, s.name AS source, s.category FROM intel_items i LEFT JOIN intel_sources s ON s.id=i.source_id"
+           + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY i.fetched DESC, i.id DESC LIMIT ?")
+    args.append(max(1, min(int(limit or 50), 500)))
+    out = []
+    for r in _conn.execute(sql, args).fetchall():
+        d = dict(r)
+        d["cves"] = json.loads(d.get("cves") or "[]")
+        d["extra"] = json.loads(d.get("extra") or "{}")
+        out.append(d)
+    return out
+
+def _vuln_row(r):
+    d = dict(r)
+    for k in ("products", "sources", "assets"):
+        try:
+            d[k] = json.loads(d.get(k) or "[]")
+        except Exception:
+            d[k] = []
+    d["kev"] = bool(d.get("kev"))
+    return d
+
+def get_vuln(cve):
+    r = _conn.execute("SELECT * FROM vulns WHERE cve=?", (cve,)).fetchone()
+    return _vuln_row(r) if r else None
+
+VULN_STATUSES = ("new", "triaging", "affected", "not_affected", "fixed", "ignored")
+
+def upsert_vuln(cve, **f):
+    """合并更新一条漏洞：列表字段取并集，数值字段只在给了值时覆盖，mentions/social 用 add_* 累加。"""
+    now = time.time()
+    with _lock:
+        r = _conn.execute("SELECT * FROM vulns WHERE cve=?", (cve,)).fetchone()
+        cur = _vuln_row(r) if r else None
+        if cur is None:
+            _conn.execute("INSERT INTO vulns(cve,first_seen,last_seen,updated) VALUES(?,?,?,?)", (cve, now, now, now))
+            cur = {"products": [], "sources": [], "assets": [], "mentions": 0, "social": 0}
+        sets = {"last_seen": now, "updated": now}
+        for k in ("title", "description", "severity", "cvss", "kev_added", "ransomware", "epss", "epss_pct", "epss_at",
+                  "status", "note"):
+            if f.get(k) not in (None, ""):
+                sets[k] = f[k]
+        if f.get("kev"):
+            sets["kev"] = 1
+        for k in ("products", "sources", "assets"):
+            if f.get(k):
+                merged = list(dict.fromkeys(list(cur.get(k) or []) + list(f[k])))
+                sets[k] = json.dumps(merged, ensure_ascii=False)
+        if f.get("add_mentions"):
+            sets["mentions"] = int(cur.get("mentions") or 0) + int(f["add_mentions"])
+        if f.get("add_social"):
+            sets["social"] = int(cur.get("social") or 0) + int(f["add_social"])
+        _conn.execute(f"UPDATE vulns SET {','.join(k + '=?' for k in sets)} WHERE cve=?", list(sets.values()) + [cve])
+        _conn.commit()
+
+def list_vulns(status=None, kev=None, q=None, days=None, sort="last_seen", limit=100, offset=0):
+    where, args = [], []
+    if status:
+        where.append("status=?"); args.append(status)
+    if kev:
+        where.append("kev=1")
+    if q:
+        where.append("(cve LIKE ? OR title LIKE ? OR products LIKE ? OR note LIKE ?)"); args += [f"%{q}%"] * 4
+    if days:
+        where.append("last_seen>=?"); args.append(time.time() - float(days) * 86400)
+    order = {"last_seen": "last_seen DESC", "epss": "COALESCE(epss,0) DESC", "social": "social DESC, mentions DESC",
+             "kev": "kev DESC, kev_added DESC", "first_seen": "first_seen DESC"}.get(sort, "last_seen DESC")
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+    total = _conn.execute("SELECT COUNT(*) n FROM vulns" + sql_where, args).fetchone()["n"]
+    rows = _conn.execute(f"SELECT * FROM vulns{sql_where} ORDER BY {order} LIMIT ? OFFSET ?",
+                         args + [max(1, min(int(limit or 100), 500)), max(0, int(offset or 0))]).fetchall()
+    return {"total": total, "items": [_vuln_row(r) for r in rows]}
+
+def vuln_stats():
+    c = lambda sql, *a: _conn.execute(sql, a).fetchone()["n"]
+    week = time.time() - 7 * 86400
+    return {"total": c("SELECT COUNT(*) n FROM vulns"),
+            "kev": c("SELECT COUNT(*) n FROM vulns WHERE kev=1"),
+            "new_7d": c("SELECT COUNT(*) n FROM vulns WHERE first_seen>=?", week),
+            "affected": c("SELECT COUNT(*) n FROM vulns WHERE status='affected'"),
+            "triage": c("SELECT COUNT(*) n FROM vulns WHERE status IN ('new','triaging')"),
+            "by_status": {r["status"]: r["n"] for r in _conn.execute("SELECT status, COUNT(*) n FROM vulns GROUP BY status")}}
+
+def vulns_needing_epss(limit=100, max_age=86400):
+    rows = _conn.execute("SELECT cve FROM vulns WHERE epss_at IS NULL OR epss_at<? ORDER BY last_seen DESC LIMIT ?",
+                         (time.time() - max_age, limit)).fetchall()
+    return [r["cve"] for r in rows]
+
+
+# ---------- Webhook 触发（harness.webhooks） ----------
+_conn.executescript("""
+    CREATE TABLE IF NOT EXISTS webhooks(
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        app_id INTEGER NOT NULL, chat_id TEXT NOT NULL,
+        workflow TEXT NOT NULL DEFAULT 'auto',
+        template TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        max_per_hour INTEGER NOT NULL DEFAULT 60,
+        calls INTEGER NOT NULL DEFAULT 0,
+        last_called REAL, last_status TEXT, last_error TEXT,
+        created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS webhook_calls(
+        hook_id TEXT NOT NULL, ts REAL NOT NULL, status TEXT NOT NULL, task_id TEXT);
+    CREATE INDEX IF NOT EXISTS idx_webhook_calls ON webhook_calls(hook_id, ts);
+""")
+_conn.commit()
+
+_HOOK_FIELDS = ("name", "app_id", "chat_id", "workflow", "template", "token_hash", "enabled", "max_per_hour")
+
+def _hook_row(r):
+    return dict(r, enabled=bool(r["enabled"])) if r else None
+
+def list_webhooks():
+    return [_hook_row(r) for r in _conn.execute("SELECT * FROM webhooks ORDER BY created")]
+
+def get_webhook(hook_id):
+    return _hook_row(_conn.execute("SELECT * FROM webhooks WHERE id=?", (hook_id,)).fetchone())
+
+def create_webhook(hook_id, **f):
+    cols = [k for k in _HOOK_FIELDS if k in f and f[k] is not None]
+    with _lock:
+        _conn.execute(f"INSERT INTO webhooks(id,{','.join(cols)},created) VALUES(?,{','.join('?' * len(cols))},?)",
+                      [hook_id] + [int(f[k]) if k in ("enabled", "max_per_hour", "app_id") else f[k] for k in cols]
+                      + [time.time()])
+        _conn.commit()
+
+def update_webhook(hook_id, **f):
+    sets = [(k, int(f[k]) if k in ("enabled", "max_per_hour", "app_id") else f[k])
+            for k in _HOOK_FIELDS if k in f and f[k] is not None]
+    if sets:
+        with _lock:
+            _conn.execute(f"UPDATE webhooks SET {','.join(k + '=?' for k, _ in sets)} WHERE id=?",
+                          [v for _, v in sets] + [hook_id])
+            _conn.commit()
+
+def delete_webhook(hook_id):
+    with _lock:
+        _conn.execute("DELETE FROM webhook_calls WHERE hook_id=?", (hook_id,))
+        _conn.execute("DELETE FROM webhooks WHERE id=?", (hook_id,))
+        _conn.commit()
+
+def webhook_calls_since(hook_id, since):
+    return _conn.execute("SELECT COUNT(*) n FROM webhook_calls WHERE hook_id=? AND ts>=? AND status='accepted'",
+                         (hook_id, since)).fetchone()["n"]
+
+def record_webhook_call(hook_id, status, error="", task_id=None):
+    now = time.time()
+    with _lock:
+        _conn.execute("INSERT INTO webhook_calls(hook_id,ts,status,task_id) VALUES(?,?,?,?)", (hook_id, now, status, task_id))
+        _conn.execute("UPDATE webhooks SET calls=calls+1, last_called=?, last_status=?, last_error=? WHERE id=?",
+                      (now, status, error or "", hook_id))
+        _conn.execute("DELETE FROM webhook_calls WHERE ts<?", (now - 7 * 86400,))
+        _conn.commit()
+
+def recent_chats(limit=50):
+    """后台选择投递目标用：最近有消息往来的会话（含应用）。"""
+    rows = _conn.execute("SELECT app_id, chat_id, MAX(ts) last FROM msgs GROUP BY app_id, chat_id "
+                         "ORDER BY last DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
 
 

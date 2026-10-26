@@ -2,22 +2,29 @@
 
 每条消息按 app 取：它绑定的 AI 供应商(模型) + 勾选的工具子集 + 人设。
 记忆/用量按 app 隔离；飞书取数用该 app 的凭证（contextvar）。
+每次调用都是一个 run（harness.runs），模型回复与工具调用逐条写进事件日志供审计。
+工具调用一律走 harness.pipeline.run_tool()：记录 → 策略 → guard → 执行 → 后处理。
 """
+import hashlib
 import json
+import os
+import time
 
 from openai import OpenAI
 
 from core import store
 from feishu import auth
+from harness import pipeline, policy, runs, tasks, workflows
+from . import authorization
 from . import mcp as mcp_mod
-from .tools import tools_for, execute, SKILL_TOOL
+from .tools import tools_for, execute, meta_for, approval_preview, explain_errors, MCP_META, SKILL_TOOL
 
 _MAX_TOOL_LOOPS = 40
 
 
-def _system(app, skills):
+def _system(app, skills, chat_id="", context_key=""):
     prompt = app.get("system_prompt") or "你是一个企业数字员工助手。"
-    notes = store.load_notes(app["id"])
+    notes = store.load_notes(app["id"], scope=f"chat:{chat_id}:{context_key}")
     if notes:
         prompt += "\n\n【长期记忆】\n" + "\n".join("- " + n for n in notes)
     if skills:
@@ -132,7 +139,14 @@ def _tool_label(name, args_json):
     if name == "query_logs":
         return "查日志 " + (a.get("stream") or "") + (f"（{a.get('where')}）" if a.get("where") else "")
     if name == "read_skill":
-        return "读技能 " + (a.get("name") or "")
+        return "读技能 " + (a.get("name") or "") + (f" / {a['file']}" if a.get("file") else "")
+    if name.startswith("code_"):
+        verb = {"code_repos": "列仓库", "code_open": "打开仓库", "code_list": "列目录", "code_read": "读",
+                "code_search": "搜索", "code_edit": "改", "code_write": "写", "code_delete": "删",
+                "code_diff": "看 diff", "code_test": "跑测试", "code_validate": "校验清单", "code_propose_mr": "提 MR",
+                "code_close": "关闭工作区"}.get(name, name)
+        obj = a.get("repo") or a.get("path") or a.get("pattern") or a.get("title") or ""
+        return f"{verb} {obj}".strip()
     if name in ("server_stats", "docker_containers", "service_status", "list_log_streams",
                 "list_ssh_hosts", "list_k8s_clusters"):
         return {"server_stats": "查服务器负载", "docker_containers": "查容器",
@@ -141,27 +155,90 @@ def _tool_label(name, args_json):
     return name
 
 
+def _usage_dict(u):
+    if not u:
+        return None
+    return {"prompt": getattr(u, "prompt_tokens", 0) or 0,
+            "completion": getattr(u, "completion_tokens", 0) or 0,
+            "total": getattr(u, "total_tokens", 0) or 0}
+
+
+def _note_call(rec, content, tool_calls, usage, **extra):
+    """一次模型调用落事件 + 累计 run 的 token。"""
+    rec.add_tokens(getattr(usage, "total_tokens", 0) if usage else 0)
+    rec.emit("assistant/message", {"content": content or "",
+                                   "tool_calls": [{"id": t["id"], "name": t["name"], "args": t["args"]}
+                                                  for t in tool_calls],
+                                   "usage": _usage_dict(usage), **extra})
+
+
+def _untrusted_input(task):
+    """任务指令本身含外部内容（巡检扫描结果、webhook 请求体）时，从第一步就按污染处理。"""
+    return task.get("source") == "patrol" or task.get("trigger") == "webhook"
+
+
 def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
-        speaker_open_id: str = "", proactive: bool = False, on_step=None, on_delta=None):
+        speaker_open_id: str = "", proactive: bool = False, on_step=None, on_delta=None,
+        trigger: str = None):
     """app 为 store.get_app() 返回的字典（含 tools 列表、ai_provider_id 等）。
     speaker/speaker_open_id：群里这条消息的发言人姓名与 open_id（用于身份识别与 @）。
-    proactive=True：主动模式，模型可回 __SILENT__ 选择不说话，此时返回 None（不发消息）。"""
+    proactive=True：主动模式，模型可回 __SILENT__ 选择不说话，此时返回 None（不发消息）。
+    trigger：写进 runs.trigger 的触发方式；不传则按 proactive 取 chat / proactive。"""
+    trigger = trigger or ("proactive" if proactive else "chat")
+    rec = runs.start(app["id"], chat_id, trigger, speaker_open_id)
+    status, reason = "error", ""
+    try:
+        answer, status = _run(rec, app, chat_id, user_text, speaker, speaker_open_id,
+                              proactive, on_step, on_delta)
+        if tasks.current() and status == "error":
+            raise RuntimeError(answer)
+        return answer
+    except tasks.TaskSuspended as e:
+        status, reason = e.status, str(e)
+        raise
+    except tasks.TaskCancelled as e:
+        status, reason = "cancelled", str(e)
+        raise
+    except (tasks.TaskUncertain, tasks.TaskIncomplete) as e:
+        status, reason = "needs_attention", str(e)
+        raise
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        runs.end(rec, status, reason)
+
+
+def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_step, on_delta):
+    """run() 的本体。返回 (answer, status)，status 见 harness.runs.STATUSES。"""
     aid = app["id"]
     prov = store.get_provider(app["ai_provider_id"]) if app.get("ai_provider_id") else None
     if not prov or not prov.get("api_key"):
-        return "（这个应用还没绑定可用的 AI —— 请到后台「应用」里给它绑定一个已配好 API Key 的 AI 供应商。）"
+        return ("（这个应用还没绑定可用的 AI —— 请到后台「应用」里给它绑定一个已配好 API Key 的 AI 供应商。）",
+                "error")
 
-    client = OpenAI(base_url=prov.get("base_url") or "https://api.openai.com/v1", api_key=prov["api_key"])
+    context_key = authorization.context_key(app)
+    state = tasks.load_checkpoint()
+    if state and state.get("context_key") != context_key:
+        raise tasks.TaskIncomplete("授权、技能或模型配置已变化，旧上下文已停止使用；请核对原任务后创建新任务。")
+
+    client = OpenAI(base_url=prov.get("base_url") or "https://api.openai.com/v1", api_key=prov["api_key"],
+                    timeout=60, max_retries=1)
     model = prov.get("model") or "gpt-4o-mini"
     skills = store.skills_for(app.get("skills"))
     tools_schema = tools_for(app.get("tools"))
+    hidden = workflows.hidden_tools((tasks.current() or {}).get("workflow", "auto"), user_text)
+    tools_schema = [t for t in tools_schema if t["function"]["name"] not in hidden]
     if skills:                                   # 有技能才挂 read_skill（保持隔离）
         tools_schema = tools_schema + [SKILL_TOOL]
     mcp_schema, mcp_routes = mcp_mod.tools_for_app(app)  # 应用勾选的 MCP server 暴露的工具
     tools_schema = tools_schema + mcp_schema
+    exposed = {t["function"]["name"] for t in tools_schema}   # 模型说出清单外的工具名会被 guard 拦下
     turns = int(app.get("history_turns") or 12)
 
-    system = _system(app, skills)
+    system = _system(app, skills, chat_id, context_key)
+    task = tasks.current() or {}
+    system += workflows.prompt(task.get("workflow", "auto"), user_text)
     if speaker:
         system += _group_brief(speaker, speaker_open_id)
     if proactive:
@@ -169,56 +246,120 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
     # 用户发言带上「姓名」前缀，群里多人发言才分得清谁是谁（也会随历史留痕）
     turn = f"「{speaker}」：{user_text}" if speaker else user_text
 
-    msgs = [{"role": "system", "content": system}]
-    msgs += store.load_history(aid, chat_id, turns)
-    msgs.append({"role": "user", "content": turn})
-    store.save(aid, chat_id, "user", turn)
+    if not state:
+        msgs = [{"role": "system", "content": system}] + store.load_history(aid, chat_id, turns, context_key=context_key)
+        msgs.append({"role": "user", "content": turn})
+        state = {"version": 1, "context_key": context_key, "messages": msgs, "step": 0, "tokens": 0,
+                 "tainted": _untrusted_input(task),
+                 "pending": [], "next_tool": 0, "evidence": [], "started": time.time()}
+        tasks.checkpoint(state)
+    msgs = state["messages"]
+    if _untrusted_input(task):
+        state["tainted"] = True
+    rec.tainted = bool(state.get("tainted"))
+    store.save(aid, chat_id, "user", turn, task_id=task.get("id"), context_key=context_key)
+    rec.emit("run/start", {"provider": prov.get("name"), "model": model,
+                           "tools": [t["function"]["name"] for t in tools_schema],
+                           "skills": [s["name"] for s in skills],
+                           "history_msgs": len(msgs) - 2, "proactive": bool(proactive),
+                           "policy": policy.normalize(app.get("policy")),
+                           "system_sha": hashlib.sha256(system.encode()).hexdigest()[:12]})
+    rec.emit("user/message", {"content": turn})
 
-    ctx = {"app_id": aid, "chat_id": chat_id,
-           "skills": {s["name"]: s.get("content") or "" for s in skills}}
+    ctx = {"app_id": aid, "chat_id": chat_id, "speaker_open_id": speaker_open_id, "context_key": context_key,
+           "skills": {s["name"]: {"content": s.get("content") or "", "files": s.get("files") or {}}
+                      for s in skills}}
     ctok = auth.use_app(app.get("feishu_app_id"), app.get("feishu_app_secret"))  # 文档工具用本应用凭证
     thinking_on = bool(app.get("thinking", True))
     extra_body = {"thinking": {"type": "enabled" if thinking_on else "disabled"}}  # 豆包思考开关（默认开）
     deliver = on_delta if not proactive else None        # 主动模式不流式（不显卡片）
     try:
-        for _ in range(_MAX_TOOL_LOOPS):
-            content, tool_calls, usage = _call(client, model, msgs, tools_schema, extra_body, deliver)
-            _record(aid, chat_id, model, usage)
-            if not tool_calls:
-                answer = (content or "").strip()
-                if proactive and (not answer or "__SILENT__" in answer):
-                    return None                      # 主动模式判定不该说话：不发、不存 assistant
-                answer = answer or "(无输出)"
-                store.save(aid, chat_id, "assistant", answer)
-                return answer
-            msgs.append({
-                "role": "assistant",
-                "content": content or "",
-                "tool_calls": [{"id": t["id"], "type": "function",
-                                "function": {"name": t["name"], "arguments": t["args"]}}
-                               for t in tool_calls],
-            })
+        while state["step"] < _MAX_TOOL_LOOPS or state.get("pending") or state.get("done"):
+            tasks.check_active()
+            if authorization.context_key(store.get_app(aid) or {}) != context_key:
+                raise tasks.TaskIncomplete("任务期间授权、技能或模型配置已变化，请核对原任务后创建新任务。")
+            if state.get("done"):
+                answer = state.get("final_answer") or "(无输出)"
+                if proactive and (answer == "(无输出)" or "__SILENT__" in answer):
+                    return None, "silent"
+                reason = workflows.verify(task.get("workflow", "auto"), user_text, state.get("evidence", []))
+                if task and reason and state.get("verify_retries", 0) < 2:
+                    # 先让模型补证据（最多两次），仍不满足再判定未完成；提示写进检查点，重启后不重复
+                    state["verify_retries"] = state.get("verify_retries", 0) + 1
+                    msgs.append({"role": "assistant", "content": answer})
+                    msgs.append({"role": "user", "content": f"【宿主验收未通过】{reason}。请补充所需的工具调用后，再给出最终答复。"})
+                    state.update(done=False, final_answer=None)
+                    tasks.checkpoint(state)
+                    continue
+                if task and reason:
+                    raise tasks.TaskIncomplete(f"验收待完成：{reason}")
+                store.save(aid, chat_id, "assistant", answer, task_id=task.get("id"), context_key=context_key)
+                return answer, "completed"
+            if state.get("tokens", 0) >= int(os.getenv("HARNESS_MAX_TOKENS", "120000")):
+                raise tasks.TaskIncomplete("任务已达到 token 预算，请查看现有证据后调整任务范围。")
+            if not state.get("pending"):
+                content, tool_calls, usage = _call(client, model, msgs, tools_schema, extra_body, deliver)
+                tasks.check_active()
+                _record(aid, chat_id, model, usage)
+                _note_call(rec, content, tool_calls, usage)
+                state["tokens"] += (getattr(usage, "total_tokens", 0) or 0) if usage else 0
+                state["step"] += 1
+                if not tool_calls:
+                    state.update(done=True, final_answer=(content or "").strip())
+                    tasks.checkpoint(state)
+                    continue
+                for i, call in enumerate(tool_calls):
+                    call["id"] = call["id"] or f"step{state['step']}-call{i}"
+                msgs.append({"role": "assistant", "content": content or "",
+                             "tool_calls": [{"id": t["id"], "type": "function",
+                                "function": {"name": t["name"], "arguments": t["args"]}} for t in tool_calls]})
+                state.update(pending=tool_calls, next_tool=0)
+                tasks.checkpoint(state)  # 模型动作列表先持久化，再执行；恢复不重新生成已批准的动作。
+            tool_calls = state["pending"]
             if on_step:                                  # 进度回调：让 bot 把「这轮在跑什么」刷到卡片上
                 try:
                     on_step([_tool_label(t["name"], t["args"]) for t in tool_calls])
                 except Exception:
                     pass
-            for t in tool_calls:
+            for index in range(state.get("next_tool", 0), len(tool_calls)):
+                t = tool_calls[index]
+                name = t["name"]
+                raw = None
                 try:
                     args = json.loads(t["args"] or "{}")
+                    if not isinstance(args, dict):
+                        raise ValueError("参数不是对象")
                 except Exception:
-                    args = {}
-                if t["name"] in mcp_routes:             # MCP 工具走 MCP 客户端
-                    result = mcp_mod.call(mcp_routes[t["name"]], args)
+                    args, raw = {}, t["args"]
+                if name in mcp_routes:                  # MCP 工具走 MCP 客户端
+                    meta = dict(MCP_META)
+                    executor = (lambda a, _r=mcp_routes[name]: mcp_mod.call(_r, a))
                 else:
-                    result = execute(t["name"], args, ctx)
-                msgs.append({"role": "tool", "tool_call_id": t["id"],
-                             "content": json.dumps(result, ensure_ascii=False)})
+                    meta = meta_for(name, args)
+                    executor = (lambda a, _n=name: explain_errors(_n, execute(_n, a, ctx)))
+                call = pipeline.ToolCall(id=t["id"], tool=name, args=args, raw_args=raw,
+                                         exposed=name in exposed, trigger=rec.trigger, app_id=aid, **meta)
+                # 需要审批时才算的卡片预览（如提 MR 的 diff），让审批人看到真正要批的内容
+                call.extra["action_key"] = f"{state['step']}:{t['id']}"
+                call.extra["prepare"] = lambda a, _n=name: authorization.prepare(_n, a, ctx)
+                call.extra["validate"] = lambda a, _n=name: authorization.validate(_n, a, ctx)
+                call.extra["sandboxed"] = name in ("code_test", "sandbox_run") or name.startswith("box_")
+                call.extra["preview"] = (lambda a, _n=name: approval_preview(_n, a, ctx))
+                content_str = pipeline.run_tool(rec, call, app.get("policy"), executor, app=app)
+                msgs.append({"role": "tool", "tool_call_id": t["id"], "content": content_str})
+                state["evidence"].append({"tool": name, "args": call.args, "result": json.loads(content_str)})
+                state.update(next_tool=index + 1, tainted=bool(rec.tainted),
+                             progress=f"已执行 {name}")
+                tasks.checkpoint(state)
+            state.update(pending=[], next_tool=0)
+            tasks.checkpoint(state)
     finally:
         auth.reset_ctx(ctok)
 
     if proactive:
-        return None                                  # 主动模式下查不动就别硬插话
+        return None, "max-steps"                     # 主动模式下查不动就别硬插话
+    if task:
+        raise tasks.TaskIncomplete("任务达到工具轮数上限，已保存检查点与证据，请缩小范围后继续。")
     # 轮数用尽：不直接放弃，强制「不带工具」再问一次（同样流式），用已查到的信息给出当前最佳结论（优雅降级）
     try:
         content, _tc, usage = _call(client, model, msgs + [
@@ -227,8 +368,9 @@ def run(app: dict, chat_id: str, user_text: str, speaker: str = "",
                         "能得出的结论；若还不完整，就说清已确认了什么、还差什么，给用户一个有用的阶段性答复。"}],
             None, extra_body, deliver)
         _record(aid, chat_id, model, usage)
+        _note_call(rec, content, [], usage, fallback=True)
         answer = (content or "").strip() or "（暂未得出明确结论，请把问题说得更具体点再试）"
     except Exception:
         answer = "（这次排查比较复杂、暂未收敛；把问题缩小一点范围再试试）"
-    store.save(aid, chat_id, "assistant", answer)
-    return answer
+    store.save(aid, chat_id, "assistant", answer, context_key=context_key)
+    return answer, "max-steps"
