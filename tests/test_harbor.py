@@ -146,6 +146,89 @@ class CollectAndReportTests(unittest.TestCase):
         common = {c["package"]: c for c in r["common_fixes"]}
         self.assertEqual((common["openssl"]["fix_to"], common["openssl"]["images"], common["openssl"]["critical"]), (["3.0.15"], 1, 1))
 
+    def test_common_fixes_count_distinct_cves_and_merge_sibling_packages(self):
+        assets = []
+        for name in ("a", "b", "c"):
+            assets.append({"kind": "service", "component": name, "image": f"harbor.upmore.net/p/{name}:1a2b3c4d",
+                           "cluster": "upmore", "namespace": "ns", "workload": f"Deployment/{name} · 容器 c"})
+        assetstore.replace("cluster:upmore", assets)
+        vulns = [{"cve": cve, "package": pkg, "version": "3.3.5-r0", "fixed": "3.3.7-r0", "severity": sev}
+                 for pkg in ("libssl3", "libcrypto3") for cve, sev in (("CVE-1", "Critical"), ("CVE-2", "High"), ("CVE-3", "High"))]
+        assetstore.replace_scans([{"project": "p", "repo": n, "reference": "sha256:" + n, "image": f"harbor.upmore.net/p/{n}:1a2b3c4d",
+                                   "status": "Success", "summary": {"Critical": 2, "High": 4}, "vulns": vulns}
+                                  for n in ("a", "b", "c")])
+        common = match.image_findings(assetstore.list_assets(), kev=set())["common_fixes"]
+        self.assertEqual(len(common), 1)
+        c = common[0]
+        self.assertEqual(sorted(c["package"].split(" / ")), ["libcrypto3", "libssl3"])
+        self.assertEqual((c["critical"], c["high"], c["images"], c["hits"]), (1, 2, 3, 9))
+
+    def test_base_layer_criticals_go_to_rebuild_and_test_env_downgrades(self):
+        imgs = {"web": "harbor.upmore.net/p/web:1a2b3c4d", "api": "harbor.upmore.net/p/api:1a2b3c4d",
+                "api-test": "harbor.upmore.net/p/api-test:v1.0.5-rc.7"}
+        assetstore.replace("cluster:upmore", [{"kind": "service", "component": n, "image": i, "cluster": "upmore",
+                                               "namespace": "ns", "workload": f"Deployment/{n} · 容器 c",
+                                               "exposure": "public", "exposure_note": "公网域名 x"} for n, i in imgs.items()])
+        system = {"cve": "CVE-9", "package": "libssl3", "version": "3.3.5-r0", "fixed": "3.3.7-r0", "severity": "Critical"}
+        app = {"cve": "CVE-8", "package": "Django", "version": "4.1.13", "fixed": "4.2.26", "severity": "Critical"}
+        assetstore.replace_scans([{"project": "p", "repo": n, "reference": "sha256:" + n, "image": i, "status": "Success",
+                                   "summary": {"Critical": 1}, "vulns": [system] if n == "web" else [system, app]}
+                                  for n, i in imgs.items()])
+        f = match.image_findings(assetstore.list_assets(), kev=set())
+        prio = {x["service"]: (x["priority"], x["priority_reason"]) for x in f["items"]}
+        self.assertEqual(prio["web"][0], "P2")
+        self.assertIn("基础镜像", prio["web"][1])
+        self.assertEqual(prio["api"][0], "P1")
+        self.assertEqual(prio["api-test"][0], "P2")
+        self.assertIn("测试环境", prio["api-test"][1])
+        self.assertEqual((f["rebuild"]["images"], f["rebuild"]["critical"]), (3, 1))
+        api = next(x for x in f["items"] if x["service"] == "api")
+        self.assertEqual([p["package"] for p in api["app_packages"]], ["Django"])
+
+    def test_marks_suppress_and_planned_overdue_reappears(self):
+        self.collect()
+        before = match.image_findings(assetstore.list_assets(), kev=set())["items"][0]
+        self.assertEqual(before["priority"], "P1")
+        assetstore.set_mark("up-oa", "openssl", "accepted", "该功能未启用", by="admin")
+        after = match.image_findings(assetstore.list_assets(), kev=set())
+        item = after["items"][0]
+        self.assertEqual(item["fixable_cves"]["critical"], 0)
+        self.assertEqual(item["marked"][0]["package"], "openssl")
+        self.assertEqual(after["marks_summary"]["by_status"], {"accepted": 1})
+        assetstore.set_mark("up-oa", "openssl", "planned", "排期", until="2020-01-01")
+        late = match.image_findings(assetstore.list_assets(), kev=set())
+        self.assertEqual(late["items"][0]["priority"], "P1")                       # 过期的计划修复重新计入
+        self.assertEqual(late["marks_summary"]["overdue"][0]["package"], "openssl")
+        with self.assertRaises(ValueError):
+            assetstore.set_mark("up-oa", "openssl", "planned")                     # 计划修复必须有到期日
+        for m in assetstore.list_marks():
+            assetstore.delete_mark(m["id"])
+
+    def test_marks_api(self):
+        store.ensure_admin("marks-test", "pw-for-test-only")
+        c = TestClient(admin.app)
+        c.cookies.set(admin._COOKIE, admin._make_session(store._conn.execute("SELECT username FROM admin WHERE id=1").fetchone()["username"]))
+        self.assertEqual(c.post("/api/security/marks", json={"service": "*", "package": "brotli-libs", "status": "nope"}).status_code, 400)
+        self.assertEqual(c.post("/api/security/marks", json={"service": "*", "package": "brotli-libs", "status": "accepted",
+                                                              "note": "静态站点"}).status_code, 200)
+        marks = c.get("/api/security/marks").json()["marks"]
+        self.assertEqual((marks[0]["package"], marks[0]["created_by"] != ""), ("brotli-libs", True))
+        self.assertTrue(marks[0]["until"])                                           # 默认 90 天后复核
+        self.assertEqual(c.delete(f"/api/security/marks/{marks[0]['id']}").status_code, 200)
+        self.assertEqual(c.get("/api/security/marks").json()["marks"], [])
+        self.assertEqual(TestClient(admin.app).get("/api/security/marks").status_code, 401)
+
+    def test_security_overview_api(self):
+        self.collect()
+        store.ensure_admin("sec-overview-test", "pw-for-test-only")
+        c = TestClient(admin.app)
+        c.cookies.set(admin._COOKIE, admin._make_session(store._conn.execute("SELECT username FROM admin WHERE id=1").fetchone()["username"]))
+        r = c.get("/api/security/overview").json()
+        self.assertEqual(r["items"][0]["service"], "up-oa")
+        self.assertEqual((r["items"][0]["fixable_cves"]["critical"], r["items"][0]["fixable_cves"]["high"]), (1, 1))
+        self.assertEqual(r["coverage"]["outside_harbor"], ["quay.io/argoproj/argocd:v3.4.12"])
+        self.assertEqual(TestClient(admin.app).get("/api/security/overview").status_code, 401)
+
     def test_report_and_tool_respect_visibility(self):
         self.collect()
         app_id = store.create_app("镜像权限")

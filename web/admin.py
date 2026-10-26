@@ -863,6 +863,47 @@ def fetch_intel_source(sid: int, request: Request):
         collector.enrich_epss()
     return r
 
+@app.get("/api/security/overview")
+def security_overview(request: Request):
+    """安全概览：我们在跑镜像的 Harbor 扫描结果（P0~P3、通用修复、覆盖缺口），与日报同一份数据。"""
+    _auth(request)
+    from core import assetstore
+    from sec import match
+    assets = assetstore.list_assets(limit=20000)
+    f = match.image_findings(assets, limit=200)
+    f["coverage"]["outside_harbor"] = match.outside_harbor(assets)
+    f["inventory"] = [{"source": x["source"], "status": x["status"], "assets": x["count"], "error": x["error"],
+                       "ok_at": x["ok_at"]} for x in assetstore.sources()]
+    return f
+
+@app.get("/api/security/marks")
+def security_marks(request: Request):
+    _auth(request)
+    from core import assetstore
+    return {"marks": assetstore.list_marks(), "status": assetstore.MARK_STATUS}
+
+
+@app.post("/api/security/marks")
+async def security_mark_set(request: Request):
+    user = _auth(request)
+    from core import assetstore
+    b = await _body(request)
+    try:
+        assetstore.set_mark(b.get("service"), b.get("package"), b.get("status"), b.get("note") or "",
+                            b.get("until") or "", by=user)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/security/marks/{mark_id}")
+def security_mark_delete(mark_id: int, request: Request):
+    _auth(request)
+    from core import assetstore
+    assetstore.delete_mark(mark_id)
+    return {"ok": True}
+
+
 @app.get("/api/vulns")
 def vulns(request: Request):
     _auth(request)

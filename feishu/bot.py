@@ -16,7 +16,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import (CreateMessageRequest, CreateMessageRequestBody,
                                  PatchMessageRequest, PatchMessageRequestBody)
 
-from core import store
+from core import store, taskstore
 from feishu import members
 from harness import approval, tasks, access
 from llm.engine import run as llm_run
@@ -386,7 +386,9 @@ def deliver_task(task, text):
     app = store.get_app(task["app_id"])
     if not app:
         raise RuntimeError("任务所属应用不存在，无法投递")
-    resp = _create_card(app, task["chat_id"], _md_card(text), task.get("notification_id"))
+    card = (json.loads(text[len(taskstore.CARD_PREFIX):]) if text.startswith(taskstore.CARD_PREFIX)
+            else _md_card(text))
+    resp = _create_card(app, task["chat_id"], card, task.get("notification_id"))
     if not resp.success():
         raise RuntimeError(f"飞书投递失败 code={resp.code}")
 

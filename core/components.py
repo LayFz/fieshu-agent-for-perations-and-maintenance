@@ -219,3 +219,31 @@ def package_component(product, components):
         if any(re.match(p, low) for p in PACKAGES.get(comp, [])):
             return comp
     return None
+
+
+_OS_VERSION = re.compile(r"-r\d+$|deb\d|ubuntu|\+b\d|^\d+:|el\d|-\d+(\.\d+)*$")
+
+
+def package_kind(package, version=""):
+    """Trivy 包名/版本 → 包类型：runtime（Go stdlib 等运行时）/ system（基础镜像系统包）/
+    go / npm / composer / maven / app（其他应用依赖）。"""
+    name = package or ""
+    if name == "stdlib":
+        return "runtime"
+    if name.startswith("@"):
+        return "npm"
+    if "/" in name:
+        if "." in name.split("/", 1)[0]:
+            return "go"
+        if re.fullmatch(r"[\w.-]+/[\w.-]+", name):
+            return "composer"
+    if re.search(r"^[\w.-]+:[\w.-]+$", name):
+        return "maven"
+    if _OS_VERSION.search(version or ""):
+        return "system"
+    return "app"
+
+
+def is_base_layer(package, version=""):
+    """基础镜像层（系统包、语言运行时）：更新基础镜像并重建即可修复，不需要改业务依赖。"""
+    return package_kind(package, version) in ("system", "runtime")

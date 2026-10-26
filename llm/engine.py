@@ -227,6 +227,8 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
     model = prov.get("model") or "gpt-4o-mini"
     skills = store.skills_for(app.get("skills"))
     tools_schema = tools_for(app.get("tools"))
+    hidden = workflows.hidden_tools((tasks.current() or {}).get("workflow", "auto"), user_text)
+    tools_schema = [t for t in tools_schema if t["function"]["name"] not in hidden]
     if skills:                                   # 有技能才挂 read_skill（保持隔离）
         tools_schema = tools_schema + [SKILL_TOOL]
     mcp_schema, mcp_routes = mcp_mod.tools_for_app(app)  # 应用勾选的 MCP server 暴露的工具

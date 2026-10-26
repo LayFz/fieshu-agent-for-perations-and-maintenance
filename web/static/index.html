@@ -181,6 +181,7 @@
       <a data-page="schedules" data-ic="clock"><span class="t">定时任务</span></a>
       <a data-page="hooks" data-ic="plug"><span class="t">Webhook 触发</span></a>
       <div class="nlabel">安全</div>
+      <a data-page="security" data-ic="shield"><span class="t">安全概览</span></a>
       <a data-page="vulns" data-ic="shield"><span class="t">漏洞台账</span><span class="badge" id="nav-vuln-badge" style="display:none"></span></a>
       <a data-page="intel" data-ic="radar"><span class="t">情报源</span></a>
       <div class="nlabel">工程</div>
@@ -246,7 +247,7 @@ $('#lg-p').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 
 /* ---------- 路由 ---------- */
 const PAGES = { patrols: patrolsPage, tasks: tasksPage, overview, apps, providers, skills, mcp, code: codePage, schedules, memory, runs: runsPage, usage, obs, ssh, k8s, account,
-  vulns: vulnsPage, intel: intelPage, connections: connectionsPage, hooks: hooksPage };
+  security: securityPage, vulns: vulnsPage, intel: intelPage, connections: connectionsPage, hooks: hooksPage };
 function go(page){
   if(!PAGES[page]) page='overview';
   let group='';
@@ -417,6 +418,99 @@ const VULN_ST={new:'新发现',triaging:'研判中',affected:'受影响',not_aff
 const sevBadge=s=>{ if(!s) return '<span class="muted">—</span>'; const k=String(s).toLowerCase(); return `<span class="sev ${esc(k)}">${esc(String(s).toUpperCase())}</span>`; };
 const epssBar=e=> e==null?'<span class="muted">—</span>':`<div style="display:flex;align-items:center;gap:6px"><div class="bar" style="width:60px"><i style="width:${Math.max(2,Math.round(e*100))}%"></i></div><span class="mono">${(e*100).toFixed(1)}%</span></div>`;
 let _vf={status:'',kev:false,q:'',sort:'last_seen',days:'',offset:0}; const _VLIMIT=50;
+/* ---------- 安全概览：我们在跑镜像的 Harbor 扫描（与漏洞日报同一份数据） ---------- */
+let _secShow=['P0','P1'];
+const PRIO_CLS={P0:'kev',P1:'critical',P2:'high',P3:'low'};
+async function securityPage(){
+  const c=$('#content');
+  c.innerHTML=`<div class="head"><div><h2>安全概览</h2><p class="desc">线上在跑的镜像 × Harbor（Trivy）扫描结果：按 P0~P3 排列、能一次清掉一批的通用修复、还没覆盖到的镜像。
+      优先级已结合暴露面（公网 / 内网 / 仅集群内），漏洞数按去重 CVE 计。与飞书漏洞日报同一份数据。</p></div>
+      <button class="btn ghost" onclick="go('vulns')">外部情报台账</button></div>
+    <div id="sec-body">加载中…</div>`;
+  let r, m; try{ [r,m]=await Promise.all([api('GET','/api/security/overview'),api('GET','/api/security/marks')]); }
+  catch(e){ $('#sec-body').innerHTML=`<div class="empty">读取失败：${esc(e.message)}</div>`; return; }
+  _secData=r; _secMarks=m; renderSecurity();
+}
+let _secData=null, _secMarks={marks:[],status:{}};
+const _markLink=(svc,pkg)=>`<a class="muted" style="cursor:pointer;font-size:11.5px;margin-left:6px" data-svc="${esc(svc)}" data-pkg="${esc(pkg)}" onclick="markDlg(this.dataset.svc,this.dataset.pkg)">标记</a>`;
+function markDlg(svc,pkg){
+  const st=_secMarks.status||{}, soon=new Date(Date.now()+14*864e5+8*36e5).toISOString().slice(0,10);
+  openModal(`<h2>标记漏洞</h2><p class="desc">标记后不再计入优先级、日报不再重复提醒。计划修复到期仍未修好会重新出现并标「逾期」；接受风险/误报默认 90 天后复核。</p>
+    <label>包</label><input id="mk-pkg" class="mono" value="${esc(pkg)}">
+    <label>范围</label><select id="mk-svc"><option value="${esc(svc)}">${svc==='*'?'所有服务里的这个包':'只针对 '+esc(svc)}</option>${svc!=='*'?'<option value="*">所有服务里的这个包</option>':''}</select>
+    <label>结论</label><select id="mk-st">${Object.entries(st).map(([k,t])=>`<option value="${k}">${t}</option>`).join('')}</select>
+    <label>到期 / 复核日期</label><input id="mk-until" type="date" value="${soon}">
+    <label>原因 / 备注</label><input id="mk-note" placeholder="如：该功能未启用 / 已排期 10 月迭代 / 仅内网工具">
+    <div class="save-bar"><button class="btn" onclick="saveMark()">保存</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`);
+}
+async function saveMark(){
+  try{ await api('POST','/api/security/marks',{service:$('#mk-svc').value,package:$('#mk-pkg').value,status:$('#mk-st').value,
+        until:$('#mk-until').value,note:$('#mk-note').value}); closeModal(); securityPage(); }
+  catch(e){ alert(e.message); }
+}
+async function delMark(id){ if(!confirm('撤销这个标记？撤销后会重新计入优先级与日报。')) return; await api('DELETE','/api/security/marks/'+id); securityPage(); }
+const _maxVer=vs=>(vs||[]).slice().sort((a,b)=>{const x=a.match(/\d+/g)||[],y=b.match(/\d+/g)||[];for(let i=0;i<Math.max(x.length,y.length);i++){const d=(+x[i]||0)-(+y[i]||0);if(d)return d;}return 0;}).pop()||'';
+function _secToggle(p){ _secShow=_secShow.includes(p)?_secShow.filter(x=>x!==p):_secShow.concat(p); renderSecurity(); }
+function renderSecurity(){
+  const r=_secData, cov=r.coverage||{}, bp=r.by_priority||{}, rb=r.rebuild||{};
+  const gaps=(cov.not_in_harbor||[]).length+(cov.not_scanned||[]).length+(cov.scanning||[]).length+(cov.errors||[]).length+(cov.outside_harbor||[]).length;
+  const stale=(r.inventory||[]).filter(x=>x.status!=='ok');
+  const stat=(p,label,cls)=>`<div class="stat ${bp[p]?cls:'good'}" style="cursor:pointer;${_secShow.includes(p)?'outline:2px solid var(--pri)':''}" onclick="_secToggle('${p}')">
+      <div class="k">${p} · ${label}</div><div class="v">${fmt(bp[p])}</div><div class="s">个镜像 · 点击${_secShow.includes(p)?'收起':'展开'}</div></div>`;
+  const fixes=(r.common_fixes||[]).map(x=>`<tr>
+      <td><b class="mono">${esc(x.package)}</b>${x.kev&&x.kev.length?' <span class="sev kev">KEV</span>':''}<div><span class="tag">${x.layer==='base'?'基础镜像':'应用依赖'}</span>${x.package.split(' / ').map(n=>_markLink('*',n)).join('')}</div></td>
+      <td class="mono" style="white-space:nowrap">${x.layer==='base'?'≥ '+esc(_maxVer(x.fix_to)):esc((x.fix_to||[]).join(' / '))}</td>
+      <td>${x.critical?`<span class="sev critical">${x.critical} 严重</span> `:''}${x.high?`<span class="sev high">${x.high} 高危</span>`:''}</td>
+      <td class="num" style="white-space:nowrap"><b>${x.images}</b> <span class="muted">（公网 ${x.images_public}）</span></td>
+      <td class="clip muted" style="font-size:12px">${esc((x.image_names||[]).join('、'))}${x.images>(x.image_names||[]).length?' …':''}</td></tr>`).join('');
+  const items=(r.items||[]).filter(x=>_secShow.includes(x.priority));
+  const rows=items.map(x=>{ const fc=x.fixable_cves||{};
+    return `<tr>
+      <td><span class="sev ${PRIO_CLS[x.priority]}">${x.priority}</span><div class="muted" style="font-size:11.5px;margin-top:4px">${esc(x.priority_reason)}</div></td>
+      <td><b>${esc(x.service)}</b><div class="mono muted" style="word-break:break-all">${esc(x.image.replace(/^[^/]+\//,''))}</div>
+        <div class="muted" style="font-size:12px">${esc((x.workloads||[]).join('，'))}</div>${x.match_note?`<div class="muted" style="font-size:12px">⚠ ${esc(x.match_note)}</div>`:''}</td>
+      <td style="font-size:12.5px">${esc(x.reachability)}<div class="muted" style="font-size:11.5px">${esc(x.reachability_note||'')}</div></td>
+      <td><div style="font-size:12px" class="muted">应用依赖</div>${fc.app_critical?`<span class="sev critical">${fc.app_critical} 严重</span> `:''}${fc.app_high?`<span class="sev high">${fc.app_high} 高危</span>`:''}${!fc.app_critical&&!fc.app_high?'<span class="muted">—</span>':''}
+        <div style="font-size:12px;margin-top:4px" class="muted">基础镜像 ${fc.base_critical||0} 严重 · ${fc.base_high||0} 高危</div>
+        ${x.kev_cves&&x.kev_cves.length?`<div><span class="sev kev">KEV</span> <span class="mono">${esc(x.kev_cves.join(' '))}</span></div>`:''}</td>
+      <td style="font-size:12.5px">${(x.app_packages||[]).slice(0,4).map(p=>`<div><span class="mono">${esc(p.package)}</span> <span class="muted">${esc(p.version)} →</span> <b class="mono">${esc(p.fixed)}</b>${_markLink(x.service,p.package)}</div>`).join('')||'<span class="muted">只需随批量重建</span>'}
+        ${(x.overdue||[]).map(o=>`<div style="color:var(--err);font-size:12px">⏰ ${esc(o.package)} 计划修复已逾期（原定 ${esc(o.until)}）</div>`).join('')}
+        ${(x.marked||[]).length?`<div class="muted" style="font-size:11.5px;margin-top:4px">已标记：${x.marked.map(m=>esc(m.package)+'（'+esc((_secMarks.status||{})[m.status]||m.status)+'）').join('、')}</div>`:''}</td></tr>`; }).join('');
+  const gapList=(title,list,hint)=>list&&list.length?`<div style="margin-bottom:12px"><div><b>${title}</b> <span class="muted">${list.length} 个 · ${hint}</span></div>
+      <div class="mono muted" style="font-size:12px;line-height:1.7;word-break:break-all">${list.map(esc).join('<br>')}</div></div>`:'';
+  $('#sec-body').innerHTML=`
+    ${stale.length?`<div class="card" style="border-color:#fde68a;background:var(--warn-soft)">⚠ 资产采集有来源失败，数据可能过期：${stale.map(x=>esc(x.source+'：'+(x.error||x.status))).join('；')}</div>`:''}
+    <div class="grid" style="margin-bottom:16px">
+      ${stat('P0','含在野利用','alert')}${stat('P1','应用依赖有严重漏洞','alert')}${stat('P2','高危 / 仅基础镜像','warn')}${stat('P3','无需单独处理','')}
+      <div class="stat ${gaps?'warn':'good'}"><div class="k">扫描覆盖</div><div class="v">${fmt(cov.scanned)}<span class="muted" style="font-size:14px"> / ${fmt(cov.images)}</span></div>
+        <div class="s">自家 Harbor 镜像已扫描${(cov.outside_harbor||[]).length?` · 另有 ${fmt(cov.outside_harbor.length)} 个不经 Harbor`:''}</div></div></div>
+    ${rb.images?`<div class="card"><div class="card-title">批量重建镜像 <span class="muted">基础镜像层（系统包、语言运行时）的漏洞：更新 FROM 到最新构建后重新构建发布即可，不改业务代码</span></div>
+      <div style="margin-bottom:8px"><b>${fmt(rb.images)}</b> 个镜像 · <span class="sev critical">${fmt(rb.critical)} 严重</span> <span class="sev high">${fmt(rb.high)} 高危</span>
+        <span class="muted">（去重 CVE；公网相关 ${fmt((rb.public||[]).length)} 个）</span></div>
+      <div class="muted" style="font-size:12.5px;line-height:1.7">${esc((rb.names||[]).join('、'))}</div></div>`:''}
+    <div class="card"><div class="card-title">按包汇总 <span class="muted">同一个包出现在多个镜像；标「基础镜像」的随批量重建修复，标「应用依赖」的需要开发升级；数字是去重 CVE</span></div>
+      ${fixes?`<div style="overflow-x:auto"><table><thead><tr><th>包</th><th>升级到</th><th>CVE</th><th class="num">涉及镜像</th><th>涉及服务</th></tr></thead><tbody>${fixes}</tbody></table></div>`:'<div class="empty">没有跨镜像的通用修复</div>'}</div>
+    <div class="card"><div class="card-title">镜像漏洞（${_secShow.slice().sort().join(' + ')||'未选优先级'}）<span class="muted">点上方 P0~P3 卡片切换显示；每个镜像最多列 4 个要升级的包</span></div>
+      ${rows?`<div style="overflow-x:auto"><table><thead><tr><th style="width:110px">优先级</th><th>服务 / 镜像</th><th style="width:170px">暴露面</th><th style="width:150px">可修复 CVE</th><th>要升级的应用依赖</th></tr></thead><tbody>${rows}</tbody></table></div>`
+            :'<div class="empty">所选优先级下没有镜像</div>'}</div>
+    <div class="card"><div class="card-title">已标记 <span class="muted">研判结论：有效期内不计入优先级、不在日报里重复提醒</span></div>
+      ${(_secMarks.marks||[]).length?`<div style="overflow-x:auto"><table><thead><tr><th>包</th><th>范围</th><th>结论</th><th>到期 / 复核</th><th>原因</th><th>标记人</th><th></th></tr></thead><tbody>
+        ${_secMarks.marks.map(m=>`<tr><td class="mono">${esc(m.package)}</td><td>${esc(m.service==='*'?'全部服务':m.service)}</td>
+          <td><span class="tag">${esc((_secMarks.status||{})[m.status]||m.status)}</span></td>
+          <td class="mono" style="${m.until&&m.until<new Date(Date.now()+8*36e5).toISOString().slice(0,10)?'color:var(--err)':''}">${esc(m.until||'—')}</td>
+          <td class="muted" style="font-size:12.5px">${esc(m.note||'')}</td><td class="muted" style="font-size:12px">${esc(m.created_by||'')}</td>
+          <td><button class="btn ghost sm" onclick="delMark(${m.id})">撤销</button></td></tr>`).join('')}</tbody></table></div>`
+        :'<div class="empty">还没有标记。在上方「要升级的应用依赖」或「按包汇总」里点「标记」</div>'}</div>
+    <div class="card"><div class="card-title">扫描覆盖缺口 <span class="muted">这些镜像的漏洞不在上面的统计里</span></div>
+      ${gaps?gapList('Harbor 里找不到',cov.not_in_harbor,'代理缓存已清理或从未经 Harbor 拉取；重新拉取一次后即可扫描')
+        +gapList('未扫描',cov.not_scanned,'等 Harbor 每日 03:00 全量扫描，或在 Harbor 手动扫描')
+        +gapList('扫描中',cov.scanning,'稍后刷新')
+        +gapList('读取失败',cov.errors,'检查 Harbor 连接与 robot 权限')
+        +gapList('不经自家 Harbor 的镜像',cov.outside_harbor,'直接从 quay.io / ghcr.io / Docker Hub 等拉取，没有 Trivy 结果；可改为经 Harbor 代理拉取')
+        :'<div class="empty">所有在跑镜像都已扫描</div>'}
+      <div class="muted" style="font-size:12px">扫描结果读取于 ${esc(r.fetched_at||'—')}（北京时间）；资产清单：${(r.inventory||[]).map(x=>esc(x.source)+(x.status==='ok'?' ✓ '+esc(dt(x.ok_at)):' ✗')).join('，')}</div></div>`;
+}
+
 async function vulnsPage(){
   const c=$('#content');
   const opt=(v,list)=>list.map(([k,t])=>`<option value="${k}" ${String(v)===String(k)?'selected':''}>${t}</option>`).join('');

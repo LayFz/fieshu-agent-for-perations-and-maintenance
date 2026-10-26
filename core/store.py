@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from .config import DB_PATH
 
@@ -581,8 +582,10 @@ def delete_skill_source(sid):
 # ---------- 定时任务（按应用） ----------
 def next_run(kind, spec, from_ts=None):
     """根据周期算下次运行的 epoch 秒。kind: daily|weekly|interval。
-    daily spec='HH:MM'；weekly spec='1,2,3,4,5@HH:MM'(1=周一..7=周日)；interval spec=分钟数。"""
-    now = datetime.now() if from_ts is None else datetime.fromtimestamp(from_ts)
+    daily spec='HH:MM'；weekly spec='1,2,3,4,5@HH:MM'(1=周一..7=周日)；interval spec=分钟数。
+    钟点按 SCHEDULE_TZ（默认 Asia/Shanghai）解释，不随宿主机时区漂移（开发机可能是 PDT，容器默认 UTC）。"""
+    tz = ZoneInfo(os.environ.get("SCHEDULE_TZ") or "Asia/Shanghai")
+    now = datetime.now(tz) if from_ts is None else datetime.fromtimestamp(from_ts, tz)
     try:
         if kind == "interval":
             return (now + timedelta(minutes=max(1, int(spec)))).timestamp()

@@ -178,6 +178,14 @@ def _priority(kev, verdicts, cvss, severity, epss, runtime):
 
 
 _DOWNGRADE = {"P0": "P1", "P1": "P2"}
+_TEST_DOWNGRADE = {"P0": "P1", "P1": "P2", "P2": "P3"}
+_TEST_ENV = re.compile(r"(^|[-_./:])(test|testing|staging|stage|dev|rc|beta)([-_./:]|\d|$)")
+
+
+def is_test_env(image):
+    """镜像仓库名或 tag 带 test/staging/dev/rc 等：测试环境，漏洞优先级降一级。"""
+    _reg, path, tag, _ = components.parse_image(image)
+    return bool(_TEST_ENV.search(f"{path.rsplit('/', 1)[-1]}:{tag or ''}".lower()))
 
 
 _REACH_RANK = {"public": 5, "indirect": 4, "lan": 3, "cluster": 2, "none": 1, "unknown": 0, "": 0}
@@ -210,7 +218,11 @@ def _is_init(asset):
 _SEV_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
 
 
-def image_findings(assets, limit=20, kev=None):
+def _today():
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+
+
+def image_findings(assets, limit=20, kev=None, marks=None):
     """Harbor 扫描结果（只含 assets 里在跑的镜像）：每个镜像的严重度统计、可修复的高危/严重、命中 KEV 的 CVE。"""
     by_image = {}
     for a in assets:
@@ -218,6 +230,11 @@ def image_findings(assets, limit=20, kev=None):
     scans = [s for s in assetstore.list_scans() if s["image"] in by_image]
     kev = kev if kev is not None else {r[0] for r in store._conn.execute("SELECT cve FROM vulns WHERE kev=1")}
     coverage = {"images": len(scans), "scanned": 0, "scanning": [], "not_scanned": [], "not_in_harbor": [], "errors": []}
+    # 研判标记：按「服务 + 包」（服务 * 表示全部）。有效期内的标记不计入优先级；计划修复过期后重新出现并标逾期
+    today = _today()
+    marks = assetstore.list_marks() if marks is None else marks
+    mark_of = {((m["service"] or "*"), m["package"].lower()): m for m in marks}
+    applied, overdue_all = {}, {}
     items, fixes = [], {}
     for s in scans:
         status = (s["status"] or "").lower()
@@ -230,28 +247,65 @@ def image_findings(assets, limit=20, kev=None):
         coverage["scanned"] += 1
         vulns = assetstore.image_vulns(s["project"], s["repo"], s["reference"])
         fixable = [v for v in vulns if v["fixed"] and v["severity"] in ("Critical", "High")]
-        hit_kev = sorted({v["cve"] for v in vulns if v["cve"] in kev})
-        crit_fix = sum(1 for v in fixable if v["severity"] == "Critical")
-        prio = "P0" if hit_kev else "P1" if crit_fix else "P2" if fixable else "P3"
-        reason = ("含在野利用（KEV）漏洞" if hit_kev else "有可修复的严重漏洞" if crit_fix else
-                  "有可修复的高危漏洞" if fixable else "无可修复的高危/严重")
+        svc_name = by_image[s["image"]][0]["component"]
+        marked, overdue = {}, {}
+        for v in fixable:
+            m = mark_of.get((svc_name, v["package"].lower())) or mark_of.get(("*", v["package"].lower()))
+            if not m:
+                continue
+            if m["until"] and m["until"] < today:
+                if m["status"] == "planned":
+                    overdue[v["package"]] = {"package": v["package"], "until": m["until"], "note": m["note"]}
+                continue
+            marked[v["package"]] = {"id": m["id"], "package": v["package"], "status": m["status"],
+                                    "until": m["until"], "note": m["note"]}
+        fixable = [v for v in fixable if v["package"] not in marked]
+        for x in marked.values():
+            applied[(svc_name, x["package"])] = x["status"]
+        for x in overdue.values():
+            overdue_all[(svc_name, x["package"])] = x
+        hit_kev = sorted({v["cve"] for v in vulns if v["cve"] in kev and v["package"] not in marked})
+        # 基础镜像层（系统包、运行时）的漏洞大多不在业务调用路径上，更新基础镜像重建即可批量清掉：
+        # 只有应用依赖的严重漏洞才单独定 P1；基础层严重漏洞定 P2 并归入「重建镜像」批量动作
+        base = [v for v in fixable if components.is_base_layer(v["package"], v["version"])]
+        app = [v for v in fixable if v not in base]
+        app_crit = {v["cve"] for v in app if v["severity"] == "Critical"}
+        app_high = {v["cve"] for v in app if v["severity"] == "High"}
+        base_crit = {v["cve"] for v in base if v["severity"] == "Critical"}
+        base_high = {v["cve"] for v in base if v["severity"] == "High"}
+        if hit_kev:
+            prio, reason = "P0", "含在野利用（KEV）漏洞"
+        elif app_crit:
+            prio, reason = "P1", "应用依赖有可修复的严重漏洞"
+        elif app_high:
+            prio, reason = "P2", "应用依赖有可修复的高危漏洞"
+        elif base_crit:
+            prio, reason = "P2", "严重漏洞只在基础镜像系统包，重建镜像即可"
+        else:
+            prio, reason = "P3", ("只有基础镜像的高危，随批量重建处理" if base_high else "无可修复的高危/严重")
         reach, reach_note = reachability(by_image[s["image"]])
         prio, reason = _downgrade_unexposed(prio, reason, reach)
+        if is_test_env(s["image"]) and prio in _TEST_DOWNGRADE:
+            prio, reason = _TEST_DOWNGRADE[prio], reason + "；测试环境，降一级"
         pkgs = {}
-        for v in sorted(fixable, key=lambda v: (_SEV_ORDER.get(v["severity"], 9), -(v["cvss"] or 0))):
+        for v in sorted(fixable, key=lambda v: (v in base, _SEV_ORDER.get(v["severity"], 9), -(v["cvss"] or 0))):
             p = pkgs.setdefault(v["package"], {"package": v["package"], "version": v["version"], "fixed": v["fixed"],
-                                                "severity": v["severity"], "cves": []})
+                                                "severity": v["severity"], "layer": "base" if v in base else "app",
+                                                "cves": []})
             p["cves"].append(v["cve"])
         mine = by_image[s["image"]]
         svc = mine[0]["component"]
         for v in fixable:
             f = fixes.setdefault(v["package"], {"package": v["package"], "fix_to": set(), "images": set(),
-                                                "public": set(), "critical": 0, "high": 0, "kev": set()})
+                                                "public": set(), "critical": set(), "high": set(), "hits": 0, "kev": set(),
+                                                "layer": "base" if v in base else "app"})
             f["fix_to"].add(v["fixed"])
             f["images"].add(svc)
             if reach in ("public", "indirect"):
                 f["public"].add(svc)
-            f["critical" if v["severity"] == "Critical" else "high"] += 1
+            # 按去重 CVE 计数：同一个 CVE 出现在 10 个镜像里仍是 1 个漏洞；hits 记「镜像×漏洞」出现次数
+            f["critical" if v["severity"] == "Critical" else "high"].add(v["cve"])
+            f["hits"] += 1
             if v["cve"] in kev:
                 f["kev"].add(v["cve"])
         items.append({
@@ -260,24 +314,64 @@ def image_findings(assets, limit=20, kev=None):
             "workloads": sorted({f"{a['cluster']}/{a['namespace']}/{a['workload'].split(' · ')[0]}" for a in mine})[:2],
             "counts": {k: v for k, v in (s["summary"] or {}).items() if v},
             "total": s["total"], "fixable_high_critical": len(fixable), "kev_cves": hit_kev,
+            # 去重 CVE 个数（同一 CVE 常出现在多个子包里，如 libssl3/libcrypto3）
+            "fixable_cves": {"critical": len({v["cve"] for v in fixable if v["severity"] == "Critical"}),
+                             "high": len({v["cve"] for v in fixable if v["severity"] == "High"}),
+                             "app_critical": len(app_crit), "app_high": len(app_high),
+                             "base_critical": len(base_crit), "base_high": len(base_high)},
+            "test_env": is_test_env(s["image"]),
+            "marked": list(marked.values()), "overdue": list(overdue.values()),
+            # 应用依赖排在前面；基础层只是重建镜像的事
             "fix_packages": [dict(p, cves=p["cves"][:3], more_cves=max(0, len(p["cves"]) - 3)) for p in list(pkgs.values())[:4]],
+            "app_packages": [{k: p[k] for k in ("package", "version", "fixed", "severity")}
+                             for p in pkgs.values() if p["layer"] == "app"][:6],
+            "_base_cves": base_crit | base_high, "_base_crit": base_crit,
             "match_note": s["error"] or None,
             "advice": ("先升级上面列出的包或基础镜像到修复版本，重新构建；" if fixable else "无可修复的高危/严重；")
                       + ("其中有在野利用漏洞，优先处理。" if hit_kev else ""),
         })
     order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-    items.sort(key=lambda x: (order[x["priority"]], -x["fixable_high_critical"]))
+    items.sort(key=lambda x: (order[x["priority"]], -x["fixable_cves"]["app_critical"], -x["fixable_high_critical"]))
     fetched = max([s["fetched"] for s in scans] or [0])
+    # 「重建镜像」批量动作：基础层有可修复严重/高危的镜像，更新基础镜像（FROM 最新构建）重新构建即可
+    need = [x for x in items if x["_base_cves"]]
+    rebuild = {"images": len(need),
+               "critical": len(set().union(*[x["_base_crit"] for x in need])) if need else 0,
+               "high": len(set().union(*[x["_base_cves"] - x["_base_crit"] for x in need])) if need else 0,
+               "public": sorted({x["service"] for x in need if x["reachability"].startswith(("公网", "可能经公网"))}),
+               "names": sorted({x["service"] for x in need}),
+               "advice": "更新 Dockerfile 的 FROM 到基础镜像最新构建（或 apk/apt upgrade）后重新构建发布；不改业务代码"}
+    for x in items:
+        x.pop("_base_cves"), x.pop("_base_crit")
     # 同一个包在多个镜像里重复出现（多为基础镜像里的 openssl/curl 等）：按「包 → 修复版本 → 涉及镜像数」汇总，
     # 修一次基础镜像就能清掉一批，比逐个镜像列 P1 更可执行
+    # 同一源码包拆出的子包（libssl3/libcrypto3 都是 openssl）CVE 完全相同：合并成一条，不重复计数
+    merged = {}
+    for f in fixes.values():
+        key = (frozenset(f["critical"] | f["high"]), frozenset(f["images"]))
+        if key in merged:
+            merged[key]["package"] += " / " + f["package"]
+            merged[key]["fix_to"] |= f["fix_to"]
+        else:
+            merged[key] = dict(f, fix_to=set(f["fix_to"]))
     common = sorted(({"package": f["package"], "fix_to": sorted(f["fix_to"])[:4], "images": len(f["images"]),
                       "images_public": len(f["public"]), "public_names": sorted(f["public"])[:6],
-                      "image_names": sorted(f["images"])[:8], "critical": f["critical"], "high": f["high"],
-                      "kev": sorted(f["kev"])} for f in fixes.values()),
+                      "image_names": sorted(f["images"])[:8], "critical": len(f["critical"]), "high": len(f["high"]),
+                      "cves": sorted(f["critical"])[:3] + sorted(f["high"])[:3], "hits": f["hits"],
+                      "kev": sorted(f["kev"]), "layer": f["layer"]} for f in merged.values()),
                     key=lambda x: (-len(x["kev"]), -x["images_public"], -x["critical"], -x["images"], -x["high"]))
     return {"coverage": coverage, "fetched_at": _when(fetched), "items": items[:limit], "items_total": len(items),
-            "common_fixes": common[:8],
+            "common_fixes": common[:8], "rebuild": rebuild,
+            "marks_summary": {"applied": len(applied), "by_status": dict(Counter(applied.values())),
+                              "overdue": [{"service": k[0], **v} for k, v in overdue_all.items()]},
             "by_priority": dict(Counter(x["priority"] for x in items))}
+
+
+def outside_harbor(assets):
+    """不经自家 Harbor 的在跑镜像（quay.io、ghcr.io、registry.k8s.io…）：没有 Trivy 结果，属于扫描覆盖缺口。"""
+    scanned = {s["image"] for s in assetstore.list_scans()}
+    return sorted({a["image"] for a in assets if a["kind"] in ("image", "service") and a["image"]
+                   and a["image"] not in scanned})
 
 
 def report(days=7, visible=None, enrich=True, limit=30, new_only=False):

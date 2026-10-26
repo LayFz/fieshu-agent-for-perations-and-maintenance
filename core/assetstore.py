@@ -167,3 +167,48 @@ def image_vulns(project=None, repo=None, reference=None):
             sql += f" AND {col}=?"
             args.append(val)
     return [dict(r) for r in store._conn.execute(sql + " ORDER BY cvss DESC", args)]
+
+
+# ---------- 漏洞标记（研判结论） ----------
+# 按「服务 + 包」标记（服务填 * 表示所有镜像里的这个包）：
+#   planned 计划修复（到期日前不再提醒，过期重新出现并标「已逾期」）
+#   accepted 接受风险 / false_positive 误报（到期日前不计入优先级；不填到期日默认 90 天后复核）
+MARK_STATUS = {"planned": "计划修复", "accepted": "接受风险", "false_positive": "误报"}
+with store._lock:
+    store._conn.executescript("""
+    CREATE TABLE IF NOT EXISTS vuln_marks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, package TEXT NOT NULL,
+        status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', until TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL DEFAULT '', created REAL NOT NULL, updated REAL NOT NULL,
+        UNIQUE(service, package));
+    """)
+    store._conn.commit()
+
+
+def set_mark(service, package, status, note="", until="", by=""):
+    if status not in MARK_STATUS:
+        raise ValueError("status 只能是 planned / accepted / false_positive")
+    service, package = (service or "").strip() or "*", (package or "").strip()
+    if not package:
+        raise ValueError("需要指定包名")
+    if until and not __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}", until):
+        raise ValueError("到期日格式为 YYYY-MM-DD")
+    if status == "planned" and not until:
+        raise ValueError("计划修复需要填到期日")
+    if not until:
+        until = time.strftime("%Y-%m-%d", time.localtime(time.time() + 90 * 86400))
+    now = time.time()
+    with transaction() as conn:
+        conn.execute("""INSERT INTO vuln_marks(service,package,status,note,until,created_by,created,updated)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(service,package) DO UPDATE SET status=excluded.status,
+            note=excluded.note,until=excluded.until,created_by=excluded.created_by,updated=excluded.updated""",
+                     (service, package, status, note or "", until, by or "", now, now))
+
+
+def delete_mark(mark_id):
+    with transaction() as conn:
+        conn.execute("DELETE FROM vuln_marks WHERE id=?", (int(mark_id),))
+
+
+def list_marks():
+    return [dict(r) for r in store._conn.execute("SELECT * FROM vuln_marks ORDER BY updated DESC").fetchall()]

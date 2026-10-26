@@ -2,8 +2,10 @@
 从上游仓库查同一版本线里更新的 tag，给出「改哪个文件、从什么改成什么、能修掉什么、风险」。
 
 只出方案，不改任何东西。真正修改走已有路径：code_open（gitops 仓库）→ code_edit → code_validate → code_propose_mr（需审批）。
-自研镜像（业务仓库）harness 没有源码读权限：只给出要升级的包与基础镜像，交给开发处理。
+自研镜像只定位问题：按 Harbor 扫描到的包类型推断该改哪类清单（composer.json / go.mod / 基础镜像…），连同线上提交号交给开发；
+默认不读业务仓库。后台 kv source_repo_read=1 时才经 GitLab 只读定位到具体文件与行（需令牌与 gitlab_projects 授权）。
 """
+import re
 from urllib.parse import quote, urlsplit
 
 from core import assetstore, components, store
@@ -62,6 +64,41 @@ def find_refs(projects, image):
             seen.add(key)
             out.append(h)
     return out[:10]
+
+
+_WHERE = {
+    "runtime": "Go 版本：Dockerfile 里构建阶段的 FROM golang:x.y，及 go.mod 的 go/toolchain 行",
+    "npm": "package.json / 锁文件（package-lock.json、pnpm-lock.yaml、yarn.lock）",
+    "go": "go.mod / go.sum（go get 包@修复版本 && go mod tidy）",
+    "composer": "composer.json / composer.lock（composer update 包名）",
+    "maven": "pom.xml / build.gradle",
+    "system": "基础镜像里的系统包：更新 Dockerfile 的 FROM 到最新构建后重新构建",
+    "app": "应用依赖清单（requirements.txt / pyproject.toml / package.json 等，按包名确认）",
+}
+
+
+def manifest_hint(package, version=""):
+    """由 Trivy 包名/版本推断要改哪类清单：{kind, where}。kind=runtime/system 归入「升级基础镜像」。"""
+    kind = components.package_kind(package, version)
+    return {"kind": kind, "where": _WHERE[kind]}
+
+
+def locate_plan(item):
+    """不读业务仓库：按包类型分成「应用依赖」与「基础镜像/运行时」，交给开发；修复版本来自 Harbor 扫描。"""
+    _reg, _path, tag, _ = components.parse_image(item["image"])
+    deps, base = [], []
+    for pkg in item["fix_packages"]:
+        hint = manifest_hint(pkg["package"], pkg["version"])
+        entry = {"package": pkg["package"], "current": pkg["version"], "fix_to": pkg["fixed"],
+                 "severity": pkg["severity"], "where": hint["where"], "cves": pkg.get("cves", [])}
+        (base if hint["kind"] in ("system", "runtime") else deps).append(entry)
+    return {"source": {"commit_hint": tag if re.fullmatch(r"[0-9a-f]{7,40}", tag or "") else None,
+                       "how": "镜像 tag 是线上那次提交号，开发按它在业务仓库定位" if re.fullmatch(r"[0-9a-f]{7,40}", tag or "")
+                              else f"镜像 tag {tag} 不是提交号，按版本号/发布记录在业务仓库定位"},
+            "dependency_changes": deps,
+            "base_image": ({"packages": base, "advice": "升级基础镜像（或 Go 等运行时版本）到包含修复的最新构建后重新构建"}
+                           if base else None),
+            "note": "只定位问题，未读业务仓库；升级说明与破坏性变更可用 web_search 查该包修复版本的发布说明"}
 
 
 def source_plan(item, allowed_project, own):
@@ -149,8 +186,9 @@ def plan(visible=None, allowed_project=None, q=None, limit=10):
     order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
     third_party.sort(key=lambda x: (order[x["priority"]], -x["fixable_high_critical"]))
     self_built.sort(key=lambda x: order[x["priority"]])
+    read_source = store.get_setting("source_repo_read") == "1"
     for item in self_built[:limit]:
-        item.update(source_plan(item, allowed_project, own))
+        item.update(source_plan(item, allowed_project, own) if read_source else locate_plan(item))
     return {"third_party": third_party[:limit], "third_party_total": len(third_party),
             "self_built": self_built[:limit], "self_built_total": len(self_built),
             "gitops_repos": [p for _n, p in projects],

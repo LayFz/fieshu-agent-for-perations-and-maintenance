@@ -57,6 +57,21 @@ def _bootstrap():
         print(f"★ 已初始化管理员账号：{username} —— 登录后请到「账号」里改掉初始密码")
 
 
+def _deterministic_task(task):
+    """不经模型的固定任务：安全日报直接由数据生成卡片。其余返回 None 交给模型。"""
+    import json
+    from core import store, taskstore
+    from harness import access
+    from sec import daily
+    if task["instruction"].strip() != daily.INSTRUCTION:
+        return None
+    app = store.get_app(task["app_id"]) or {}
+    if "vuln_report" not in (app.get("tools") or []) or not (app.get("resources") or {}).get("k8s_clusters"):
+        raise PermissionError("安全日报需要应用勾选 vuln_report 并授权至少一个集群（资源权限 k8s_clusters）")
+    card = daily.run(visible=lambda a: access.asset_visible(app, a))
+    return taskstore.CARD_PREFIX + json.dumps(card, ensure_ascii=False)
+
+
 def main():
     _bootstrap()
 
@@ -70,6 +85,7 @@ def main():
     from harness import approval
     approval.cancel_stale()        # 仅失效旧版无 task 的审批；持久任务审批由恢复器接续
     tasks.register_executor(bot.execute_task)
+    bot.register_task_executor(_deterministic_task)
     tasks.register_sender(bot.deliver_task)
     tasks.start(workers=int(os.getenv("HARNESS_WORKERS", "2")))
     from app import patrol_service

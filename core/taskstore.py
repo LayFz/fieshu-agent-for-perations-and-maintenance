@@ -116,7 +116,8 @@ def submit(app_id, chat_id, instruction, *, source="chat", event_id=None, speake
         created = cursor.rowcount == 1
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone() if created else conn.execute(
             "SELECT * FROM tasks WHERE source=? AND app_id=? AND event_id=?", (source, app_id, event_id)).fetchone()
-        if created and trigger != "proactive":
+        # 定时任务直接出结果，不在群里先发「已接收」
+        if created and trigger not in ("proactive", "schedule"):
             conn.execute("""INSERT INTO task_outbox(id,task_id,dedupe_key,text,available_at,created)
                 VALUES(?,?,?,?,?,?)""", (uuid.uuid4().hex, task_id, f"{task_id}:received",
                 f"已接收任务 {task_id[:12]}，正在排队处理。\n可发送“任务 {task_id[:12]}”查看进度。", now, now))
@@ -164,6 +165,10 @@ def assert_owned(task_id, owner, epoch):
         return _task(_owned(conn, task_id, owner, epoch))
 
 
+# 确定性任务可直接产出整张飞书卡片：结果以此前缀 + 卡片 JSON 保存，投递时原样发送
+CARD_PREFIX = "\x1ecard:"
+
+
 def _notify(conn, row, status, result=None, error=""):
     if status not in TERMINAL | {"needs_attention"}:
         return
@@ -175,7 +180,10 @@ def _notify(conn, row, status, result=None, error=""):
     body = "\n\n".join(parts)
     if status == "completed" and result is None and row["trigger"] == "proactive":
         return
-    text = f"任务 {row['id'][:12]} · {label}\n{body or ''}".strip()
+    if status == "completed" and isinstance(result, str) and result.startswith(CARD_PREFIX):
+        text = result
+    else:
+        text = f"任务 {row['id'][:12]} · {label}\n{body or ''}".strip()
     now = time.time()
     conn.execute("""INSERT OR IGNORE INTO task_outbox
         (id,task_id,dedupe_key,text,available_at,created) VALUES(?,?,?,?,?,?)""",

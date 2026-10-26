@@ -552,7 +552,8 @@ TOOLS += [
         "name": "vuln_fix_plan",
         "description": "生成修复方案（只读，不改任何东西）：第三方镜像（redis、mysql、rabbitmq…）在 gitops 仓库的引用位置、"
                        "建议升级到的 tag（同一版本线的最新版本）、能修掉的漏洞、停止维护提示、修改步骤；"
-                       "自研镜像列出需要开发升级的包。用户问「怎么修」「出修复方案」时调用。",
+                       "自研镜像定位问题：线上提交号、要升级的应用依赖及该改哪类清单（composer.json/go.mod…）、"
+                       "需升级基础镜像或运行时的包。用户问「怎么修」「出修复方案」时调用。",
         "parameters": {"type": "object", "properties": {
             "q": {"type": "string", "description": "只看某个镜像/组件，如 redis、mysql；不填看全部"},
             "limit": {"type": "integer", "description": "默认 10"},

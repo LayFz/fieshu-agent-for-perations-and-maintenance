@@ -17,9 +17,15 @@ PROFILES = {
                        "这是结合实际架构的判断：不对公网开放的数据库、中间件已按规则降级，按给出的优先级写，不要自行升级。"
                        "in_images 是情报里出现、且包在我们镜像里的漏洞（已体现在 image_findings），不要把它们写成「无关」。"
                        "用户问怎么修/要修复方案时用 vuln_fix_plan：第三方镜像按 gitops 引用位置与建议 tag 说明改法，"
-                       "有 eol 提示的要明确同线升级修不了、需规划大版本；自研镜像列出交给开发的包。只给方案，"
+                       "有 eol 提示的要明确同线升级修不了、需规划大版本；自研镜像按 dependency_changes（应用依赖，写明改哪类清单）"
+                       "与 base_image（系统包/运行时，升级基础镜像）分开写，附线上提交号，交给开发；"
+                       "需要升级注意事项时可用 web_search 查该包修复版本的发布说明，注明来源。只给方案，"
                        "用户明确要求修改时再用 code_* 在 gitops 仓库修改、静态校验并提 MR（需审批）。"
                        "image_findings 是 Harbor 对我们镜像的扫描：先按 common_fixes 写「升级哪个包/基础镜像到什么版本，能清掉几个镜像的问题」，"
+                       "P1 只代表应用依赖（Django、pillow、Go 模块等）有可修复的严重漏洞；基础镜像系统包的漏洞归入 rebuild（批量重建镜像），"
+                       "写成一条「重建这些镜像」的批量动作，不要逐个镜像列成高优先级；测试环境已降一级。"
+                       "critical/high 是去重后的 CVE 个数（同一个 CVE 在多个镜像里只算一个），照此写「N 个严重/高危 CVE、涉及 M 个镜像」，"
+                       "不要把 hits（镜像×漏洞的出现次数）当成漏洞数；"
                        "再按优先级列重点镜像（服务、工作负载、可修复的包与修复版本）；带 match_note 的说明不是线上那一版，"
                        "建议按影响排序：P0 → 严重漏洞多、涉及镜像多的通用修复 → 其余 P1 → 已降级的 P2；不要把降级条目排在前面。"
                        "未扫描/读取失败的镜像写明覆盖缺口；需要明细时用 image_vulns。"
@@ -70,6 +76,31 @@ def _wants_report(instruction):
     return any(w in text for w in _REPORT_WORDS) and not any(w in text.upper() for w in ("CVE-", "GHSA-"))
 
 
+_REPAIR_WORDS = ("修复", "改代码", "提 mr", "提mr", "merge request", "升级依赖")
+# 报告里的名词用法（修复版本、修复方案…）不是「要动手修」
+_REPAIR_NOUNS = ("修复版本", "修复方案", "修复建议", "通用修复", "可修复", "修复动作", "修复优先级")
+
+
+def wants_repair(instruction):
+    text = (instruction or "").lower()
+    for noun in _REPAIR_NOUNS:
+        text = text.replace(noun, "")
+    return any(w in text for w in _REPAIR_WORDS)
+
+
+def hidden_tools(name, instruction):
+    """只读报告类任务不暴露修改/重型工具：漏洞报告不开代码工作区，日报也不跑修复方案，避免跑偏和耗尽 token 预算。"""
+    if resolve(name, instruction) != "vulnerability" or not _wants_report(instruction):
+        return set()
+    if wants_repair(instruction):
+        return set()
+    hidden = {"code_repos", "code_open", "code_list", "code_read", "code_search", "code_edit", "code_write",
+              "code_delete", "code_diff", "code_test", "code_validate", "code_propose_mr", "code_close"}
+    if "日报" in (instruction or ""):
+        hidden.add("vuln_fix_plan")
+    return hidden
+
+
 def verify(name, instruction, evidence):
     """最小确定性验收：执行事实缺失时不把业务任务标完成。"""
     key = resolve(name, instruction)
@@ -97,7 +128,7 @@ def verify(name, instruction, evidence):
         return "漏洞报告还没有基于资产清单的相关性证据：请先调用 vuln_report（清单为空时先 asset_refresh）"
     if key == "research" and not ({"web_search", "web_fetch"} & successful.keys()):
         return "还没有成功的联网搜索或网页查询证据"
-    repair = any(w in instruction for w in ("修复", "改代码", "提 MR", "提MR", "升级依赖"))
+    repair = wants_repair(instruction)
     if key in ("development", "vulnerability") and repair:
         if not (successful.get("code_test", {}).get("passed") or successful.get("code_validate", {}).get("passed")):
             return "修复尚无通过的隔离测试或 GitOps 静态校验记录"

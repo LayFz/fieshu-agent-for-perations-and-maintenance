@@ -153,6 +153,8 @@ class SelfBuiltPlanTests(PlanTests):
              "vulns": [{"cve": "CVE-1", "package": "pillow", "version": "11.3.0", "fixed": "13.0.0", "severity": "Critical"},
                        {"cve": "CVE-2", "package": "libssl3", "version": "3.3.5-r0", "fixed": "3.3.7-r0", "severity": "Critical"}]}])
         files = {"requirements.txt": "Pillow==11.3.0\nDjango==4.2\n", "Dockerfile": "FROM python:3.12-alpine\nCOPY . .\n"}
+        store.set_setting("source_repo_read", "1")
+        self.addCleanup(store.set_setting, "source_repo_read", "")
         with mock.patch.object(fixplan.source_repo, "resolve",
                                return_value={"project": "upmore/crm", "commit": "1a2b3c4d" + "0" * 32, "how": "按名称"}), \
                 mock.patch.object(fixplan.source_repo, "dependency_files", return_value=list(files)), \
@@ -167,3 +169,32 @@ class SelfBuiltPlanTests(PlanTests):
                          ("pillow", "13.0.0", "requirements.txt", 1))
         self.assertEqual(item["base_image"]["system_packages"], ["libssl3 3.3.5-r0 → 3.3.7-r0"])
         self.assertEqual(item["base_image"]["from_lines"][0]["suggested"], "3.12.8-alpine")
+
+
+class LocateWithoutRepoTests(PlanTests):
+    def test_default_does_not_touch_business_repo(self):
+        assetstore.replace_scans([
+            {"project": "crm", "repo": "web", "reference": "sha256:a", "image": "harbor.upmore.net/crm/web:1a2b3c4d",
+             "status": "Success", "summary": {"Critical": 3},
+             "vulns": [{"cve": "CVE-1", "package": "topthink/framework", "version": "6.0.1", "fixed": "6.0.14", "severity": "Critical"},
+                       {"cve": "CVE-2", "package": "libssl3", "version": "3.3.5-r0", "fixed": "3.3.7-r0", "severity": "Critical"},
+                       {"cve": "CVE-3", "package": "stdlib", "version": "v1.22.1", "fixed": "1.22.9", "severity": "Critical"}]}])
+        with mock.patch.object(fixplan.source_repo, "resolve") as resolve, \
+                mock.patch.object(fixplan.registry, "tags", return_value=[]), \
+                mock.patch.object(fixplan.gitlab, "_get", return_value=([], None)), \
+                mock.patch.object(fixplan.asset_scan, "own_registries", return_value=["harbor.upmore.net"]):
+            item = fixplan.plan()["self_built"][0]
+        resolve.assert_not_called()
+        self.assertEqual(item["source"]["commit_hint"], "1a2b3c4d")
+        self.assertEqual([d["package"] for d in item["dependency_changes"]], ["topthink/framework"])
+        self.assertIn("composer.json", item["dependency_changes"][0]["where"])
+        self.assertEqual(sorted(b["package"] for b in item["base_image"]["packages"]), ["libssl3", "stdlib"])
+
+    def test_manifest_hint(self):
+        kinds = {p: fixplan.manifest_hint(p, v)["kind"] for p, v in (
+            ("golang.org/x/net", "v0.20.0"), ("github.com/jackc/pgx/v5", "v5.5.0"), ("stdlib", "v1.22.1"),
+            ("guzzlehttp/guzzle", "7.4.0"), ("@babel/core", "7.1.0"), ("libc6", "2.36-9+deb12u7"),
+            ("busybox", "1.36.1-r29"), ("pillow", "11.3.0"), ("org.yaml:snakeyaml", "1.33"))}
+        self.assertEqual(kinds, {"golang.org/x/net": "go", "github.com/jackc/pgx/v5": "go", "stdlib": "runtime",
+                                 "guzzlehttp/guzzle": "composer", "@babel/core": "npm", "libc6": "system",
+                                 "busybox": "system", "pillow": "app", "org.yaml:snakeyaml": "maven"})
