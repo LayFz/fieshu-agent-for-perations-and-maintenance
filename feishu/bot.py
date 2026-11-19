@@ -124,13 +124,21 @@ def _md_card(text):
             "elements": [{"tag": "markdown", "content": md}]}
 
 
+_MD_MARK = re.compile(r"\*\*([^*]+)\*\*|`([^`]+)`")
+
+
+def _plain(cell):
+    """table 组件按纯文本渲染单元格：去掉 **加粗**/**加粗**、`代码` 标记，只留文字。"""
+    return _MD_MARK.sub(lambda m: m.group(1) or m.group(2), str(cell)).replace("**", "")
+
+
 def _table_element(header, rows):
     """一张 markdown 表格 → 飞书原生 table 组件（真表格）。"""
     if not header:
         return None
-    cols = [{"name": f"c{j}", "display_name": (h or f"列{j+1}"), "data_type": "text",
+    cols = [{"name": f"c{j}", "display_name": _plain(h or f"列{j+1}"), "data_type": "text",
              "horizontal_align": "left"} for j, h in enumerate(header)]
-    out_rows = [{f"c{j}": (cells[j] if j < len(cells) else "") for j in range(len(header))}
+    out_rows = [{f"c{j}": (_plain(cells[j]) if j < len(cells) else "") for j in range(len(header))}
                 for cells in rows]
     return {"tag": "table", "columns": cols, "rows": out_rows}
 
