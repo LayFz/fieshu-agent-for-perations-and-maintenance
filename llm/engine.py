@@ -172,6 +172,22 @@ def _note_call(rec, content, tool_calls, usage, **extra):
                                    "usage": _usage_dict(usage), **extra})
 
 
+_TOOL_RESULT_LIMIT = int(os.getenv("HARNESS_TOOL_RESULT_CHARS", "6000"))
+
+
+def _fit_tool_result(content_str):
+    """超大工具结果截断后再进模型上下文；完整结果仍留在 evidence 供验收与续跑。
+    JSON 结果截掉尾部并标注原大小，防止一次 get events / describe 把预算吃光。"""
+    if len(content_str) <= _TOOL_RESULT_LIMIT:
+        return content_str
+    head = content_str[:_TOOL_RESULT_LIMIT]
+    cut = head.rfind("\n")
+    if cut > _TOOL_RESULT_LIMIT // 2:
+        head = head[:cut]
+    return (f"{head}\n…[结果共 {len(content_str)} 字符，已截断；如需其余部分，"
+            f"换更精确的查询参数缩小范围后重新调用]")
+
+
 def _untrusted_input(task):
     """任务指令本身含外部内容（巡检扫描结果、webhook 请求体）时，从第一步就按污染处理。"""
     return task.get("source") == "patrol" or task.get("trigger") == "webhook"
@@ -295,7 +311,30 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                     raise tasks.TaskIncomplete(f"验收待完成：{reason}")
                 store.save(aid, chat_id, "assistant", answer, task_id=task.get("id"), context_key=context_key)
                 return answer, "completed"
-            if state.get("tokens", 0) >= int(os.getenv("HARNESS_MAX_TOKENS", "120000")):
+            if (state.get("tokens", 0) >= int(os.getenv("HARNESS_MAX_TOKENS", "120000"))
+                    and not state.get("pending")):
+                # 预算耗尽不再直接判「待核对」：证据已经够时，不带工具再调一次模型，用现有证据交付报告。
+                # （pending 批次先在上面的分支里执行完，下一轮才进这里。）
+                try:
+                    content, _tc, usage = _call(client, model, msgs + [
+                        {"role": "user",
+                         "content": "（已达到 token 预算，禁止再调用任何工具）请基于以上已查到的证据直接产出最终答复："
+                                    "写清结论、执行过的操作与证据、未完成项；没有采集到的数据不要编造。"}],
+                        None, extra_body, deliver)
+                    _record(aid, chat_id, model, usage)
+                    _note_call(rec, content, [], usage, fallback=True)
+                    answer = (content or "").strip()
+                except Exception:
+                    answer = ""
+                if answer:
+                    reason = workflows.verify(task.get("workflow", "auto"), user_text, state.get("evidence", []))
+                    if not (task and reason):
+                        state.update(done=True, final_answer=answer)
+                        tasks.checkpoint(state)
+                        if proactive and (answer == "(无输出)" or "__SILENT__" in answer):
+                            return None, "silent"
+                        store.save(aid, chat_id, "assistant", answer, task_id=task.get("id"), context_key=context_key)
+                        return answer, "completed"
                 raise tasks.TaskIncomplete("任务已达到 token 预算，请查看现有证据后调整任务范围。")
             if not state.get("pending"):
                 content, tool_calls, usage = _call(client, model, msgs, tools_schema, extra_body, deliver)
@@ -346,7 +385,8 @@ def _run(rec, app, chat_id, user_text, speaker, speaker_open_id, proactive, on_s
                 call.extra["sandboxed"] = name in ("code_test", "sandbox_run") or name.startswith("box_")
                 call.extra["preview"] = (lambda a, _n=name: approval_preview(_n, a, ctx))
                 content_str = pipeline.run_tool(rec, call, app.get("policy"), executor, app=app)
-                msgs.append({"role": "tool", "tool_call_id": t["id"], "content": content_str})
+                msgs.append({"role": "tool", "tool_call_id": t["id"],
+                             "content": _fit_tool_result(content_str)})
                 state["evidence"].append({"tool": name, "args": call.args, "result": json.loads(content_str)})
                 state.update(next_tool=index + 1, tainted=bool(rec.tainted),
                              progress=f"已执行 {name}")
