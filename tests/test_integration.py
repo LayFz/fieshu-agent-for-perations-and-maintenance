@@ -141,6 +141,42 @@ class HarnessIntegrationTests(unittest.TestCase):
                 if expected == "needs_attention":
                     self.assertIn("日志", row["error"])
 
+    def test_budget_exhausted_delivers_report_from_evidence(self):
+        # token 预算耗尽时不再空手标「待核对」：不带工具降级调用一次，用已有证据交付报告。
+        usage = NS(prompt_tokens=10, completion_tokens=10, total_tokens=200000)
+        self.model.side_effect = [
+            ("", [tool("kubectl", {"target": "test-cluster", "command": "get pods -n test-ns"})], usage),
+            ("基于已查到的证据：集群正常。", [], None),
+        ]
+        task = self.submit("生成集群运行报告", workflow="cluster")
+        tasks.tick()
+        row = tasks.get(task["id"])
+        self.assertEqual(row["status"], "completed", row["error"])
+        self.assertIn("集群正常", row["result"])
+        # 降级调用不带工具：最后一次模型调用的 messages 里没有 tools schema。
+        last_call = self.model.call_args
+        self.assertIsNone(last_call.args[3])
+        fallback_msg = last_call.args[2][-1]
+        self.assertIn("token 预算", fallback_msg["content"])
+
+    def test_oversized_tool_result_is_truncated_in_context_but_kept_in_evidence(self):
+        long_stdout = "x" * 20000
+        self.cluster.return_value = {"exit_code": 0, "stdout": long_stdout, "stderr": ""}
+        self.respond("kubectl", {"target": "test-cluster", "command": "get pods -n test-ns"})
+        task = self.submit("检查集群 Pod 状态")
+        tasks.tick()
+        row = tasks.get(task["id"])
+        self.assertEqual(row["status"], "completed", row["error"])
+        # evidence 保留完整结果；上下文里的 tool 消息被截断并注明。
+        evidence = json.dumps(row["checkpoint"]["evidence"], ensure_ascii=False)
+        self.assertEqual(evidence.count(long_stdout), 1)
+        msgs = self.model.call_args.args[2]
+        tool_msgs = [m for m in msgs if isinstance(m, dict) and m.get("role") == "tool"]
+        self.assertTrue(tool_msgs)
+        self.assertLess(max(len(m["content"]) for m in tool_msgs), 8000)
+        self.assertIn("已截断", tool_msgs[-1]["content"])
+        self.cluster.return_value = {"exit_code": 0, "stdout": "api-0 Running Ready 1/1", "stderr": ""}
+
     def test_history_and_notes_are_isolated_by_app_chat_and_context(self):
         other_app = store.create_app("另一个记忆隔离应用")
         store.save(self.app, "x", "user", "legacy history")

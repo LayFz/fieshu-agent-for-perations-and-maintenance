@@ -20,4 +20,10 @@ services:
       # 全网卡：公司 LAN 直接 http://<deploy-host>:8800 进后台；
       # 飞书是出站长连接，无需任何入站端口
       - "8800:8800"
+    environment:
+      # 任务 token 预算（llm/engine.py 读取）。日报类任务采集+写报告的实际用量在 104k~139k，
+      # 默认 120000 会把报告在写出来之前掐断；放宽到 200k，配合工具结果截断兜底。
+      HARNESS_MAX_TOKENS: "200000"
+      # 单次工具结果进入模型上下文的字符上限（evidence 仍保留完整结果供验收/续跑）。
+      HARNESS_TOOL_RESULT_CHARS: "6000"
     # 健康检查继承自镜像 HEALTHCHECK(/healthz)；deploy.sh 据此判健康门
