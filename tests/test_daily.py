@@ -111,6 +111,33 @@ class CardDeliveryTests(unittest.TestCase):
             bot.deliver_task({"app_id": 1, "chat_id": "chat"}, text)
         self.assertEqual(sent.call_args.args[2], card)
 
+    def test_markdown_result_renders_real_tables_and_keeps_inline_bold(self):
+        from feishu import bot
+        text = ("任务 6e73a5522d27 · 已完成\n\n"
+                "### 一、整体结论：**集群健康，发现 1 个故障点**\n\n"
+                "| 服务器 | CPU | 磁盘 |\n|---|---|---|\n| agent2-.51 | 12.37% | 71.21% |\n")
+        sent = mock.Mock(return_value=mock.Mock(success=lambda: True))
+        with mock.patch.object(bot, "_create_card", sent), mock.patch.object(bot.store, "get_app", return_value={"id": 1}):
+            bot.deliver_task({"app_id": 1, "chat_id": "chat", "notification_id": "n1"}, text)
+        card = sent.call_args.args[2]
+        tables = [el for el in card["elements"] if el["tag"] == "table"]
+        self.assertEqual(len(tables), 1)
+        self.assertEqual([c["display_name"] for c in tables[0]["columns"]], ["服务器", "CPU", "磁盘"])
+        mds = [el["content"] for el in card["elements"] if el["tag"] == "markdown"]
+        self.assertTrue(any("一、整体结论：**集群健康" in m for m in mds))   # 标题转粗体不破坏内联加粗
+        self.assertFalse(any("****" in m or "###" in m for m in mds))
+
+    def test_markdown_result_falls_back_when_table_card_rejected(self):
+        from feishu import bot
+        text = "| a | b |\n|---|---|\n| 1 | 2 |"
+        responses = [mock.Mock(success=lambda: False, code=1001),   # rich 卡被飞书拒绝
+                     mock.Mock(success=lambda: True)]               # 退回分行 markdown 成功
+        sent = mock.Mock(side_effect=responses)
+        with mock.patch.object(bot, "_create_card", sent), mock.patch.object(bot.store, "get_app", return_value={"id": 1}):
+            bot.deliver_task({"app_id": 1, "chat_id": "chat"}, text)
+        self.assertEqual(sent.call_count, 2)
+        self.assertTrue(all(el["tag"] == "markdown" for el in sent.call_args.args[2]["elements"]))
+
 
 if __name__ == "__main__":
     unittest.main()

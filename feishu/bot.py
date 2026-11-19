@@ -109,10 +109,17 @@ def _tables_to_text(text):
     return "\n".join(out)
 
 
+def _strip_headings(md):
+    """`# 标题` → 粗体行；标题里已有 **加粗** 时只去掉 # 前缀，不二次包裹（会配对错乱漏出星号）。"""
+    def heading(m):
+        t = m.group(1).strip()
+        return t if "**" in t else f"**{t}**"
+    return re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", heading, md, flags=re.M)
+
+
 def _md_card(text):
     """流式/中途用：单个 markdown 元素，md 表格降级为分行列表（飞书 markdown 不渲染表格）。"""
-    md = _tables_to_text(text)
-    md = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", r"**\1**", md, flags=re.M)
+    md = _strip_headings(_tables_to_text(text))
     return {"config": {"wide_screen_mode": True},
             "elements": [{"tag": "markdown", "content": md}]}
 
@@ -128,15 +135,23 @@ def _table_element(header, rows):
     return {"tag": "table", "columns": cols, "rows": out_rows}
 
 
+_MD_ELEMENT_LIMIT = 4000    # 飞书单 markdown 元素过大不渲染，超限按空行切段
+
+
 def _rich_card(text):
     """最终定版用：普通文字走 markdown，markdown 表格渲染成飞书原生 table 组件（真表格）。"""
     elements, buf = [], []
+
     def flush():
-        if buf:
-            md = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", r"**\1**", "\n".join(buf), flags=re.M).strip("\n")
-            if md.strip():
-                elements.append({"tag": "markdown", "content": md})
-            buf.clear()
+        if not buf:
+            return
+        md = _strip_headings("\n".join(buf)).strip("\n")
+        buf.clear()
+        if not md.strip():
+            return
+        for chunk in _split_md(md):
+            elements.append({"tag": "markdown", "content": chunk})
+
     lines = text.split("\n")
     i, n = 0, len(lines)
     while i < n:
@@ -161,6 +176,37 @@ def _rich_card(text):
     if not elements:
         elements = [{"tag": "markdown", "content": text}]
     return {"config": {"wide_screen_mode": True}, "elements": elements}
+
+
+def _split_md(md, limit=_MD_ELEMENT_LIMIT):
+    """超长 markdown 按空行切段，段仍超限时按行硬切；代码块/表格行不作为切分点优先级最高。"""
+    if len(md) <= limit:
+        return [md]
+    paras = md.split("\n\n")
+    out, cur = [], ""
+    for p in paras:
+        if cur and len(cur) + 2 + len(p) > limit:
+            out.append(cur)
+            cur = p
+        else:
+            cur = f"{cur}\n\n{p}" if cur else p
+    if cur:
+        out.append(cur)
+    # 单段仍超限（如无空行的长列表）：按行兜底硬切
+    final = []
+    for chunk in out:
+        if len(chunk) <= limit:
+            final.append(chunk)
+            continue
+        line, rest = "", chunk
+        while len(rest) > limit:
+            cut = rest.rfind("\n", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            final.append(rest[:cut])
+            rest = rest[cut:].lstrip("\n")
+        if rest:
+            final.append(rest)
+    return final
 
 
 def _create_card(app, chat_id, card, message_uuid=None):
@@ -386,9 +432,14 @@ def deliver_task(task, text):
     app = store.get_app(task["app_id"])
     if not app:
         raise RuntimeError("任务所属应用不存在，无法投递")
-    card = (json.loads(text[len(taskstore.CARD_PREFIX):]) if text.startswith(taskstore.CARD_PREFIX)
-            else _md_card(text))
-    resp = _create_card(app, task["chat_id"], card, task.get("notification_id"))
+    if text.startswith(taskstore.CARD_PREFIX):
+        card = json.loads(text[len(taskstore.CARD_PREFIX):])
+        resp = _create_card(app, task["chat_id"], card, task.get("notification_id"))
+    else:
+        # 任务结果与主动推送同一待遇：md 表格渲染成原生 table 组件；被飞书拒绝退回分行 markdown。
+        resp = _create_card(app, task["chat_id"], _rich_card(text), task.get("notification_id"))
+        if not resp.success():
+            resp = _create_card(app, task["chat_id"], _md_card(text), task.get("notification_id"))
     if not resp.success():
         raise RuntimeError(f"飞书投递失败 code={resp.code}")
 
