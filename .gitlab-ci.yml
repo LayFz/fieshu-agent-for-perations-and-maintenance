@@ -1,5 +1,6 @@
-# feishu-agent CI/CD：test → build(构镜像→推 Harbor) → deploy(.51 内网) → notify(飞书)。
-# MR 与 main 执行本地替身测试；构建、部署、通知仍只在 main 运行。
+# feishu-agent CI/CD：test → build(构镜像→推 Harbor) → deploy(.51 内网)。
+# 流水线结果已由 GitLab 全局 Pipeline Webhook (ci-feishu-notify) 统一推送飞书，不再在 CI 内重复发通知。
+# MR 与 main 执行本地替身测试；构建、部署仍只在 main 运行。
 # 镜像双标签 :SHA(精确回滚) + :latest。单容器(Python + SQLite，前端内置)，比支付中台简单。
 #
 # 需在 GitLab 项目 Settings → CI/CD → Variables 配置（Masked 标注的勿泄漏）：
@@ -8,11 +9,10 @@
 #   DEPLOY_HOST=<deploy-host>                     # .51(ubantu2) LAN 地址（overlay <deploy-host-wg> 亦可）
 #   DEPLOY_DIR=/opt/feishu-agent                   # .51 上的部署目录
 #   DEPLOY_SSH_KEY=/root/.ssh/id_ed25519_deploy    # infra runner → .51 的免密私钥路径
-#   FEISHU_WEBHOOK(Masked) / FEISHU_SECRET(Masked，可选)
 # 前置：build runner(tags: build，shell executor，宿主有 docker + daemon.json insecure-registries:[<harbor-host>])；
 #       .51 已放好 config.yaml（飞书凭证+管理员密码）与 data/。
 
-stages: [test, build, deploy, notify]
+stages: [test, build, deploy]
 
 variables:
   REGISTRY: "$HARBOR_REGISTRY"
@@ -49,8 +49,6 @@ build:
     - docker build -t "$REGISTRY/$PROJECT/feishu-agent:$TAG" -t "$REGISTRY/$PROJECT/feishu-agent:latest" .
     - docker push "$REGISTRY/$PROJECT/feishu-agent:$TAG"
     - docker push "$REGISTRY/$PROJECT/feishu-agent:latest"
-  after_script:
-    - bash scripts/feishu-notify.sh "$CI_JOB_STATUS" "构建"
 
 # infra runner 经 SSH 把 compose+脚本推上 .51，远程执行 deploy.sh（拉镜像→up→健康门→失败可回滚）。
 # 真实密钥(config.yaml)早已放在 .51，CI 全程不经手密钥。
@@ -69,23 +67,3 @@ deploy:
     - $SCP deploy/compose.yml "root@$DEPLOY_HOST:$DEPLOY_DIR/compose.yml"
     - $SCP deploy/deploy.sh "root@$DEPLOY_HOST:$DEPLOY_DIR/deploy.sh"
     - $SSH "REGISTRY='$REGISTRY' PROJECT='$PROJECT' TAG='$TAG' HARBOR_USER='$HARBOR_USER' HARBOR_PASSWORD='$HARBOR_PASSWORD' bash $DEPLOY_DIR/deploy.sh"
-
-notify:ok:
-  stage: notify
-  tags: [build]
-  needs: ["deploy"]
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
-      when: on_success
-  script:
-    - bash scripts/feishu-notify.sh success "部署"
-
-notify:fail:
-  stage: notify
-  tags: [build]
-  needs: ["deploy"]
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
-      when: on_failure
-  script:
-    - bash scripts/feishu-notify.sh failed "部署"
