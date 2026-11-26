@@ -110,26 +110,153 @@ def search(stream, where=None, period="15m", limit=50, org=None):
         return {"error": f"[{src['org']}] {e}"}
 
 
-def list_streams(org=None):
-    """列日志流：传 org 只列该组织；不传则列全部已配置组织。"""
+def list_streams(org=None, stream_type="logs"):
+    """列数据流：传 org 只列该组织；不传则列全部已配置组织。stream_type 可为 logs / metrics / traces。"""
     if org:
         src, err = _pick(org)
         if err:
             return err
-        return {"org": src["org"], **_streams_of(src)}
-    return {"orgs": [{"org": s["org"], **_streams_of(s)} for s in sources()]}
+        return {"org": src["org"], **_streams_of(src, stream_type)}
+    return {"orgs": [{"org": s["org"], **_streams_of(s, stream_type)} for s in sources()]}
 
 
-def _streams_of(src):
+def _streams_of(src, stream_type="logs"):
     err = _incomplete(src)
     if err:
         return err
     try:
         r = _http.get(f"{src['base']}/api/{src['org']}/streams",
-                         params={"type": "logs"}, auth=(src["user"], src["pass"]), timeout=15)
+                         params={"type": stream_type}, auth=(src["user"], src["pass"]), timeout=15)
         if r.status_code != 200:
             return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
         data = r.json() or {}
         return {"streams": sorted(s["name"] for s in data.get("list", []) if s.get("name"))}
     except Exception as e:
         return {"error": str(e)}
+
+
+def _auto_step(secs):
+    if secs <= 1800:
+        return 60
+    if secs <= 7200:
+        return 120
+    if secs <= 86400:
+        return 600
+    return 3600
+
+
+def query_metrics(promql, period="15m", step=None, org=None, limit=50):
+    """用 PromQL 查 OpenObserve 指标趋势（/prometheus/api/v1/query_range），返回各时间序列的最新值与统计摘要。"""
+    src, err = _pick(org)
+    if err:
+        return err
+    if (err := _incomplete(src)):
+        return err
+    q = (promql or "").strip()
+    if not q:
+        return {"error": "promql 不能为空"}
+    secs = max(60, min(_seconds(period), 30 * 86400))
+    now = int(time.time())
+    start = now - secs
+    step_s = max(15, int(step)) if step else _auto_step(secs)
+    limit = max(1, min(int(limit or 50), 200))
+    try:
+        r = _http.get(
+            f"{src['base']}/api/{src['org']}/prometheus/api/v1/query_range",
+            params={"query": q, "start": start, "end": now, "step": step_s},
+            auth=(src["user"], src["pass"]),
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return {"error": f"[{src['org']}] HTTP {r.status_code}: {r.text[:300]}"}
+        body = r.json() or {}
+        if body.get("status") != "success":
+            return {"error": f"[{src['org']}] PromQL 查询失败: {body.get('error') or str(body)[:200]}"}
+        results = (body.get("data") or {}).get("result") or []
+        series = []
+        for item in results[:limit]:
+            vals = item.get("values") or []
+            nums = []
+            for _, v in vals:
+                try:
+                    nums.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+            latest = vals[-1] if vals else None
+            entry = {"metric": item.get("metric") or {}, "samples": len(vals)}
+            if latest is not None:
+                entry["latest_ts"] = latest[0]
+                entry["latest"] = round(float(latest[1]), 4) if nums else latest[1]
+            if nums:
+                entry["min"] = round(min(nums), 4)
+                entry["max"] = round(max(nums), 4)
+                entry["avg"] = round(sum(nums) / len(nums), 4)
+            series.append(entry)
+        return {
+            "org": src["org"],
+            "promql": q,
+            "period": period,
+            "step_sec": step_s,
+            "total_series": len(results),
+            "returned": len(series),
+            "series": series,
+        }
+    except Exception as e:
+        return {"error": f"[{src['org']}] {e}"}
+
+
+def query_traces(service=None, where=None, period="15m", min_duration_ms=None, limit=30, org=None):
+    """查 OpenObserve OTel 链路追踪（type=traces，默认 default 流）。duration 字段单位为微秒。"""
+    src, err = _pick(org)
+    if err:
+        return err
+    if (err := _incomplete(src)):
+        return err
+    limit = max(1, min(int(limit or 30), 200))
+    now_us = int(time.time() * 1_000_000)
+    start_us = now_us - _seconds(period) * 1_000_000
+    clauses = []
+    if service:
+        svc = str(service).strip().replace("'", "")
+        clauses.append(f"service_name='{svc}'")
+    if min_duration_ms is not None:
+        try:
+            min_us = max(0, int(float(min_duration_ms) * 1000))
+            clauses.append(f"duration >= {min_us}")
+        except (TypeError, ValueError):
+            pass
+    if where:
+        clauses.append(f"({where})")
+    sql = 'SELECT * FROM "default"'
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY start_time DESC"
+    body = {"query": {"sql": sql, "start_time": start_us, "end_time": now_us, "size": limit}}
+    try:
+        r = _http.post(
+            f"{src['base']}/api/{src['org']}/_search",
+            params={"type": "traces"},
+            json=body,
+            auth=(src["user"], src["pass"]),
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return {"error": f"[{src['org']}] HTTP {r.status_code}: {r.text[:300]}"}
+        hits = (r.json() or {}).get("hits") or []
+        keep = (
+            "trace_id", "span_id", "service_name", "operation_name", "span_kind",
+            "span_status", "status_message", "http_request_method", "http_route",
+            "http_response_status_code", "url_path", "upmore_request_id", "start_time",
+        )
+        spans = []
+        for h in hits[:limit]:
+            row = {k: h[k] for k in keep if k in h and h[k] not in (None, "")}
+            if "duration" in h and h["duration"] is not None:
+                try:
+                    row["duration_ms"] = round(float(h["duration"]) / 1000.0, 2)
+                except (TypeError, ValueError):
+                    row["duration"] = h["duration"]
+            spans.append(row)
+        return {"org": src["org"], "sql": sql, "period": period, "count": len(spans), "spans": spans}
+    except Exception as e:
+        return {"error": f"[{src['org']}] {e}"}

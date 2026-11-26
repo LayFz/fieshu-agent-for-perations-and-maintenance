@@ -97,6 +97,30 @@ TOOLS = [
         }, "required": ["stream"]},
     }},
     {"type": "function", "function": {
+        "name": "query_metrics",
+        "description": "用 PromQL 查 OpenObserve 指标（Metrics），返回各时间序列的最新值、最小/最大/平均值。"
+                       "适合查集群节点负载（node_load1）、磁盘使用率、CNPG 数据库连接数/复制延迟/容量、Pod CPU/内存等。",
+        "parameters": {"type": "object", "properties": {
+            "promql": {"type": "string", "description": "PromQL 表达式，例如 max by (k8s_cluster, node) (node_load1)"},
+            "period": {"type": "string", "description": "时间窗，如 15m/1h/6h/24h，默认 15m"},
+            "step": {"type": "integer", "description": "可选，采样步长（秒）；不传按时间窗自动选择"},
+            "org": {"type": "string", "description": "可选，组织名，不传查默认组织"},
+            "limit": {"type": "integer", "description": "返回时间序列条数上限，默认 50，最多 200"},
+        }, "required": ["promql"]},
+    }},
+    {"type": "function", "function": {
+        "name": "query_traces",
+        "description": "查 OpenObserve OTel 分布式链路追踪（Traces），用于定位慢请求、报错接口及上下游耗时分布（如 upmore-api）。",
+        "parameters": {"type": "object", "properties": {
+            "service": {"type": "string", "description": "可选，服务名，例如 upmore-api"},
+            "min_duration_ms": {"type": "number", "description": "可选，最小耗时阈值（毫秒），例如 1000 表示只看超过 1 秒的慢调用"},
+            "where": {"type": "string", "description": "可选 SQL 过滤条件（不含 WHERE），例如 http_response_status_code >= 500 或 trace_id='...'"},
+            "period": {"type": "string", "description": "时间窗，如 15m/1h/6h，默认 15m"},
+            "limit": {"type": "integer", "description": "返回 span 条数上限，默认 30，最多 200"},
+            "org": {"type": "string", "description": "可选，组织名，不传查默认组织"},
+        }},
+    }},
+    {"type": "function", "function": {
         "name": "server_stats",
         "description": "查服务器实时运行状况(来自 Beszel):列出服务器及其 CPU/内存/磁盘占用、负载、运行时长。"
                        "用于运维巡检/出服务器报告。不传 name 列全部,传 name 模糊筛某台。",
@@ -613,6 +637,8 @@ _META = {
     "remember": {"risk": "write"},
     "list_log_streams": {"risk": "read"},
     "query_logs": {"risk": "read"},
+    "query_metrics": {"risk": "read"},
+    "query_traces": {"risk": "read"},
     "server_stats": {"risk": "read"},
     "docker_containers": {"risk": "read"},
     "list_chat_members": {"risk": "read"},
@@ -690,7 +716,7 @@ def _preview_test(args, ctx):
 _META["code_propose_mr"]["preview"] = _preview_mr
 _META["code_test"]["preview"] = _preview_test
 
-for _untrusted in ("read_doc", "query_logs", "gitlab_read", "code_read", "code_search", "kubectl"):
+for _untrusted in ("read_doc", "query_logs", "query_traces", "gitlab_read", "code_read", "code_search", "kubectl"):
     _META[_untrusted]["external"] = True
 
 _UNKNOWN_META = {"risk": "exec", "external": False, "timeout": 120}
@@ -794,7 +820,8 @@ def _code_tool(name, args, ctx):
 
 _NET_ERROR = re.compile(r"ConnectionError|ConnectTimeout|ReadTimeout|RemoteDisconnected|Connection aborted|Connection refused|"
                         r"Max retries exceeded|Name or service not known|nodename nor servname|连不上|连接失败|执行超时", re.I)
-_INTERNAL = ("server_stats", "service_status", "query_logs", "list_log_streams", "kubectl", "argocd_apps", "argocd_app",
+_INTERNAL = ("server_stats", "service_status", "query_logs", "list_log_streams", "query_metrics", "query_traces",
+             "kubectl", "argocd_apps", "argocd_app",
              "image_vulns",
              "gitlab_project", "gitlab_pipelines", "gitlab_tree", "gitlab_read", "asset_refresh", "ssh_exec")
 
@@ -1008,6 +1035,14 @@ def execute(name, args, ctx=None):
             return openobserve.search(args["stream"], args.get("where"),
                                       args.get("period", "15m"), args.get("limit", 50),
                                       args.get("org"))
+        if name == "query_metrics":
+            return openobserve.query_metrics(args["promql"], args.get("period", "15m"),
+                                             args.get("step"), args.get("org"),
+                                             args.get("limit", 50))
+        if name == "query_traces":
+            return openobserve.query_traces(args.get("service"), args.get("where"),
+                                            args.get("period", "15m"), args.get("min_duration_ms"),
+                                            args.get("limit", 30), args.get("org"))
         if name == "server_stats":
             return beszel.servers(args.get("name"))
         if name == "docker_containers":

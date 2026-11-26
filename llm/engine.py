@@ -138,6 +138,10 @@ def _tool_label(name, args_json):
         return "ssh " + (a.get("command") or "")[:50]
     if name == "query_logs":
         return "查日志 " + (a.get("stream") or "") + (f"（{a.get('where')}）" if a.get("where") else "")
+    if name == "query_metrics":
+        return "查指标 " + (a.get("promql") or "")[:50]
+    if name == "query_traces":
+        return "查链路 " + (a.get("service") or "all") + (f"（>{a.get('min_duration_ms')}ms）" if a.get("min_duration_ms") else "")
     if name == "read_skill":
         return "读技能 " + (a.get("name") or "") + (f" / {a['file']}" if a.get("file") else "")
     if name.startswith("code_"):

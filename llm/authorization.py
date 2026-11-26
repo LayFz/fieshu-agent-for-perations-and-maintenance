@@ -59,7 +59,7 @@ def prepare(name, args, ctx):
         args["workspace"] = ws["id"]
         if name in ("code_test", "code_propose_mr"):
             args = workspace.prepare_action(name, args, ctx)
-    elif name in ("query_logs", "list_log_streams"):
+    elif name in ("query_logs", "list_log_streams", "query_metrics", "query_traces"):
         source, error = openobserve._pick(args.get("org"))
         if error:
             raise PermissionError("日志组织未配置")
@@ -73,6 +73,13 @@ def prepare(name, args, ctx):
             where = str(args.get("where") or "").lower()
             if any(x in where for x in ("select", "union", ";", "--", "/*")):
                 raise PermissionError("日志过滤条件不允许子查询或 SQL 注释")
+        elif name == "query_traces":
+            svc = str(args.get("service") or "").strip()
+            if svc and not re.fullmatch(r"[A-Za-z0-9_.\-]+", svc):
+                raise PermissionError("服务名只能包含字母、数字、点、下划线和连字符")
+            where = str(args.get("where") or "").lower()
+            if any(x in where for x in ("select", "union", ";", "--", "/*")):
+                raise PermissionError("链路过滤条件不允许子查询或 SQL 注释")
     elif name in ("gitlab_project", "gitlab_pipelines", "gitlab_tree", "gitlab_read"):
         access.require(app, "gitlab_projects", args.get("project"))
     elif name == "gitlab_projects":
