@@ -1001,7 +1001,7 @@ async function skills(){
       <td class="muted">${s.source_id?`<span class="tag">Git</span> ${esc(s.plugin||'')}<br><span class="mono" style="font-size:11px">${esc(srcName(s.source_id))} · ${esc((s.revision||'').slice(0,8))}</span>`:'手工'}</td>
       <td class="muted">${(s.content||'').length} 字${(s.file_names||[]).length?' + '+s.file_names.length+' 个文件':''}</td>
       <td style="white-space:nowrap">${s.source_id?`<button class="btn ghost sm" onclick="viewSkill(${s.id})">查看</button>`
-        :`<button class="btn sm" onclick='editSkill(${JSON.stringify(s)})'>编辑</button>
+        :`<button class="btn sm" onclick="editSkillById(${s.id})">编辑</button>
           <button class="btn danger" onclick="delSkill(${s.id},'${esc(s.name)}')">删除</button>`}</td></tr>`).join('')
     : '<tr><td colspan="5" class="muted">还没有技能。技能=喂给数字员工的知识/工作方法（如「服务器情况」「公众号选题规范」），应用按需勾选。</td></tr>';
   c.innerHTML=`
@@ -1089,6 +1089,7 @@ function _skillForm(s){
 }
 function newSkill(){ openModal(_skillForm({})); }
 function editSkill(s){ openModal(_skillForm(s)); }
+async function editSkillById(id){ try{ openModal(_skillForm(await api('GET','/api/skills/'+id))); }catch(e){ toast(e.message); } }
 async function saveSkill(id){
   const body={ name:$('#sk-name').value.trim(), description:$('#sk-desc').value, content:$('#sk-content').value };
   if(!body.name){ toast('请填名称'); return; }
